@@ -1,0 +1,88 @@
+<?php
+/**
+ * Vigil gate configuration — GENERATED FILE, do not edit by hand.
+ *
+ * Regenerate with:  vigil gate reconfigure <kind>
+ *
+ * This file holds the credential hash for the login gate. It is readable
+ * by the web server's group and nobody else; the password itself is never
+ * stored, only a bcrypt digest.
+ *
+ * The gate library is required here (not in the pages) so every page gets
+ * the same helpers and there is one place where the policy is loaded.
+ */
+declare(strict_types=1);
+
+require_once '__LIB_PATH__';
+
+$vigilPolicyPath = __DIR__ . '/policy.conf';
+$vigilPolicy = vigil_policy($vigilPolicyPath);
+
+$vigilConfig = [
+    'state_dir'   => __DIR__,
+    'policy'      => $vigilPolicyPath,
+
+    // Session cookie. `dshnav`-style one-time cookies are listed separately
+    // so logout can clear every one of them.
+    'cookie'      => '__COOKIE__',
+    'nav_cookie'  => __NAV_COOKIE__,
+    'extra_cookies' => __EXTRA_COOKIES__,
+    'cookie_lifetime' => __COOKIE_LIFETIME__,
+
+    // Endpoints served by the gate itself.
+    'entry_path'  => '__ENTRY_PATH__',
+    'captcha'     => '__CAPTCHA_PATH__',
+    'logout'      => '__LOGOUT_PATH__',
+
+    // Presentation.
+    'title'       => '__TITLE__',
+    'subtitle'    => '__SUBTITLE__',
+    'lang'        => '__LANG__',
+
+    // Sign-in. When require_password is false this is a pure human check
+    // and no credential exists anywhere in the installation.
+    'require_password' => __REQUIRE_PASSWORD__,
+    'user'        => '__USER__',
+    'pass_hash'   => '__PASS_HASH__',
+
+    // Puzzle artwork:
+    //   0 = generated Q-style landscape only
+    //   1 = pictures from the pool only
+    //   2 = auto -- whichever is available, chosen fresh per challenge, so
+    //       "new puzzle" changes the kind of picture as well as the picture
+    // An unavailable or empty pool never breaks the gate: it degrades to 0.
+    'scene_kind'  => __SCENE_KIND__,
+    'image_dirs'  => __IMAGE_DIRS__,
+    'image_pool'  => __DIR__ . '/image_pool.json',
+    'image_cache' => __DIR__ . '/image-cache',
+    'image_dir'   => __DIR__ . '/images',
+    // Carry the pictures inside the challenge page as `data:` URIs instead of
+    // pointing at the asset endpoint.
+    //
+    // Reason: the page must show a picture. When the pictures were fetched by
+    // URL, anything that dropped those requests -- a script that dies before
+    // it asks (which happened, and is why this exists), an ad blocker or DNS
+    // filter matching the word "captcha" in the path, a proxy that forwards
+    // only the HTML -- produced an empty box and left *no trace on the server
+    // at all*, because the request never arrived to be logged. Five inlined
+    // pictures add about 160 KB to the page and remove five round trips; the
+    // challenge is one-time and single-use, so there was never anything to
+    // cache. Set to 0 to fetch them again, which keeps the asset log as a
+    // diagnostic.
+    'inline_images' => __INLINE_IMAGES__,
+    // Rejected pictures, keyed by the upload's id. Written by
+    // `vigil gate scene block`; the pool skips anything listed here.
+    'image_block' => __DIR__ . '/image_blocklist.json',
+    // Remembers the last few kinds and pictures served, so `auto` can hold
+    // near-even odds without clumping and without repeating a picture.
+    'image_kind_state' => __DIR__ . '/image_kind_history.json',
+__UPSTREAM_KEYS__];
+
+// Optional post-login hook, e.g. exchanging a launch token for the upstream
+// application's own session cookies.
+$vigilHook = __DIR__ . '/hook.php';
+$vigilConfig['on_success'] = is_file($vigilHook)
+    ? (require $vigilHook)
+    : null;
+
+return $vigilConfig;

@@ -1,0 +1,33 @@
+# Vigil gate rate-limit zones and bot filtering (generated).
+#
+# Lives in the http{} block. Must be included BEFORE any vhost that
+# references these zones, or nginx refuses to load its configuration.
+
+limit_req_zone  $binary_remote_addr zone=__ZONE_REQ__:10m   rate=30r/m;
+limit_req_zone  $binary_remote_addr zone=__ZONE_CAP__:10m   rate=120r/m;
+limit_conn_zone $binary_remote_addr zone=__ZONE_CONN__:10m;
+limit_req_status  429;
+limit_conn_status 429;
+
+# Scanner user agents, rejected in the rewrite phase before they can reach
+# the gate endpoints at all.
+map $http_user_agent $vigil_bad_agent {
+    default 0;
+    "~*nikto"        1;
+    "~*sqlmap"       1;
+    "~*nmap"         1;
+    "~*masscan"      1;
+    "~*acunetix"     1;
+    "~*nessus"       1;
+    "~*openvas"      1;
+    "~*dirbuster"    1;
+    "~*gobuster"     1;
+    "~*wfuzz"        1;
+    "~*hydra"        1;
+    "~*zgrab"        1;
+    "~*python-requests" 1;
+    "~*curl/"        1;
+    "~*wget/"        1;
+    "~*libwww-perl"  1;
+    "~*bsqlbf"       1;
+}

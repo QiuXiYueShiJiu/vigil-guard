@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime state -- NEVER commit these. The repository must stay free
+# of any host's addresses, domains or credentials.
+*.local.json
+secrets.json
+config.json
+*.bak
+*.sent
+*.sending
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*~
+tools/source-forbid.txt

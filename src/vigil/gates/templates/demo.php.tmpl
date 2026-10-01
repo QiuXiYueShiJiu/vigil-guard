@@ -1,0 +1,656 @@
+<?php
+/**
+ * Slider puzzle at __DEMO_PATH__.
+ *
+ * Not a gate: nothing is protected, no session exists, nothing is
+ * rate-limited. One file serves the page, the images and the verdict.
+ *
+ *   ?cid=<id>&part=slider-bg|slider-piece   images
+ *   POST  cid, slider_x                                   verdict
+ */
+declare(strict_types=1);
+
+require_once '__LIB_PATH__';
+
+$stateDir = '__DEMO_STATE__';
+$policy = ['captcha_ttl' => 3600, 'captcha_length' => 5, 'lock_max' => 999];
+
+// The picture settings have to be passed too. They live in the gate's own
+// config.php, which this page does not load -- and without them
+// `vigil_slider_plate` falls through to generated art every single time, so
+// the pool was never used here and the anime pictures never appeared.
+$plateCfg = [
+    'scene_kind'  => __DEMO_SCENE_KIND__,
+    'image_dirs'  => __DEMO_IMAGE_DIRS__,
+    'image_pool'  => $stateDir . '/image_pool.json',
+    'image_cache' => __DEMO_IMAGE_CACHE__,
+    'image_block' => __DEMO_IMAGE_BLOCK__,
+];
+@mkdir($stateDir . '/slider', 0755, true);
+@mkdir($stateDir . '/captcha', 0755, true);
+
+// The verdict arrives as a POST, so `cid` has to be read from both. Taking
+// it only from the query string made every submission answer "expired"
+// while the images, which do use GET, loaded perfectly.
+$cid = (string)($_POST['cid'] ?? $_GET['cid'] ?? '');
+$part = (string)($_GET['part'] ?? '');
+$valid = preg_match('/^[0-9a-f]{32}$/', $cid) === 1;
+
+// ---------------------------------------------------------------- assets --
+if ($part !== '') {
+    // No `slider-scene`: the unmarked copy is what let the page recover the
+    // gap by differencing two images. Serving it here would reintroduce the
+    // defect on the page people look at to judge the puzzle.
+    //
+    // The playground shows the first piece only: a demo is for seeing
+    // what the challenge looks like, and duplicating the whole two-slider
+    // widget here would be a second implementation to keep in step for no
+    // security gain.
+    // Resolved by the shared helper, not by a second hand-written list: this
+    // page and the gate's own endpoint had drifted, and a name the generator
+    // can write must be resolvable by every reader of it.
+    $file = $valid ? vigil_slider_asset($stateDir, $cid, $part) : null;
+    if ($file === null) {
+        http_response_code(404);
+        exit;
+    }
+    header('Content-Type: image/png');
+    header('Cache-Control: private, max-age=300');
+    readfile($file);
+    exit;
+}
+
+// --------------------------------------------------------------- verdict --
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json; charset=utf-8');
+    // Parenthesised on purpose: without the brackets `.` binds tighter than
+    // `?:`, so this used to parse as a concatenation used as the condition
+    // and yield a bare filename with no directory in it.
+    $meta = $valid ? ($stateDir . '/captcha/' . $cid . '.json') : '';
+    $data = $meta !== '' && is_file($meta)
+        ? json_decode((string)@file_get_contents($meta), true) : null;
+    if (!is_array($data)) {
+        echo json_encode(['ok' => false, 'error' => '已过期'],
+                         JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $answer = (int)($_POST['slider_x'] ?? -99999);
+    $delta = abs($answer - (int)$data['x']);
+    $tol = 16;
+    // Both factors, same as the gate: the piece in the gap *and* the
+    // passcode read off the picture. The demo should show the real thing --
+    // a playground that passes on the easier half teaches the wrong lesson.
+    $codeOK = true;
+    if (array_key_exists('q_ans', $data)) {
+        $want = (string)(int)$data['q_ans'];
+        $got  = trim((string)($_POST['q_answer'] ?? ''));
+        $codeOK = ($got !== '' && hash_equals($want, $got));
+    }
+    // Pass or fail, and nothing else. Returning the distance turns the
+    // endpoint into an oracle: an attacker binary-searches the offset in a
+    // handful of requests and never has to look at the picture. It is also
+    // deliberately a single boolean: saying which factor failed would let a
+    // script search the two independently.
+    echo json_encode(['ok' => true, 'pass' => ($delta <= $tol) && $codeOK],
+                     JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// ------------------------------------------------------------------ page --
+$slider = vigil_new_slider($stateDir, $policy, $plateCfg);
+if (empty($slider['ok'])) {
+    http_response_code(500);
+    echo '<!DOCTYPE html><meta charset="utf-8"><p>无法生成拼图（需要 PHP GD）</p>';
+    exit;
+}
+$scramble = vigil_slider_scramble((int)$slider['width'], (int)$slider['height'],
+                                  (string)($slider['kind'] ?? 'art'));
+$e = static fn(string $s): string => htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+$self = '__DEMO_PATH__';
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>人机验证演示</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center;
+         justify-content:center; padding:20px 14px; background:#eef3fa;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+              "Hiragino Sans GB","Microsoft YaHei",sans-serif; color:#1b2233; }
+  .box { width:100%; max-width:420px; }
+  h1 { margin:0 0 4px; font-size:17px; font-weight:650; }
+  p.sub { margin:0 0 14px; font-size:13px; color:#6b7688; }
+  .puzzle { position:relative; border-radius:12px; overflow:hidden;
+            background:#101728; touch-action:none; }
+  .puzzle canvas { display:block; width:100%; height:auto; touch-action:none;
+                   cursor:crosshair; }
+  .track { position:relative; margin-top:10px; height:44px; border-radius:10px;
+           background:#f4f7fb; border:1px solid #e2e8f1; overflow:hidden; }
+  .track .handle { position:absolute; top:0; left:0; width:44px; height:42px;
+                   display:flex; align-items:center; justify-content:center;
+                   background:#fff; border:1px solid #cdd7e5; border-radius:9px;
+                   cursor:grab; font-size:16px; color:#5a6c85; }
+  .track .label { position:absolute; inset:0; display:flex; align-items:center;
+                  justify-content:center; font-size:12.5px; color:#9aa6b8;
+                  pointer-events:none; }
+  .fb { margin-top:10px; font-size:13.5px; min-height:20px; color:#6b7688; }
+  .fb.ok { color:#1a8f52; }
+  .fb.no { color:#c0392b; }
+  .again { margin-top:6px; font-size:13px; color:#5a6c85; background:none;
+           border:none; padding:0; cursor:pointer; text-decoration:underline; }
+  @media (prefers-color-scheme: dark) {
+    body { background:#0d1218; color:#e7edf6; }
+    p.sub, .fb, .again { color:#94a0b3; }
+    .track { background:#141b28; border-color:#26303f; }
+    .track .handle { background:#232c3c; border-color:#333f52; color:#a9b6c9; }
+  }
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>人机验证演示</h1>
+  <p class="sub">拖动滑块把图像拼回去。</p>
+
+  <?php
+  // Same sourcing rule as the gate page: the pictures are carried in this
+  // page unless that is impossible, in which case they are fetched from this
+  // same script's asset branch. A playground that cannot show its picture
+  // teaches nothing about the puzzle.
+  $srcOf = static function (string $part) use ($self, $slider, $stateDir): string {
+      $uri = vigil_slider_data_uri($stateDir, (string)$slider['id'], $part);
+      return $uri !== '' ? $uri : $self . '?cid=' . $slider['id'] . '&part=' . $part;
+  };
+  ?>
+  <div class="puzzle" id="puzzle"
+       data-w="<?= (int)$slider['width'] ?>"
+       data-h="<?= (int)$slider['height'] ?>"
+       data-pw="<?= (int)($slider['piece'] + $slider['radius']) ?>"
+       data-ph="<?= (int)($slider['piece'] + $slider['radius'] * 2) ?>"
+       data-piecetop="<?= (int)($slider['piece_y'] - $slider['radius']) ?>"
+       data-max="<?= (int)($slider['width'] - $slider['piece'] - $slider['radius']) ?>"
+       data-bg="<?= $e($srcOf('slider-bg')) ?>"
+       data-piece="<?= $e($srcOf('slider-piece1')) ?>"
+       data-objects="<?= $e($srcOf('slider-objects')) ?>"
+       data-cid="<?= $e($slider['id']) ?>"
+       data-scramble="<?= $e(json_encode($scramble)) ?>"
+       data-kind="<?= $e((string)($slider['kind'] ?? 'art')) ?>"
+       data-glow="<?= $e(implode(',', $slider['glow'] ?? [120, 200, 255])) ?>"
+       data-sun="<?= $e($slider['sun'] ? implode(',', $slider['sun']) : '') ?>">
+    <canvas id="cv"></canvas>
+  </div>
+
+  <div style="margin-top:10px">
+    <div style="font-size:13px;color:#4c586b;margin-bottom:6px"><?= $e((string)($slider['q_text'] ?? '')) ?></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <?php foreach (($slider['q_opts'] ?? []) as $oi => $opt): ?>
+        <label style="display:flex;align-items:center;gap:6px;padding:8px 11px;
+                      border:1px solid #e3e8f0;border-radius:10px;cursor:pointer">
+          <input type="radio" name="q_answer" value="<?= (int)$oi ?>">
+          <span><?= $e((string)$opt) ?></span>
+        </label>
+      <?php endforeach; ?>
+    </div>
+  </div>
+  <div class="track" id="track">
+    <div class="label" id="label"></div>
+    <div class="handle" id="handle" role="slider" tabindex="0">⇥</div>
+  </div>
+
+  <div class="fb" id="fb"></div>
+  <button class="again" id="again" type="button">换一张</button>
+</div>
+
+<script>
+/* The verdict is requested the moment the slider is released -- there is no
+ * submit button, because a real human-verification step does not have one.
+ * A short delay lets the piece finish settling so the answer matches what
+ * the solver sees. */
+(function () {
+  "use strict";
+  var host = document.getElementById("puzzle");
+  var cv = document.getElementById("cv");
+  var track = document.getElementById("track");
+  var handle = document.getElementById("handle");
+  var label = document.getElementById("label");
+  var fb = document.getElementById("fb");
+  var again = document.getElementById("again");
+  if (!host || !cv) { return; }
+
+  var W = parseInt(host.dataset.w, 10) || 340;
+  var H = parseInt(host.dataset.h, 10) || 200;
+  var PW = parseInt(host.dataset.pw, 10) || 55;
+  var PH = parseInt(host.dataset.ph, 10) || 64;
+  var pieceTop = parseInt(host.dataset.piecetop, 10) || 0;
+  var MAX = parseInt(host.dataset.max, 10) || (W - PW);
+  var CID = host.dataset.cid || "";
+  var glow = (host.dataset.glow || "120,200,255").split(",").map(Number);
+  var ART = (host.dataset.kind || "art") !== "image";
+  var sunRaw = host.dataset.sun || "";
+  var sun = sunRaw ? sunRaw.split(",").map(Number) : null;
+  var ripples = [];
+  // `drawPetals` reads this. The drawing functions were copied over from the
+  // gate, but the arrays they close over were not -- and a missing global
+  // inside the animation loop throws on the first frame and stops the whole
+  // thing, which is why the picture went still rather than merely losing one
+  // effect.
+  var petals = [];
+  for (i = 0; i < 14; i++) {
+    petals.push({ x: rnd(0, W), y: rnd(-H, H), s: rnd(1.8, 3.6),
+                  vy: rnd(5, 14), ph: rnd(0, 6.28) });
+  }
+  var scramble = [];
+  try { scramble = JSON.parse(host.dataset.scramble || "{}").bands || []; }
+  catch (e) { scramble = []; }
+
+  cv.width = W; cv.height = H;
+  var ctx = cv.getContext("2d");
+  var bgC = document.createElement("canvas"); bgC.width = W; bgC.height = H;
+  var bgX = bgC.getContext("2d", { willReadFrequently: true });
+  var pcC = document.createElement("canvas"); pcC.width = PW; pcC.height = PH;
+  var pcX = pcC.getContext("2d", { willReadFrequently: true });
+  var stage = document.createElement("canvas"); stage.width = W; stage.height = H;
+  var stX = stage.getContext("2d");
+
+  var cur = 0, dragging = false, startX = 0;
+  var shown = 0, target = 0, raf = null, lastTs = 0, boost = 0, busy = false;
+  var pending = 2, done_ = false;
+
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+  var birds = [], bugs = [], motes = [];
+  for (var i = 0; i < 6; i++) {
+    birds.push({ x: rnd(-30, W + 30), y: rnd(H * .05, H * .4), s: rnd(2, 3.2),
+                 v: rnd(9, 20), ph: rnd(0, 6.28), bob: rnd(3, 8) });
+  }
+  for (i = 0; i < 10; i++) {
+    bugs.push({ x: rnd(0, W), y: rnd(H * .55, H * .95), s: rnd(1.4, 2.6),
+                ph: rnd(0, 6.28), vx: rnd(-7, 7), vy: rnd(-3, 3), hue: i % 3 });
+  }
+  for (i = 0; i < 28; i++) {
+    motes.push({ x: rnd(0, W), y: rnd(0, H), r: rnd(.6, 1.6),
+                 ph: rnd(0, 6.28), vy: rnd(-5, -1.2) });
+  }
+
+  function load(src, cb) {
+    var im = new Image();
+    im.onload = function () { cb(im); };
+    im.onerror = function () { cb(null); };
+    im.src = src;
+  }
+
+  /* Find the gap by diffing the marked image against the clean one. Not
+   * secret -- the gap is plainly visible -- and it gives honest, immediate
+   * feedback instead of waiting for a round trip. */
+  function bandOffset(i, chaos, t) {
+    var b = scramble[i];
+    return b.shift * chaos + Math.sin(t * 0.0011 + i * 1.9) * chaos * 4.5;
+  }
+  function bandOffsetAtY(y, chaos, t) {
+    for (var k = 0; k < scramble.length; k++) {
+      var b = scramble[k];
+      if (y >= b.y && y < b.y + b.h) { return bandOffset(k, chaos, t); }
+    }
+    return 0;
+  }
+
+  function compose(t, chaos) {
+    stX.clearRect(0, 0, W, H);
+    for (var k = 0; k < scramble.length; k++) {
+      var b = scramble[k], sx = Math.round(bandOffset(k, chaos, t));
+      if (!sx) {
+        stX.drawImage(bgC, 0, b.y, W, b.h, 0, b.y, W, b.h);
+      } else if (sx > 0) {
+        stX.drawImage(bgC, 0, b.y, W, b.h, sx, b.y, W, b.h);
+        stX.drawImage(bgC, W - sx, b.y, sx, b.h, 0, b.y, sx, b.h);
+      } else {
+        stX.drawImage(bgC, 0, b.y, W, b.h, sx, b.y, W, b.h);
+        stX.drawImage(bgC, 0, b.y, -sx, b.h, W + sx, b.y, -sx, b.h);
+      }
+    }
+  }
+
+  function present(t, chaos) {
+    ctx.clearRect(0, 0, W, H);
+    if (ART && chaos > 0.006) {
+      var n = 22, hh = H / n;
+      for (var s = 0; s < n; s++) {
+        var sy = s * hh;
+        var dy = chaos * (3.4 * Math.sin(sy / 8.5 + t * .0022)
+                        + 1.5 * Math.sin(sy / 3.4 - t * .0034));
+        var src = Math.max(0, sy - 2);
+        ctx.drawImage(stage, 0, src, W, Math.min(H - src, hh + 4),
+                      0, sy + dy, W, hh + 4);
+      }
+    } else {
+      ctx.drawImage(stage, 0, 0);
+    }
+  }
+
+
+  function drawRays(t, a) {
+    if (!sun) { return; }
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.translate(sun[0], sun[1]);
+    ctx.rotate(t * 0.00006);
+    var n = 10;
+    for (var k = 0; k < n; k++) {
+      var ang = (k / n) * Math.PI * 2;
+      var len = H * (0.34 + 0.14 * Math.sin(t * 0.0009 + k));
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.cos(ang - 0.045) * len, Math.sin(ang - 0.045) * len);
+      ctx.lineTo(Math.cos(ang + 0.045) * len, Math.sin(ang + 0.045) * len);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(" + glow.join(",") + "," + (0.045 * a).toFixed(3) + ")";
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawCloudShadow(t, a) {
+    ctx.save();
+    for (var k = 0; k < 3; k++) {
+      var px = ((t * 0.0042 * (1 + k * 0.45) + k * 190) % (W + 220)) - 110;
+      var py = H * (0.30 + k * 0.16);
+      var rx = 96 + k * 30, ry = 26 + k * 8;
+      var g = ctx.createRadialGradient(px, py, 0, px, py, rx);
+      g.addColorStop(0, "rgba(24,32,58," + (0.085 * a).toFixed(3) + ")");
+      g.addColorStop(1, "rgba(24,32,58,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.ellipse(px, py, rx, ry, 0, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawGrassSway(t, a) {
+    var base = H - 2;
+    ctx.save();
+    ctx.strokeStyle = "rgba(30,62,44," + (0.34 * a).toFixed(3) + ")";
+    ctx.lineWidth = 1.1;
+    ctx.lineCap = "round";
+    for (var k = 0; k < 26; k++) {
+      var x = (k + 0.5) * (W / 26) + Math.sin(k * 3.1) * 6;
+      var hgt = 5 + (k % 5) * 2.2;
+      var lean = Math.sin(t * 0.0022 + k * 0.7) * (2.4 + (k % 3));
+      ctx.beginPath();
+      ctx.moveTo(x, base);
+      ctx.quadraticCurveTo(x + lean * 0.5, base - hgt * 0.6, x + lean, base - hgt);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawSweep(t, a) {
+    var px = ((t * 0.022) % (W + 260)) - 130;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    var g = ctx.createLinearGradient(px - 60, 0, px + 60, H);
+    g.addColorStop(0, "rgba(255,255,255,0)");
+    g.addColorStop(0.5, "rgba(255,255,255," + (0.085 * a).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(px - 70, 0, 140, H);
+    ctx.restore();
+  }
+
+  function drawPetals(t, a, dt) {
+    ctx.save();
+    for (var k = 0; k < petals.length; k++) {
+      var p = petals[k];
+      p.y += p.vy * dt / 1000;
+      p.x += Math.sin(t * 0.0016 + p.ph) * 0.7;
+      if (p.y > H + 6) { p.y = -6; p.x = rnd(0, W); }
+      ctx.fillStyle = ART
+        ? "rgba(255,190,215," + (0.72 * a).toFixed(3) + ")"
+        : "rgba(255,238,246," + (0.40 * a).toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, p.s, p.s * 0.55, Math.sin(t * 0.002 + p.ph), 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawRipples(dt) {
+    ctx.save();
+    for (var k = ripples.length - 1; k >= 0; k--) {
+      var r = ripples[k];
+      r.r += dt * 0.16;
+      r.life -= dt / 620;
+      if (r.life <= 0) { ripples.splice(k, 1); continue; }
+      ctx.strokeStyle = "rgba(" + glow.join(",") + ","
+                      + (r.life * 0.5).toFixed(3) + ")";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function ambient(t, p, dt) {
+    var a = (0.42 + 0.58 * (1 - p)) * (1 + boost * .9);
+    ctx.save();
+    if (ART) {
+      ctx.strokeStyle = "rgba(28,34,58," + (.5 * a).toFixed(3) + ")";
+      ctx.lineWidth = 1.4; ctx.lineCap = "round";
+      for (var k = 0; k < birds.length; k++) {
+        var b = birds[k];
+        b.x += b.v * dt / 1000;
+        if (b.x > W + 30) { b.x = -30; b.y = rnd(H * .05, H * .4); }
+        var fl = Math.sin(t * .0075 + b.ph);
+        var sp = b.s * (.55 + .45 * Math.abs(fl));
+        var by = b.y + Math.sin(t * .0012 + b.ph) * b.bob;
+        ctx.beginPath();
+        ctx.moveTo(b.x - sp, by + sp * .5 * fl);
+        ctx.quadraticCurveTo(b.x - sp * .4, by - sp * .35, b.x, by);
+        ctx.quadraticCurveTo(b.x + sp * .4, by - sp * .35, b.x + sp, by + sp * .5 * fl);
+        ctx.stroke();
+      }
+    }
+    for (var j = 0; j < bugs.length; j++) {
+      var g = bugs[j];
+      g.x += g.vx * dt / 1000; g.y += g.vy * dt / 1000;
+      if (g.x < -6) { g.x = W + 6; }
+      if (g.x > W + 6) { g.x = -6; }
+      if (g.y < H * .5) { g.vy = Math.abs(g.vy); }
+      if (g.y > H - 2) { g.vy = -Math.abs(g.vy); }
+      g.vx = Math.max(-16, Math.min(16, g.vx + rnd(-9, 9) * dt / 1000));
+      g.vy = Math.max(-9, Math.min(9, g.vy + rnd(-6, 6) * dt / 1000));
+      var flap = .35 + .65 * Math.abs(Math.sin(t * .019 + g.ph));
+      var gy = g.y + Math.sin(t * .006 + g.ph) * 2.4;
+      var cols = ["255,196,120", "255,150,190", "180,220,255"];
+      ctx.fillStyle = "rgba(" + cols[g.hue] + "," + (.72 * a).toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.ellipse(g.x - g.s * .85, gy, g.s * flap, g.s * .62, -.4, 0, 6.2832);
+      ctx.ellipse(g.x + g.s * .85, gy, g.s * flap, g.s * .62, .4, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.fillStyle = ART ? "rgba(255,255,255," + (.42 * a).toFixed(3) + ")"
+                       : "rgba(255,250,235," + (.30 * a).toFixed(3) + ")";
+    for (var m = 0; m < motes.length; m++) {
+      var mo = motes[m];
+      mo.y += mo.vy * dt / 1000;
+      mo.x += Math.sin(t * .0011 + mo.ph) * .25;
+      if (mo.y < -4) { mo.y = H + 4; mo.x = rnd(0, W); }
+      ctx.beginPath(); ctx.arc(mo.x, mo.y, mo.r, 0, 6.2832); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawPiece(p, chaos, t) {
+    ctx.save();
+    ctx.shadowColor = "rgba(8,12,24," + (.48 - .28 * p) + ")";
+    ctx.shadowBlur = 11 - 8 * p;
+    ctx.shadowOffsetY = 5 - 4 * p;
+    ctx.drawImage(pcC, 0, 0, PW, PH, cur, pieceTop, PW, PH);
+    ctx.restore();
+  }
+
+  function frame(ts) {
+    var t = ts || 0;
+    var dt = lastTs ? Math.min(48, t - lastTs) : 16;
+    lastTs = t;
+    var diff = target - shown;
+    if (Math.abs(diff) > .0015) { shown += diff * .16; } else { shown = target; }
+    // Picture at rest, same reason as the gate: any "you are close"
+    // feedback is also a hint a bot can read, so alignment is made exact
+    // instead of animated.
+    var chaos = 0;
+    if (boost > 0) { boost *= Math.exp(-dt / 420); if (boost < .005) { boost = 0; } }
+    compose(t, chaos);
+    present(t, chaos);
+
+    // Same order and the same amplitude model as the gate: weather first,
+    // then wildlife, then the piece on top. A demo whose motion differs from
+    // the product is a demo of a different product.
+    var a = (0.42 + 0.58 * chaos) * (1 + boost * 0.9);
+    if (a > 1.7) { a = 1.7; }
+    if (ART) {
+      drawRays(t, a);
+      drawCloudShadow(t, a);
+      drawGrassSway(t, a);
+    } else {
+      drawSweep(t, a);
+    }
+    ambient(t, shown, dt);
+    drawPetals(t, a, dt);
+    drawPiece(shown, chaos, t);
+    drawRipples(dt);
+    raf = requestAnimationFrame(frame);
+  }
+
+  function setPiece(px) {
+    cur = Math.max(0, Math.min(MAX, Math.round(px)));
+    var pct = MAX > 0 ? cur / MAX : 0;
+    var hw = handle.offsetWidth || 44;
+    var maxD = Math.max(1, (track.clientWidth || 1) - hw);
+    handle.style.left = (pct * maxD) + "px";
+    if (label) { label.style.opacity = pct > .02 ? "0" : "1"; }
+    // Drag progress, not distance-to-answer: the page must not know where
+    // the gap is, or the answer is computable here (see the gate template).
+    target = MAX > 0 ? Math.max(0, Math.min(1, cur / MAX)) : 0;
+    boost = 1;
+  }
+
+  function pt(e) {
+    if (e.touches && e.touches.length) { return e.touches[0].clientX; }
+    if (e.changedTouches && e.changedTouches.length) {
+      return e.changedTouches[0].clientX;
+    }
+    return e.clientX;
+  }
+  function cvt(cx) {
+    var r = cv.getBoundingClientRect();
+    return (cx - r.left) * (W / Math.max(1, r.width));
+  }
+
+  /* No distance readout, on purpose.
+   *
+   * An earlier version printed "N pixels to go" live while dragging. That is
+   * a gift to anyone automating this: measure the reported distance, move,
+   * measure again, and the correct offset falls out in a few steps without
+   * ever interpreting the picture. The visual feedback is the picture itself
+   * coming together, which a person reads and a script cannot. */
+  function preview() {
+    fb.textContent = "";
+    fb.className = "fb";
+  }
+
+  function verify() {
+    if (busy || !done_) { return; }
+    busy = true;
+    var body = new URLSearchParams();
+    body.set("cid", CID);
+    body.set("slider_x", String(cur));
+    var picked = document.querySelector('input[name="q_answer"]:checked');
+    body.set("q_answer", picked ? picked.value : "");
+    fetch(location.pathname, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString()
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      busy = false;
+      if (!d || !d.ok) { fb.textContent = ""; fb.className = "fb"; return; }
+      // Pass says nothing at all -- the next puzzle arriving is the
+      // feedback. Reporting success is a pass/fail oracle, and a script that
+      // can read it can hill-climb the offset without ever interpreting the
+      // image. Failure still has to say something or the solver is stuck.
+      if (d.pass) { fb.textContent = ""; fb.className = "fb"; }
+      else { fb.textContent = "未通过"; fb.className = "fb no"; }
+      // Pass and it moves on by itself, the way a real challenge does. The
+      // gate redirects to wherever you were going; here there is nowhere to
+      // go, so it deals the next puzzle. A short pause lets the "pass" read
+      // before the picture changes under the solver's hand.
+      if (d.pass) { setTimeout(function () { location.href = location.pathname; }, 900); }
+    }).catch(function () {
+      busy = false;
+      fb.textContent = ""; fb.className = "fb";
+    });
+  }
+
+  function down(e) {
+    dragging = true;
+    startX = cvt(pt(e)) - cur;
+    handle.style.cursor = "grabbing";
+    if (e.cancelable) { e.preventDefault(); }
+  }
+  function move(e) {
+    if (!dragging) { return; }
+    setPiece(cvt(pt(e)) - startX);
+    ripples.push({ x: cur + PW / 2, y: pieceTop + PH / 2, r: 6, life: 1 });
+    if (ripples.length > 6) { ripples.shift(); }
+    preview();
+    if (e.cancelable) { e.preventDefault(); }
+  }
+  function up() {
+    if (!dragging) { return; }
+    dragging = false;
+    handle.style.cursor = "grab";
+    // Let the piece finish settling so the verdict matches what is on
+    // screen; asking immediately would judge a position the solver never
+    // actually saw.
+    setTimeout(verify, 260);
+  }
+
+  handle.addEventListener("mousedown", down, false);
+  cv.addEventListener("mousedown", down, false);
+  document.addEventListener("mousemove", move, false);
+  document.addEventListener("mouseup", up, false);
+  handle.addEventListener("touchstart", down, { passive: false });
+  cv.addEventListener("touchstart", down, { passive: false });
+  document.addEventListener("touchmove", move, { passive: false });
+  document.addEventListener("touchend", up, false);
+  handle.addEventListener("keydown", function (e) {
+    var step = e.shiftKey ? 10 : 2;
+    if (e.key === "ArrowRight") { setPiece(cur + step); }
+    else if (e.key === "ArrowLeft") { setPiece(cur - step); }
+    else { return; }
+    preview();
+    clearTimeout(up._t);
+    up._t = setTimeout(verify, 400);
+    e.preventDefault();
+  });
+
+  function ready() {
+    if (--pending > 0) { return; }
+    done_ = true;
+    setPiece(0);
+    shown = target;
+    preview();
+    if (raf === null) { raf = requestAnimationFrame(frame); }
+  }
+
+  load(host.dataset.bg, function (im) { if (im) { bgX.drawImage(im, 0, 0, W, H); } ready(); });
+  load(host.dataset.piece, function (im) { if (im) { pcX.drawImage(im, 0, 0, PW, PH); } ready(); });
+
+  again.addEventListener("click", function () { location.href = location.pathname; });
+})();
+</script>
+</body>
+</html>

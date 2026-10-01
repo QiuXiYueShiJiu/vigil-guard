@@ -1,0 +1,263 @@
+-- Vigil access gate — GENERATED FILE.
+--
+-- Runs in nginx's access phase via `access_by_lua_file`, at *server* scope
+-- so every location of the vhost is covered. Attaching this to `location /`
+-- only would leave the rest of the server open, which is the most common
+-- way a gate ends up protecting nothing.
+--
+-- Two response modes, because a redirect is wrong for a programmatic call:
+--   · navigation (a person in a browser) -> 302 to the verification page
+--   · anything else (fetch/XHR/API)      -> 401 with a JSON body
+-- Returning HTML to an XHR produces a confusing parse error instead of a
+-- clear "you are not verified", and returning a 302 makes the client follow
+-- it and then fail to parse the login page as JSON.
+--
+-- Ticket design note. The previous implementation stored the raw User-Agent
+-- inside the ticket file. A User-Agent containing a newline could therefore
+-- inject an extra `exp=` line and defeat the expiry check entirely. Tickets
+-- now contain only hex digests, which makes injection impossible, keeps
+-- personal data out of the file, and means a briefly wrong file mode leaks
+-- nothing.
+
+local SESS_DIR   = "__STATE_DIR__sessions/"
+local POLICY     = "__POLICY__"
+local LOGIN      = "__ENTRY_PATH__"
+local CAPTCHA    = "__CAPTCHA_PATH__"
+local LOGOUT     = "__LOGOUT_PATH__"
+local COOKIE     = "__COOKIE__"
+local NAV_COOKIE = __NAV_COOKIE_LUA__
+
+-- Policy defaults; overridden by the file. Reading it on every request was
+-- a syscall on the hot path, so it is cached briefly instead.
+local POLICY_TTL = 3
+local _policy_cache = { at = 0, v = nil }
+
+local function file_exists(p)
+  local fh = io.open(p, "r")
+  if fh then fh:close() return true end
+  return false
+end
+
+local function load_policy()
+  local now = ngx.now()
+  if _policy_cache.v and (now - _policy_cache.at) < POLICY_TTL then
+    return _policy_cache.v
+  end
+  local p = { session_ttl = __SESSION_TTL__, abs_ttl = __ABS_TTL__,
+              nav_ttl = __NAV_TTL__, bind_ua = __BIND_UA__,
+              bind_ip = __BIND_IP__, strict_nav = __STRICT_NAV__ }
+  local fh = io.open(POLICY, "r")
+  if fh then
+    for line in fh:lines() do
+      local k, v = line:match("^%s*([%w_]+)%s*=%s*(%d+)")
+      if k and p[k] ~= nil then p[k] = tonumber(v) end
+    end
+    fh:close()
+  end
+  _policy_cache.at = now
+  _policy_cache.v = p
+  return p
+end
+
+local function digest(s)
+  -- ngx.md5 is part of ngx_lua core. The fallback keeps the gate working
+  -- (with a weaker binding) rather than erroring on an unusual build.
+  if ngx.md5 then return ngx.md5(s) end
+  local h = 5381
+  for i = 1, #s do
+    h = (h * 33 + string.byte(s, i)) % 4294967296
+  end
+  return string.format("%08x", h)
+end
+
+local function ua_hash() return digest(ngx.var.http_user_agent or "") end
+local function ip_hash() return digest(ngx.var.remote_addr or "") end
+
+-- Parse a ticket file. Every field must match its expected shape, so a
+-- malformed or hand-edited file fails closed instead of being interpreted.
+-- Timestamps are read as decimal, with a base-16 fallback so a ticket
+-- written by an older build still validates. Without the fallback a format
+-- change silently logs every user out with no diagnosable reason.
+local function tonum(s)
+  if not s or s == "" then return 0 end
+  local n = tonumber(s)
+  if n then return n end
+  return tonumber(s, 16) or 0
+end
+
+local function read_ticket(tok)
+  local path = SESS_DIR .. tok
+  local fh = io.open(path, "r")
+  if not fh then return nil, path end
+  local body = fh:read("*a")
+  fh:close()
+  local t = {}
+  for line in body:gmatch("[^\n]+") do
+    local k, v = line:match("^(%a+)=(%x*)$")
+    if k then t[k] = v end
+  end
+  return t, path
+end
+
+local function is_nav()
+  local mode = ngx.var.http_sec_fetch_mode
+  if mode and mode ~= "" then return mode == "navigate" end
+  local acc = ngx.var.http_accept or ""
+  return acc:find("text/html", 1, true) ~= nil
+end
+
+-- Where the last accepted navigation landed, remembered per session.
+--
+-- It is needed because the request carries no flag that separates a reload
+-- from a click: Sec-Fetch-Mode is "navigate" for both, and so is the
+-- Referer. What does differ is the target -- a reload asks for the page that
+-- is already on screen, a click asks for a different one -- so the last
+-- accepted URI is kept beside the session and compared.
+local function nav_marker(tok)
+  if type(tok) ~= "string" or tok == "" then return nil end
+  local fh = io.open(SESS_DIR .. tok .. ".nav", "r")
+  if not fh then return nil end
+  local body = fh:read("*l")
+  fh:close()
+  return body
+end
+
+local function nav_marker_set(tok, uri)
+  if type(tok) ~= "string" or tok == "" then return end
+  local path = SESS_DIR .. tok .. ".nav"
+  local tmp = path .. "." .. tostring(ngx.worker.pid()) .. ".tmp"
+  local fh = io.open(tmp, "w")
+  if fh then
+    fh:write(uri) fh:close()
+    os.rename(tmp, path)
+  end
+end
+
+local function deny(uri)
+  if is_nav() then
+    ngx.header["Cache-Control"] = "no-store"
+    return ngx.redirect(LOGIN .. "?next=" .. ngx.escape_uri(uri), 302)
+  end
+  ngx.status = 401
+  ngx.header["Content-Type"] = "application/json"
+  ngx.header["Cache-Control"] = "no-store"
+  ngx.say('{"error":"human_verification_required","verify":"'
+          .. LOGIN .. '"}')
+  return ngx.exit(401)
+end
+
+-- Validate a ticket. Returns true only when every binding holds.
+local function valid(tok, p, now)
+  if type(tok) ~= "string" or #tok ~= 64 or not tok:match("^%x+$") then
+    return false
+  end
+  local t, path = read_ticket(tok)
+  if not t then return false end
+
+  local exp = tonum(t.exp)
+  local iat = tonum(t.iat)
+  if exp == 0 or now > exp then os.remove(path) return false end
+  if p.abs_ttl > 0 and iat > 0 and (now - iat) > p.abs_ttl then
+    os.remove(path) return false
+  end
+  if p.bind_ua >= 1 then
+    if t.uah ~= ua_hash() then os.remove(path) return false end
+  end
+  -- Fail closed: with IP binding on, a ticket that carries no address hash
+  -- is rejected rather than silently accepted.
+  if p.bind_ip >= 1 then
+    if not t.iph or t.iph == "" or t.iph ~= ip_hash() then
+      os.remove(path) return false
+    end
+  end
+  return true
+end
+
+-- Sliding renewal. Rewrites only when most of the lifetime has passed, and
+-- never shells out: the sessions directory is 0700, so the file's own mode
+-- is irrelevant for confidentiality.
+local function renew(tok, p, now)
+  if p.session_ttl <= 0 then return end
+  local t, path = read_ticket(tok)
+  if not t then return end
+  local exp = tonum(t.exp)
+  if (exp - now) > (p.session_ttl * 0.9) then return end
+  -- Renewal writes in the same format the reader expects.
+  local body = string.format("exp=%d\niat=%d\nuah=%s\niph=%s\n",
+                             now + p.session_ttl, tonum(t.iat),
+                             t.uah or ua_hash(), t.iph or ip_hash())
+  local tmp = path .. "." .. tostring(ngx.worker.pid()) .. ".tmp"
+  local fh = io.open(tmp, "w")
+  if fh then
+    fh:write(body) fh:close()
+    os.rename(tmp, path)
+  end
+end
+
+local uri = ngx.var.uri
+
+-- Exemptions. ACME must always pass or certificate renewal breaks, and the
+-- failure only shows up weeks later when the certificate expires.
+if uri == LOGIN or uri == CAPTCHA or uri == LOGOUT then return end
+if uri:sub(1, 13) == "/.well-known/" then return end
+
+local now = ngx.time()
+local p = load_policy()
+
+-- Navigating means a person is loading or reloading a page. Two policies:
+--
+--   strict_nav = 1  only the one-time navigation ticket is accepted, and it
+--                   is consumed here. Reloading therefore always asks for
+--                   verification again, and a copied navigation cookie is
+--                   worthless because it has already been spent.
+--
+--   strict_nav = 2  only a *reload* is refused. The one-time ticket is
+--                   still consumed on every navigation, but a navigation to
+--                   a page other than the one currently on screen is
+--                   accepted on the session. This is the setting for a
+--                   multi-page application: pressing F5 anywhere asks for
+--                   verification again, while clicking through the menus
+--                   does not.
+--
+--   strict_nav = 0  a valid session is enough, reloads included.
+--
+-- Either way, non-navigation requests (XHR, fetch, WebSocket) use the
+-- session ticket, so a single-page app keeps working after the document has
+-- loaded -- and that is what stops strict mode from becoming a login loop.
+local strict = (p.strict_nav or 0)
+
+if is_nav() then
+  local navuri = ngx.var.request_uri
+  local tok = ngx.var["cookie_" .. COOKIE]
+  local nav = NAV_COOKIE and ngx.var["cookie_" .. NAV_COOKIE] or nil
+
+  if nav and nav ~= "" and valid(nav, p, now) then
+    os.remove(SESS_DIR .. nav)
+    -- Remember where this fresh verification landed, so the next
+    -- navigation can be told apart from a reload of that same page.
+    nav_marker_set(tok, navuri)
+    return
+  end
+
+  if strict >= 1 then
+    if strict == 2 and tok and tok ~= "" and valid(tok, p, now) then
+      if nav_marker(tok) == navuri then
+        -- Same page as last time: this is a reload. Verify again.
+        return deny(navuri)
+      end
+      nav_marker_set(tok, navuri)
+      renew(tok, p, now)
+      return
+    end
+    -- strict = 1, or strict = 2 with no usable session: this is a reload, a
+    -- new tab, or someone who never verified. Send them to the gate.
+    return deny(navuri)
+  end
+  -- Lenient mode falls through to the session check below.
+end
+
+local tok = ngx.var["cookie_" .. COOKIE]
+if not valid(tok, p, now) then
+  return deny(ngx.var.request_uri)
+end
+renew(tok, p, now)

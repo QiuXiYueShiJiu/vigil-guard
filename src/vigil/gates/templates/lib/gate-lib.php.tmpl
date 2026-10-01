@@ -1,0 +1,3954 @@
+<?php
+/**
+ * Vigil gate library — shared by every gate type.
+ *
+ * All of the security-relevant logic lives here rather than in the page
+ * templates, so there is exactly one implementation of "compare a CAPTCHA",
+ * "count a failure" and "issue a session" to audit.
+ *
+ * Threat model: the attacker can fetch unlimited challenges, submit
+ * unlimited answers, replay anything they captured, and run from many
+ * addresses. Defences, in the order they apply:
+ *
+ *   1. challenge is bound to the client (address + user agent) — a cid
+ *      harvested elsewhere is useless, which kills challenge-farming;
+ *   2. a minimum solve time — no human types five characters in under a
+ *      second, so instant answers are rejected before comparison;
+ *   3. a honeypot field — hidden from people, irresistible to scrapers;
+ *   4. one-time consumption, unlinked *before* comparison — a captured
+ *      answer cannot be replayed even if the request is retried;
+ *   5. constant-time comparison via hash_equals;
+ *   6. per-address failure counting with *exponential* backoff, so a
+ *      sustained guessing run gets progressively more expensive;
+ *   7. per-address challenge-issue limiting, so the challenge store cannot
+ *      be exhausted as a denial-of-service;
+ *   8. bounded pruning of both challenges and sessions.
+ *
+ * @package vigil
+ */
+
+declare(strict_types=1);
+
+// --------------------------------------------------------------------------
+// Configuration
+// --------------------------------------------------------------------------
+
+/**
+ * Parse the shared policy file.
+ *
+ * Only integer keys are honoured, so a malformed or hostile policy file can
+ * never inject strings into the logic.
+ */
+function vigil_policy(string $path): array
+{
+    $defaults = [
+        'session_ttl' => 1800, 'nav_ttl' => 120, 'captcha_ttl' => 180,
+        'abs_ttl' => 43200, 'bind_ua' => 1, 'bind_ip' => 0,
+        'lock_max' => 8, 'lock_secs' => 900, 'max_sessions' => 100,
+        // First lockout length, and the multiplier for each repeat. The old
+        // shape had no separate first value: lock_secs * backoff^(strikes-1)
+        // with backoff defaulting to 1, so the documented "exponential
+        // backoff" was in fact a flat 15 minutes every time -- a comment that
+        // lied about the code. Now the first lock is short and it really does
+        // grow, capped by lock_secs.
+        'lock_first_secs' => 120,
+        // A wrong *password* is not a failed challenge and must not spend the
+        // same budget: a person mistyping a password was being locked out of
+        // the puzzle for 15 minutes by the fifth keystroke-level mistake.
+        // Guessing is already bounded by the puzzle (one solved challenge per
+        // guess), so this budget is deliberately far more generous.
+        'cred_max' => 20, 'cred_lock_secs' => 300,
+        // Security tuning (all optional; safe defaults if absent).
+        'captcha_min_seconds' => 1, 'captcha_max_tries' => 6,
+        'captcha_per_minute' => 12, 'lock_backoff' => 1,
+        'captcha_length' => 5,
+    ];
+    $out = $defaults;
+    if (!is_readable($path)) {
+        return $out;
+    }
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+        if (!preg_match('/^\s*([a-z_]+)\s*=\s*(\d+)/', $line, $m)) {
+            continue;
+        }
+        if (array_key_exists($m[1], $out)) {
+            $out[$m[1]] = (int)$m[2];
+        }
+    }
+    // Clamp: a typo must not be able to disable a protection entirely.
+    $out['captcha_length'] = max(4, min(8, $out['captcha_length']));
+    $out['captcha_min_seconds'] = max(0, min(30, $out['captcha_min_seconds']));
+    $out['lock_max'] = max(2, $out['lock_max']);
+    $out['lock_first_secs'] = max(5, min(3600, $out['lock_first_secs']));
+    $out['lock_backoff'] = max(1, min(8, $out['lock_backoff']));
+    $out['cred_max'] = max(3, $out['cred_max']);
+    $out['cred_lock_secs'] = max(5, min(3600, $out['cred_lock_secs']));
+    $out['session_ttl'] = max(60, $out['session_ttl']);
+    return $out;
+}
+
+/** Create the state directories with private permissions. */
+function vigil_state_dirs(string $stateDir): void
+{
+    foreach (['', 'sessions', 'captcha', 'fails', 'logs'] as $sub) {
+        $d = rtrim($stateDir, '/') . ($sub === '' ? '' : '/' . $sub);
+        if (!is_dir($d)) {
+            @mkdir($d, 0700, true);
+        }
+        @chmod($d, 0700);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Client identity
+// --------------------------------------------------------------------------
+
+/** Best-effort real client address (honours the trusted proxy setup). */
+function vigil_client_ip(): string
+{
+    $ip = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+    return $ip !== '' ? $ip : '0.0.0.0';
+}
+
+/**
+ * Bind a challenge to the client.
+ *
+ * Only address and user agent are mixed in — deliberately not anything the
+ * client controls per-request, or a proxy that rewrites headers would break
+ * legitimate logins.
+ */
+function vigil_client_binding(): string
+{
+    return hash('sha256', vigil_client_ip() . '|'
+                         . (string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
+}
+
+// --------------------------------------------------------------------------
+// CAPTCHA
+// --------------------------------------------------------------------------
+
+/** Alphabet without look-alike glyphs, so a human is never failed by font. */
+function vigil_alphabet(): string
+{
+    return 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+}
+
+/**
+ * Create a challenge and return its id plus the answer (for rendering).
+ *
+ * Difficulty rises with recent failures from the same address: longer code
+ * and heavier distortion. A legitimate user who mistyped once barely
+ * notices; a scripted attacker loses throughput immediately.
+ */
+function vigil_new_captcha(string $stateDir, array $policy): array
+{
+    $fails = vigil_fail_count($stateDir);
+    $length = (int)$policy['captcha_length'];
+    if ($fails >= 2) {
+        $length = min(8, $length + 1);
+    }
+    if ($fails >= 5) {
+        $length = min(8, $length + 1);
+    }
+
+    $alphabet = vigil_alphabet();
+    $code = '';
+    for ($i = 0; $i < $length; $i++) {
+        $code .= $alphabet[random_int(0, strlen($alphabet) - 1)];
+    }
+
+    $id = bin2hex(random_bytes(16));
+    $payload = json_encode([
+        'code'   => $code,
+        'exp'    => time() + (int)$policy['captcha_ttl'],
+        'born'   => time(),
+        'bind'   => vigil_client_binding(),
+        'weight' => $fails,
+    ], JSON_UNESCAPED_SLASHES);
+    $file = rtrim($stateDir, '/') . '/captcha/' . $id . '.json';
+    file_put_contents($file, (string)$payload, LOCK_EX);
+    @chmod($file, 0600);
+    // `weight` is returned as well as stored: the page draws the picture
+    // itself now, and a caller that had to re-read the state file to find the
+    // fail count would silently draw every challenge at weight 0 -- i.e. the
+    // repeat offender would get the *easiest* picture, the exact opposite of
+    // the intent.
+    return ['id' => $id, 'code' => $code, 'length' => $length,
+            'weight' => $fails];
+}
+
+/**
+ * Validate and consume a challenge.
+ *
+ * Returns ['ok' => bool, 'reason' => string]. The reason is for the audit
+ * log only — never shown to the client, because telling an attacker *why*
+ * they failed is free reconnaissance.
+ */
+function vigil_check_captcha(string $stateDir, array $policy,
+                             string $cid, string $answer,
+                             bool $honeypotTripped): array
+{
+    // Cheap rejections first, so a flood of obvious junk costs no I/O.
+    if ($honeypotTripped) {
+        return ['ok' => false, 'reason' => 'HONEYPOT'];
+    }
+    if (!preg_match('/^[0-9a-f]{32}$/', $cid)) {
+        return ['ok' => false, 'reason' => 'BAD_ID'];
+    }
+    $file = rtrim($stateDir, '/') . '/captcha/' . $cid . '.json';
+    if (!is_file($file)) {
+        return ['ok' => false, 'reason' => 'MISSING'];
+    }
+
+    // Consume before comparing: a retry can never succeed, so an attacker
+    // cannot re-use an answer even if they capture the request.
+    $raw = (string)@file_get_contents($file);
+    @unlink($file);
+
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        return ['ok' => false, 'reason' => 'CORRUPT'];
+    }
+    if ((int)($data['exp'] ?? 0) < time()) {
+        return ['ok' => false, 'reason' => 'EXPIRED'];
+    }
+    if (!hash_equals((string)($data['bind'] ?? ''), vigil_client_binding())) {
+        // The challenge was fetched by someone else. This is the signature
+        // of a relay/farming attempt rather than a mistyped character.
+        return ['ok' => false, 'reason' => 'BINDING'];
+    }
+    $elapsed = time() - (int)($data['born'] ?? 0);
+    if ($elapsed < (int)$policy['captcha_min_seconds']) {
+        return ['ok' => false, 'reason' => 'TOO_FAST'];
+    }
+    $expected = strtoupper(trim((string)($data['code'] ?? '')));
+    $got = strtoupper(trim($answer));
+    if ($expected === '' || !hash_equals($expected, $got)) {
+        return ['ok' => false, 'reason' => 'WRONG'];
+    }
+    return ['ok' => true, 'reason' => 'OK'];
+}
+
+// --------------------------------------------------------------------------
+// Failure accounting / lockout
+// --------------------------------------------------------------------------
+
+function vigil_fail_file(string $stateDir): string
+{
+    return rtrim($stateDir, '/') . '/fails/'
+           . hash('sha256', vigil_client_ip()) . '.json';
+}
+
+function vigil_fail_state(string $stateDir): array
+{
+    $f = vigil_fail_file($stateDir);
+    $d = is_file($f) ? json_decode((string)@file_get_contents($f), true) : null;
+    if (!is_array($d)) {
+        $d = ['count' => 0, 'until' => 0, 'strikes' => 0, 'issued' => 0,
+              'issued_at' => 0, 'cred' => 0];
+    }
+    foreach (['count', 'until', 'strikes', 'issued', 'issued_at',
+              'cred'] as $k) {
+        $d[$k] = (int)($d[$k] ?? 0);
+    }
+    return $d;
+}
+
+function vigil_fail_count(string $stateDir): int
+{
+    return (int)(vigil_fail_state($stateDir)['strikes'] ?? 0);
+}
+
+/**
+ * Record a failure and lock the address out with exponential backoff.
+ *
+ * Two budgets, deliberately separate:
+ *
+ *   CHALLENGE  the puzzle was not solved (bad drag, wrong answer, no track).
+ *              This is what an automated solver produces, so it keeps the
+ *              tighter budget.
+ *   BAD_CRED   the puzzle *was* solved and the password was wrong. A person
+ *              mistyping a password is the common case here, and it used to
+ *              share the challenge budget -- five fat-fingered logins locked
+ *              somebody out of the puzzle for fifteen minutes. Guessing is
+ *              already bounded by the puzzle itself (a solved challenge is
+ *              required per guess), so this budget is much more generous and
+ *              its lock is short.
+ *
+ * The duration grows: first lock `lock_first_secs`, then multiplied by
+ * `lock_backoff` per repeat lockout, capped at `lock_secs`. The old formula
+ * was `lock_secs * backoff^(strikes-1)` with backoff defaulting to 1, so it
+ * was flat in practice however the comment described it.
+ */
+function vigil_fail_bump(string $stateDir, array $policy,
+                         string $reason = 'CHALLENGE'): void
+{
+    $d = vigil_fail_state($stateDir);
+    $now = time();
+    if ($reason === 'BAD_CRED') {
+        $d['cred']++;
+        if ($d['cred'] >= (int)$policy['cred_max']) {
+            $d['until'] = $now + (int)$policy['cred_lock_secs'];
+            $d['cred'] = 0;
+        }
+    } else {
+        $d['count']++;
+        if ($d['count'] >= (int)$policy['lock_max']) {
+            $d['strikes']++;
+            $first = (int)($policy['lock_first_secs'] ?? 120);
+            $backoff = max(1, (int)$policy['lock_backoff']);
+            $cap = max($first, (int)$policy['lock_secs']);
+            $grow = $first * ($backoff ** min(6, $d['strikes'] - 1));
+            $d['until'] = $now + (int)min($cap, $grow);
+            $d['count'] = 0;
+        }
+    }
+    $f = vigil_fail_file($stateDir);
+    file_put_contents($f, json_encode($d), LOCK_EX);
+    @chmod($f, 0600);
+}
+
+/**
+ * Delete lockout records that can no longer matter.
+ *
+ * Without this the directory is append-only history: every address that ever
+ * failed once keeps a file forever, and on this host that had already grown
+ * to twenty-odd records with nothing to remove them. A record is worth
+ * keeping only while it still describes a live hold or a counted failure, so
+ * the sweeper removes:
+ *
+ *   · holds that expired more than `grace` ago (default one day),
+ *   · records with nothing counted and no hold (a bare `issued` counter),
+ *   · anything untouched for `max_age` days (default 7),
+ *   · files that are not the current JSON shape at all (an older format).
+ *
+ * Throttled by a marker file, because it is called from every page render and
+ * pruning must never become the expensive part of serving a login page.
+ */
+function vigil_fail_sweep(string $stateDir, int $grace = 86400,
+                          int $max_age = 604800, int $every = 3600): int
+{
+    $dir = rtrim($stateDir, '/') . '/fails';
+    if (!is_dir($dir)) {
+        return 0;
+    }
+    $marker = $dir . '/.swept';
+    $last = is_file($marker) ? (int)@filemtime($marker) : 0;
+    $now = time();
+    if ($last && $now - $last < $every) {
+        return 0;
+    }
+    @touch($marker);
+    $removed = 0;
+    foreach (glob($dir . '/*') ?: [] as $f) {
+        $base = basename($f);
+        if ($base === '.swept' || !is_file($f)) {
+            continue;
+        }
+        $age = $now - (int)@filemtime($f);
+        $kill = false;
+        if (substr($base, -5) !== '.json') {
+            // Not the current shape: a file from an older format. It is not
+            // read by anything any more.
+            $kill = $age > $grace;
+        } else {
+            $d = json_decode((string)@file_get_contents($f), true);
+            if (!is_array($d)) {
+                $kill = $age > $grace;
+            } else {
+                $until = (int)($d['until'] ?? 0);
+                $count = (int)($d['count'] ?? 0);
+                $strikes = (int)($d['strikes'] ?? 0);
+                $cred = (int)($d['cred'] ?? 0);
+                if ($until > 0 && $until < $now - $grace) {
+                    $kill = true;                       // long-expired hold
+                } elseif ($until === 0 && $count === 0 && $strikes === 0
+                          && $cred === 0) {
+                    $kill = true;                       // nothing to remember
+                } elseif ($age > $max_age) {
+                    $kill = true;                       // simply too old
+                }
+            }
+        }
+        if ($kill) {
+            @unlink($f);
+            $removed++;
+        }
+    }
+    return $removed;
+}
+
+/** Remaining lock seconds, or 0. */
+function vigil_locked_for(string $stateDir): int
+{
+    $until = (int)vigil_fail_state($stateDir)['until'];
+    return max(0, $until - time());
+}
+
+function vigil_fail_clear(string $stateDir): void
+{
+    @unlink(vigil_fail_file($stateDir));
+}
+
+/**
+ * Challenge-issue rate limit.
+ *
+ * Without this, an attacker can mint challenges in a loop and fill the
+ * state directory — a disk-exhaustion denial of service that also destroys
+ * the ability of real users to log in.
+ */
+function vigil_can_issue(string $stateDir, array $policy): bool
+{
+    $d = vigil_fail_state($stateDir);
+    $now = time();
+    if ($now - $d['issued_at'] > 60) {
+        $d['issued_at'] = $now;
+        $d['issued'] = 0;
+    }
+    if ($d['issued'] >= (int)$policy['captcha_per_minute']) {
+        return false;
+    }
+    $d['issued']++;
+    $f = vigil_fail_file($stateDir);
+    file_put_contents($f, json_encode($d), LOCK_EX);
+    @chmod($f, 0600);
+    return true;
+}
+
+
+// --------------------------------------------------------------------------
+// Slider puzzle CAPTCHA
+// --------------------------------------------------------------------------
+//
+// Why a puzzle rather than more distorted text: text CAPTCHAs are beaten by
+// OCR, and the arms race is unwinnable -- modern models read warped text
+// better than most people. A jigsaw alignment task is a different problem:
+// the solver has to *locate a matching pattern* and then reproduce a human
+// motion, which is far more expensive to automate and, unlike warped text,
+// does not get harder for a person with poor eyesight.
+//
+// Defences layered on top of the alignment itself:
+//   · the correct offset is NEVER sent to the client -- only the images are;
+//   · the piece is cut from a randomly generated background, so the puzzle
+//     cannot be pre-solved or looked up;
+//   · tolerance shrinks as failures accumulate, turning a lucky guess into
+//     an increasingly unlikely one;
+//   · the drag trajectory must look human (sampled, varied speed, forward
+//     only), which rejects "set the value and submit" scripts even when they
+//     guess the offset correctly;
+//   · the drag must take a plausible amount of time.
+
+/** Geometric parameters of the puzzle. */
+function vigil_slider_geometry(string $stateDir, array $policy): array
+{
+    $size = 46;
+    $radius = 9;
+    return [
+        'piece'  => $size,
+        'radius' => $radius,
+        // 340x200 was legible but soft on a modern display: the canvas is
+        // scaled up by CSS to fill a ~400px card, so every pixel was being
+        // stretched before it reached the eye. 480x280 keeps the same 12:7
+        // framing and needs no crop change, and the piece and gap scale with
+        // it. Cost is roughly double the draw time -- about 0.2s on the
+        // slowest host measured -- which a login page can afford once.
+        'width'  => 480,
+        'height' => 280,
+        // Tolerance is deliberately generous. It was 10px, which is under 4%
+        // of the track: technically defensible and miserable to actually
+        // use, because a mouse slip of a few pixels failed the challenge.
+        // 16px still leaves an effectively impossible chance of a blind
+        // guess (the track is ~285px, so roughly 1 in 9), while a person
+        // aiming at a visible target lands it comfortably.
+        'tolerance' => max(9, 16 - vigil_fail_count_direct($stateDir)),
+        // How far the piece must travel before the picture is considered
+        // "close". Used only for the visual warm/cold indication.
+        'approach'  => 90,
+    ];
+}
+
+/**
+ * Scene presets -- Q-style anime, cel-shaded.
+ *
+ * Five flat-colour, thick-outline cartoon landscapes. Each has one light
+ * source, one palette and its own mood, and all five use the same visual
+ * grammar: two or three flat tones per object, a single dark outline, no
+ * gradients except the sky, and chunky rounded silhouettes.
+ *
+ * Beyond looking right, the style is doing real work for the puzzle. Flat
+ * shapes and heavy outlines are high-contrast structure spread over the whole
+ * frame, so a band shifted sideways snaps visibly and a correctly seated
+ * piece is obvious -- an earlier photoreal gradient-and-ribbons background
+ * looked busy but had almost no alignment signal, which is why solved and
+ * scrambled were hard to tell apart.
+ *
+ * `ink` outlines the gap; `glow` and `accent` are handed to the browser to
+ * tint the live animation drawn over this still image.
+ */
+function vigil_slider_scenes(): array
+{
+    return [
+        // 晴空 -- cornflower ranges, mint meadow, hard midday light.
+        'day' => [
+            'sky'     => [[0x5f, 0xb8, 0xef], [0x9d, 0xdc, 0xf7], [0xdd, 0xf3, 0xff]],
+            'sun'     => [0.79, 0.14, [0xff, 0xf8, 0xc4], [0xff, 0xdf, 0x6b]],
+            'rays'    => true,
+            'cloud'   => [[0xff, 0xff, 0xff], [0xc6, 0xe2, 0xf6]],
+            'density' => 1.20,
+            'ranges'  => [
+                [[0x8c, 0xb6, 0xe4], [0x6b, 0x96, 0xcc], [0xff, 0xff, 0xff]],
+                [[0x6d, 0x98, 0xc8], [0x54, 0x7c, 0xae], [0xee, 0xf8, 0xff]],
+                [[0x53, 0x8a, 0x6c], [0x3e, 0x6e, 0x57], null],
+            ],
+            'grass'   => [[0x93, 0xda, 0x6c], [0x6e, 0xc0, 0x55], [0x4b, 0x99, 0x44]],
+            'flower'  => [[0xff, 0x92, 0xb4], [0xff, 0xe1, 0x69], [0xff, 0xff, 0xff]],
+            'water'   => [[0x8d, 0xd2, 0xef], [0xd6, 0xf1, 0xfd]],
+            'ink'     => [0x3c, 0x36, 0x60],
+            'glow'    => [0xff, 0xf1, 0x9c],
+            'accent'  => [0xff, 0x8f, 0xb1],
+        ],
+        // 樱风 -- blossom pink, pale light, petals in the air.
+        'sakura' => [
+            'sky'     => [[0xf7, 0xb6, 0xd2], [0xfb, 0xd8, 0xe6], [0xff, 0xf2, 0xf7]],
+            'sun'     => [0.24, 0.16, [0xff, 0xfa, 0xe6], [0xff, 0xd9, 0xe8]],
+            'rays'    => true,
+            'petals'  => true,
+            'cloud'   => [[0xff, 0xff, 0xff], [0xf3, 0xd3, 0xe4]],
+            'density' => 1.00,
+            'ranges'  => [
+                [[0xc7, 0xba, 0xe8], [0xa9, 0x9a, 0xd6], [0xff, 0xf4, 0xfa]],
+                [[0xa9, 0x9a, 0xd6], [0x8b, 0x7c, 0xbe], [0xfb, 0xe9, 0xf4]],
+                [[0x7c, 0xb2, 0x84], [0x62, 0x96, 0x6c], null],
+            ],
+            'grass'   => [[0xa8, 0xdd, 0x86], [0x82, 0xc6, 0x66], [0x5c, 0xa2, 0x52]],
+            'flower'  => [[0xff, 0x9e, 0xc4], [0xff, 0xf0, 0xf5], [0xff, 0xd9, 0x6e]],
+            'water'   => [[0xf2, 0xc2, 0xd8], [0xff, 0xef, 0xf6]],
+            'ink'     => [0x6b, 0x3f, 0x5e],
+            'glow'    => [0xff, 0xd6, 0xe6],
+            'accent'  => [0xff, 0x8f, 0xb8],
+        ],
+        // 黄昏 -- amber sky, violet hills, a low orange sun.
+        'dusk' => [
+            'sky'     => [[0xff, 0x9a, 0x5c], [0xff, 0xc2, 0x7a], [0xff, 0xe4, 0xb4]],
+            'sun'     => [0.63, 0.55, [0xff, 0xf0, 0xb8], [0xff, 0x8e, 0x4a]],
+            'rays'    => true,
+            'cloud'   => [[0xff, 0xe3, 0xd0], [0xe8, 0x9d, 0x9e]],
+            'density' => 1.30,
+            'ranges'  => [
+                [[0xb4, 0x93, 0xd6], [0x93, 0x74, 0xba], [0xff, 0xe9, 0xf2]],
+                [[0x8b, 0x6f, 0xb4], [0x6e, 0x56, 0x96], [0xff, 0xdd, 0xea]],
+                [[0x6d, 0x5a, 0x7e], [0x55, 0x44, 0x64], null],
+            ],
+            'grass'   => [[0x9c, 0xc4, 0x66], [0x76, 0x9c, 0x52], [0x54, 0x74, 0x46]],
+            'flower'  => [[0xff, 0xc4, 0x76], [0xff, 0xec, 0xc2], [0xff, 0x9a, 0xa8]],
+            'water'   => [[0xd9, 0x92, 0x8e], [0xff, 0xd2, 0xa6]],
+            'ink'     => [0x4a, 0x33, 0x54],
+            'glow'    => [0xff, 0xc9, 0x7a],
+            'accent'  => [0xff, 0x9a, 0x6a],
+        ],
+        // 星夜 -- indigo sky, silver moon, fireflies in the grass.
+        'night' => [
+            'sky'     => [[0x20, 0x2a, 0x5e], [0x3b, 0x4a, 0x92], [0x6f, 0x84, 0xc4]],
+            'sun'     => [0.74, 0.15, [0xff, 0xfb, 0xd6], [0xc9, 0xd8, 0xff]],
+            'moon'    => true,
+            'stars'   => true,
+            'cloud'   => [[0x8e, 0x9d, 0xd6], [0x54, 0x63, 0xa2]],
+            'density' => 0.80,
+            'ranges'  => [
+                [[0x5a, 0x6c, 0xad], [0x42, 0x52, 0x8c], [0xe8, 0xf0, 0xff]],
+                [[0x42, 0x52, 0x8c], [0x30, 0x3e, 0x70], [0xd4, 0xe2, 0xff]],
+                [[0x2b, 0x40, 0x5e], [0x1e, 0x2f, 0x48], null],
+            ],
+            'grass'   => [[0x3f, 0x74, 0x62], [0x2d, 0x5a, 0x4d], [0x1e, 0x42, 0x3a]],
+            'flower'  => [[0xff, 0xe9, 0x8a], [0xbf, 0xe4, 0xff], [0xff, 0xff, 0xff]],
+            'water'   => [[0x18, 0x28, 0x50], [0x54, 0x76, 0xb4]],
+            'ink'     => [0x14, 0x18, 0x38],
+            'glow'    => [0xc9, 0xd8, 0xff],
+            'accent'  => [0xff, 0xe9, 0x8a],
+        ],
+        // 青岚 -- teal mist, layered jade ridges, quiet water.
+        'mist' => [
+            'sky'     => [[0x5f, 0xa8, 0xa6], [0x93, 0xc9, 0xc2], [0xd8, 0xee, 0xe6]],
+            'sun'     => [0.34, 0.18, [0xf4, 0xff, 0xf8], [0xbf, 0xe8, 0xdc]],
+            'cloud'   => [[0xf2, 0xff, 0xfb], [0xbc, 0xdc, 0xd6]],
+            'density' => 1.45,
+            'ranges'  => [
+                [[0x8f, 0xbd, 0xb6], [0x6f, 0x9e, 0x9a], [0xf4, 0xff, 0xfb]],
+                [[0x63, 0x96, 0x90], [0x4a, 0x78, 0x76], [0xdc, 0xf2, 0xec]],
+                [[0x35, 0x64, 0x58], [0x25, 0x4c, 0x44], null],
+            ],
+            'grass'   => [[0x92, 0xd2, 0x9a], [0x6e, 0xb4, 0x80], [0x4e, 0x90, 0x68]],
+            'flower'  => [[0xff, 0xff, 0xff], [0xd8, 0xf4, 0xd0], [0xff, 0xdd, 0x8f]],
+            'water'   => [[0x6a, 0xa8, 0xa4], [0xa8, 0xd6, 0xce]],
+            'ink'     => [0x28, 0x4c, 0x50],
+            'glow'    => [0xcf, 0xf0, 0xe6],
+            'accent'  => [0x8f, 0xd6, 0xbe],
+        ],
+    ];
+}
+
+/**
+ * Draw a stroke that keeps its alpha.
+ *
+ * GD silently ignores the alpha channel of `imageline` whenever
+ * `imageantialias` is on: it takes a different drawing path that writes the
+ * colour straight in, so a 5%-opacity line lands as a solid one. That single
+ * quirk is what turned the vignette into a black frame, the aerial wash into
+ * a flat painted panel and the soft foreground grass into a dark smear.
+ *
+ * Filled shapes -- rectangle, ellipse, polygon -- are unaffected, which is
+ * why the clouds and the sun halo always looked right. Axis-aligned bands
+ * therefore use `imagefilledrectangle`, and diagonal strokes come through
+ * here, where antialiasing is switched off for the duration. At this size a
+ * diagonal without AA is barely distinguishable; a correct alpha is not
+ * optional.
+ */
+function vigil_soft_line($im, int $x0, int $y0, int $x1, int $y1, $color): void
+{
+    imageantialias($im, false);
+    imageline($im, $x0, $y0, $x1, $y1, $color);
+    imageantialias($im, true);
+}
+
+/** Allocate a colour, clamping the channels and the alpha. */
+function vigil_rgb($im, array $rgb, int $alpha = 0)
+{
+    return imagecolorallocatealpha($im,
+        max(0, min(255, (int)$rgb[0])),
+        max(0, min(255, (int)$rgb[1])),
+        max(0, min(255, (int)$rgb[2])),
+        max(0, min(127, $alpha)));
+}
+
+/** Linear blend of two RGB triples. */
+function vigil_mix(array $a, array $b, float $t): array
+{
+    $t = max(0.0, min(1.0, $t));
+    return [
+        (int)round($a[0] + ($b[0] - $a[0]) * $t),
+        (int)round($a[1] + ($b[1] - $a[1]) * $t),
+        (int)round($a[2] + ($b[2] - $a[2]) * $t),
+    ];
+}
+
+/** Push a colour toward white, for cel highlights. */
+function vigil_light(array $rgb, float $t): array
+{
+    return vigil_mix($rgb, [255, 255, 255], $t);
+}
+
+/** Push a colour toward the outline colour, for cel shadows. */
+function vigil_dark(array $rgb, array $ink, float $t): array
+{
+    return vigil_mix($rgb, $ink, $t);
+}
+
+/**
+ * Filled polygon across PHP versions.
+ *
+ * 8.1 deprecated the explicit point count and made it optional; 7.4 still
+ * requires it. Passing it unconditionally emits a deprecation notice, and any
+ * output before the gate's headers is a hard 500 -- so the branch is not
+ * cosmetic, it is what keeps the page rendering on newer PHP.
+ */
+function vigil_polygon($im, array $pts, $color): void
+{
+    if (count($pts) < 6) {
+        return;
+    }
+    if (PHP_VERSION_ID >= 80100) {
+        imagefilledpolygon($im, $pts, $color);
+    } else {
+        imagefilledpolygon($im, $pts, (int)(count($pts) / 2), $color);
+    }
+}
+
+/**
+ * Offsets on a circle of radius $r, so a shape can be dilated evenly.
+ *
+ * This is how outlines are drawn. GD's own thick outlines are unreliable for
+ * polygons -- they leave notches at joins -- so instead the shape is stamped
+ * a few pixels out in the ink colour and then filled on top, which produces a
+ * clean, even, closed contour at any thickness.
+ */
+function vigil_ink_ring(int $r): array
+{
+    static $cache = [];
+    if (isset($cache[$r])) {
+        return $cache[$r];
+    }
+    $out = [];
+    $n = max(8, (int)round(2 * M_PI * $r * 1.6));
+    for ($i = 0; $i < $n; $i++) {
+        $a = 2 * M_PI * $i / $n;
+        $dx = (int)round(cos($a) * $r);
+        $dy = (int)round(sin($a) * $r);
+        $out[$dx . ':' . $dy] = [$dx, $dy];
+    }
+    return $cache[$r] = array_values($out);
+}
+
+/** Shift a flat point list by (dx, dy). */
+function vigil_shift_pts(array $pts, int $dx, int $dy): array
+{
+    $out = [];
+    $n = count($pts);
+    for ($i = 0; $i < $n; $i += 2) {
+        $out[] = $pts[$i] + $dx;
+        $out[] = $pts[$i + 1] + $dy;
+    }
+    return $out;
+}
+
+/** A flat polygon with a thick outline. */
+function vigil_inked_poly($im, array $pts, $fill, $inkCol, int $ink = 2): void
+{
+    if ($ink > 0 && count($pts) >= 6) {
+        foreach (vigil_ink_ring($ink) as $o) {
+            vigil_polygon($im, vigil_shift_pts($pts, $o[0], $o[1]), $inkCol);
+        }
+    }
+    vigil_polygon($im, $pts, $fill);
+}
+
+/** A flat ellipse with a thick outline. */
+function vigil_inked_ellipse($im, int $cx, int $cy, int $ew, int $eh,
+                             $fill, $inkCol, int $ink = 2): void
+{
+    if ($ink > 0) {
+        foreach (vigil_ink_ring($ink) as $o) {
+            imagefilledellipse($im, $cx + $o[0], $cy + $o[1], $ew, $eh, $inkCol);
+        }
+    }
+    imagefilledellipse($im, $cx, $cy, $ew, $eh, $fill);
+}
+
+/**
+ * A union of ellipses sharing one outline.
+ *
+ * Outlining each lobe separately would draw the circles the cloud is made of
+ * straight through the middle of it. Stamping every lobe in ink first and
+ * then painting every lobe on top produces a single contour around the union.
+ */
+function vigil_inked_blob($im, array $lobes, $fill, $inkCol, int $ink = 2): void
+{
+    if ($ink > 0) {
+        foreach (vigil_ink_ring($ink) as $o) {
+            foreach ($lobes as $L) {
+                imagefilledellipse($im, $L[0] + $o[0], $L[1] + $o[1],
+                                   $L[2], $L[3], $inkCol);
+            }
+        }
+    }
+    foreach ($lobes as $L) {
+        imagefilledellipse($im, $L[0], $L[1], $L[2], $L[3], $fill);
+    }
+}
+
+/**
+ * Keep only the part of a polygon above $cutY, closing it along the cut.
+ *
+ * Used to slice snow caps and shorelines off a silhouette exactly, instead of
+ * approximating them with a second hand-built shape that never quite lines up
+ * with the first.
+ */
+function vigil_clip_top(array $pts, float $cutY): array
+{
+    return vigil_clip_line($pts, $cutY, true);
+}
+
+/** Keep only the part of a polygon on one side of a horizontal line. */
+function vigil_clip_line(array $pts, float $cutY, bool $keepAbove): array
+{
+    $out = [];
+    $n = (int)(count($pts) / 2);
+    if ($n < 3) {
+        return $out;
+    }
+    $inside = static function (float $y) use ($cutY, $keepAbove): bool {
+        return $keepAbove ? ($y <= $cutY) : ($y >= $cutY);
+    };
+    for ($i = 0; $i < $n; $i++) {
+        $j = ($i + 1) % $n;
+        $x1 = (float)$pts[$i * 2];
+        $y1 = (float)$pts[$i * 2 + 1];
+        $x2 = (float)$pts[$j * 2];
+        $y2 = (float)$pts[$j * 2 + 1];
+        $in1 = $inside($y1);
+        $in2 = $inside($y2);
+        if ($in1) {
+            $out[] = (int)round($x1);
+            $out[] = (int)round($y1);
+        }
+        if ($in1 !== $in2) {
+            $t = ($cutY - $y1) / (($y2 - $y1) ?: 1e-6);
+            $out[] = (int)round($x1 + ($x2 - $x1) * $t);
+            $out[] = (int)round($cutY);
+        }
+    }
+    return count($out) >= 6 ? $out : [];
+}
+
+/** Keep only the part of a polygon on one side of a vertical line. */
+function vigil_clip_x(array $pts, float $cut, bool $keepLeft): array
+{
+    $out = [];
+    $n = (int)(count($pts) / 2);
+    if ($n < 3) {
+        return $out;
+    }
+    $inside = static function (float $x) use ($cut, $keepLeft): bool {
+        return $keepLeft ? ($x <= $cut) : ($x >= $cut);
+    };
+    for ($i = 0; $i < $n; $i++) {
+        $j = ($i + 1) % $n;
+        $x1 = (float)$pts[$i * 2];
+        $y1 = (float)$pts[$i * 2 + 1];
+        $x2 = (float)$pts[$j * 2];
+        $y2 = (float)$pts[$j * 2 + 1];
+        $in1 = $inside($x1);
+        $in2 = $inside($x2);
+        if ($in1) {
+            $out[] = (int)round($x1);
+            $out[] = (int)round($y1);
+        }
+        if ($in1 !== $in2) {
+            $t = ($cut - $x1) / (($x2 - $x1) ?: 1e-6);
+            $out[] = (int)round($cut);
+            $out[] = (int)round($y1 + ($y2 - $y1) * $t);
+        }
+    }
+    return count($out) >= 6 ? $out : [];
+}
+
+/**
+ * One chibi mountain: a smooth-stepped flank up to a rounded peak.
+ *
+ * Smoothstep is doing the cute part. A straight triangle reads as a diagram;
+ * easing the flanks gives the flared base and soft crown that cartoon
+ * mountains have, with no extra geometry.
+ */
+function vigil_chibi_peak(float $x0, float $x1, float $baseY, float $peakY,
+                          float $lean, int $n = 16): array
+{
+    $px = ($x0 + $x1) / 2 + $lean * ($x1 - $x0) * 0.5;
+    $pts = [];
+    for ($i = 0; $i <= $n; $i++) {
+        $t = $i / $n;
+        $e = $t * $t * (3 - 2 * $t);
+        $pts[] = (int)round($x0 + ($px - $x0) * $e);
+        $pts[] = (int)round($baseY + ($peakY - $baseY) * $e);
+    }
+    for ($i = 1; $i <= $n; $i++) {
+        $t = $i / $n;
+        $e = $t * $t * (3 - 2 * $t);
+        $pts[] = (int)round($px + ($x1 - $px) * $e);
+        $pts[] = (int)round($peakY + ($baseY - $peakY) * $e);
+    }
+    return $pts;
+}
+
+/**
+ * Paint a range of chibi peaks, back to front.
+ *
+ * Each peak gets a flat body, a cel shadow on the side away from the sun, an
+ * optional snow cap and a shared heavy outline. The shadow boundary is a
+ * straight vertical cut, which is deliberately stylised -- a soft gradient
+ * here would fight the flat look everywhere else.
+ */
+function vigil_draw_range($im, int $w, int $h, $inkCol, array $inkRgb,
+                          array $body, array $shade, $snowCol, int $sunSide,
+                          float $baseY, float $peakY, int $count,
+                          int $sunX, bool $snow, int $inkW = 2): void
+{
+    $span = $w * 1.30 / max(1, $count);
+    $start = -$w * 0.15;
+    for ($i = 0; $i < $count; $i++) {
+        $x0 = $start + $i * $span;
+        $x1 = $x0 + $span * random_int(92, 112) / 100;
+        $jitter = random_int(-7, 7) / 100;
+        $py = $peakY * (1 + $jitter);
+        // A small lean only. Larger values swing the apex far enough off
+        // centre that the straight cel-shadow cut turns each peak into a
+        // lopsided wing instead of a mountain.
+        $lean = random_int(-9, 9) / 100;
+        $pts = vigil_chibi_peak($x0, $x1, $baseY, $py, $lean);
+        $bodyCol = vigil_rgb($im, $body);
+        $shadeCol = vigil_rgb($im, $shade);
+
+        // Outline and body first, then the cel shadow on top of the body.
+        vigil_inked_poly($im, $pts, $bodyCol, $inkCol, $inkW);
+        $cutX = ($x0 + $x1) / 2 + $lean * ($x1 - $x0) * 0.5;
+        $shadePts = vigil_clip_x($pts, $cutX, $sunSide > 0 ? false : true);
+        if ($shadePts) {
+            vigil_polygon($im, $shadePts, $shadeCol);
+        }
+        // Sunlit rim along the top of whichever flank faces the light.
+        $rimPts = vigil_clip_top($pts, $py + ($baseY - $py) * 0.16);
+        if ($rimPts) {
+            $rim = vigil_clip_x($rimPts, $cutX, $sunSide > 0 ? true : false);
+            if ($rim) {
+                vigil_polygon($im, $rim, vigil_rgb($im, vigil_light($body, 0.30)));
+            }
+        }
+        if ($snow && $snowCol !== null) {
+            $snowLine = $py + ($baseY - $py) * (0.24 + random_int(0, 6) / 100);
+            $capPts = vigil_clip_top($pts, $snowLine);
+            if ($capPts) {
+                // A ragged lower edge, generous enough to read at this size.
+                // At +-2px it was a straight line, and a straight line under a
+                // white triangle is what makes snow look glued on.
+                $jag = [];
+                $cn = (int)(count($capPts) / 2);
+                for ($k = 0; $k < $cn; $k++) {
+                    $cx = $capPts[$k * 2];
+                    $cy = $capPts[$k * 2 + 1];
+                    if ($cy >= (int)$snowLine - 3) {
+                        $cy += random_int(-5, 4);
+                    }
+                    $jag[] = $cx;
+                    $jag[] = $cy;
+                }
+                // Filled without an outline: the cap's upper edge is the
+                // mountain's own silhouette, so outlining it drew the ridge
+                // twice and thickened the summit into a separate shape.
+                vigil_polygon($im, $jag, vigil_rgb($im, $snowCol));
+                $shadowCap = vigil_clip_x($jag, $cutX, $sunSide > 0 ? false : true);
+                if ($shadowCap) {
+                    vigil_polygon($im, $shadowCap,
+                                  vigil_rgb($im, vigil_dark($snowCol, $inkRgb, 0.18)));
+                }
+                // A narrow rock band just below the snowline, so the white
+                // meets the mountain through a transition rather than a cut.
+                $bandTop = $jag;
+                for ($t = 0; $t < 3; $t++) {
+                    $band = [];
+                    $bn = (int)(count($bandTop) / 2);
+                    for ($k = 0; $k < $bn; $k++) {
+                        $band[] = $bandTop[$k * 2];
+                        $band[] = $bandTop[$k * 2 + 1] + $t;
+                    }
+                    for ($k = $bn - 1; $k >= 0; $k--) {
+                        $band[] = $bandTop[$k * 2];
+                        $band[] = $bandTop[$k * 2 + 1] + $t + 1;
+                    }
+                    if (count($band) >= 6) {
+                        vigil_polygon($im, $band, vigil_rgb($im,
+                            vigil_dark($snowCol, $body, 0.42 + $t * 0.16), 106));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** A cartoon cumulus: a union of lobes over a flat base, with one outline. */
+function vigil_draw_cloud($im, int $cx, int $cy, int $scale, array $body,
+                          array $shade, $inkCol): void
+{
+    $s = max(4.0, $scale / 2.0);
+    $lobes = [
+        [(int)round($cx - $s * 1.55), (int)round($cy + $s * 0.30),
+         (int)round($s * 1.15), (int)round($s * 1.00)],
+        [(int)round($cx + $s * 1.60), (int)round($cy + $s * 0.26),
+         (int)round($s * 1.25), (int)round($s * 1.06)],
+        [(int)round($cx - $s * 0.70), (int)round($cy - $s * 0.32),
+         (int)round($s * 1.70), (int)round($s * 1.62)],
+        [(int)round($cx + $s * 0.72), (int)round($cy - $s * 0.22),
+         (int)round($s * 1.80), (int)round($s * 1.52)],
+        [(int)round($cx), (int)round($cy - $s * 0.62),
+         (int)round($s * 1.85), (int)round($s * 1.62)],
+        [(int)round($cx - $s * 0.05), (int)round($cy + $s * 0.46),
+         (int)round($s * 4.30), (int)round($s * 0.92)],
+    ];
+    vigil_inked_blob($im, $lobes, vigil_rgb($im, $body), $inkCol, 2);
+    // Flat cel shadow along the underside.
+    $shadow = [];
+    foreach ($lobes as $L) {
+        $shadow[] = [$L[0] - (int)round($s * 0.08), $L[1] + (int)round($s * 0.54),
+                     (int)round($L[2] * 0.90), (int)round($L[3] * 0.40)];
+    }
+    foreach ($shadow as $L) {
+        imagefilledellipse($im, $L[0], $L[1], $L[2], $L[3],
+                           vigil_rgb($im, $shade));
+    }
+    // Two highlights, so the top reads as lit rather than merely uncut.
+    imagefilledellipse($im, (int)round($cx - $s * 0.75), (int)round($cy - $s * 0.95),
+                       (int)round($s * 1.15), (int)round($s * 0.72),
+                       vigil_rgb($im, vigil_light($body, 0.55)));
+    imagefilledellipse($im, (int)round($cx + $s * 0.85), (int)round($cy - $s * 0.72),
+                       (int)round($s * 0.85), (int)round($s * 0.55),
+                       vigil_rgb($im, vigil_light($body, 0.45)));
+}
+
+/** A chibi tree: a round canopy over a stubby trunk. */
+function vigil_draw_tree($im, int $x, int $y, int $size, array $leaf,
+                         array $shade, $inkCol, bool $conifer): void
+{
+    $trunkW = max(3, (int)round($size * 0.20));
+    $trunkH = max(4, (int)round($size * 0.42));
+    $trunk = vigil_rgb($im, [0x8a, 0x5f, 0x42]);
+    $trunkInk = vigil_rgb($im, [0x4a, 0x33, 0x30]);
+    vigil_inked_poly($im, [
+        $x - (int)($trunkW / 2), $y,
+        $x + (int)($trunkW / 2), $y,
+        $x + (int)($trunkW / 2), $y - $trunkH,
+        $x - (int)($trunkW / 2), $y - $trunkH,
+    ], $trunk, $trunkInk, 1);
+    $r = (int)round($size * 0.62);
+    if ($conifer) {
+        $h = (int)round($size * 1.5);
+        $tiers = 3;
+        for ($i = 0; $i < $tiers; $i++) {
+            $t = $i / $tiers;
+            $ty = (int)round($y - $trunkH - $h * $t * 0.72);
+            $hw = (int)round($r * (1 - $t * 0.42));
+            $tip = $ty - (int)round($h * 0.52);
+            vigil_inked_poly($im, [
+                $x - $hw, $ty, $x + $hw, $ty, $x, $tip,
+            ], vigil_rgb($im, $i === $tiers - 1 ? $leaf : $shade), $inkCol, 2);
+        }
+        return;
+    }
+    $canopy = [
+        [$x, (int)round($y - $trunkH - $r * 0.85), $r * 2, $r * 2],
+        [(int)round($x - $r * 0.82), (int)round($y - $trunkH - $r * 0.30), (int)($r * 1.6), (int)($r * 1.5)],
+        [(int)round($x + $r * 0.82), (int)round($y - $trunkH - $r * 0.34), (int)($r * 1.65), (int)($r * 1.55)],
+    ];
+    vigil_inked_blob($im, $canopy, vigil_rgb($im, $leaf), $inkCol, 2);
+    foreach ($canopy as $L) {
+        imagefilledellipse($im, $L[0] - (int)($r * 0.16), $L[1] + (int)($r * 0.62),
+                           (int)($L[2] * 0.80), (int)($L[3] * 0.34),
+                           vigil_rgb($im, $shade));
+    }
+    imagefilledellipse($im, (int)round($x - $r * 0.42), (int)round($y - $trunkH - $r * 1.28),
+                       (int)($r * 0.86), (int)($r * 0.66),
+                       vigil_rgb($im, vigil_light($leaf, 0.5)));
+}
+
+/** A four-point sparkle, the anime shorthand for "this is lovely". */
+function vigil_draw_sparkle($im, int $x, int $y, int $r, $col): void
+{
+    if ($r < 2) {
+        return;
+    }
+    $t = max(1, (int)round($r * 0.20));
+    vigil_polygon($im, [$x, $y - $r, $x + $t, $y, $x, $y + $r, $x - $t, $y], $col);
+    vigil_polygon($im, [$x - $r, $y, $x, $y - $t, $x + $r, $y, $x, $y + $t], $col);
+}
+
+/** A chibi critter, sitting in the grass. */
+function vigil_draw_mascot($im, int $x, int $y, int $s, array $fur,
+                           $inkCol, int $kind): void
+{
+    $body = vigil_rgb($im, $fur);
+    $shade = vigil_rgb($im, vigil_dark($fur, [0x3a, 0x33, 0x58], 0.16));
+    $w = $s * 2;
+    $h = (int)round($s * 1.7);
+    if ($kind === 1) {
+        // Round bird: body, wing, beak, eye.
+        vigil_inked_ellipse($im, $x, $y - (int)($h * 0.45), $w, $h, $body, $inkCol, 2);
+        imagefilledellipse($im, $x - (int)($s * 0.55), $y - (int)($h * 0.45),
+                           (int)($s * 0.85), (int)($s * 0.95), $shade);
+        vigil_polygon($im, [$x + (int)($s * 0.85), $y - (int)($h * 0.55),
+                            $x + (int)($s * 1.65), $y - (int)($h * 0.42),
+                            $x + (int)($s * 0.85), $y - (int)($h * 0.30)],
+                      vigil_rgb($im, [0xff, 0xb3, 0x3d]));
+        imagefilledellipse($im, $x + (int)($s * 0.45), $y - (int)($h * 0.68),
+                           max(2, (int)($s * 0.28)), max(2, (int)($s * 0.34)), $inkCol);
+        return;
+    }
+    // Cat-ish blob: body, two ears, eyes, blush.
+    $ears = [
+        [$x - (int)($s * 0.72), $y - (int)($h * 0.95), (int)($s * 0.62), (int)($s * 0.62)],
+        [$x + (int)($s * 0.72), $y - (int)($h * 0.95), (int)($s * 0.62), (int)($s * 0.62)],
+        [$x, $y - (int)($h * 0.50), $w, $h],
+    ];
+    vigil_inked_blob($im, $ears, $body, $inkCol, 2);
+    imagefilledellipse($im, $x, $y - (int)($h * 0.34), (int)($w * 0.72),
+                       (int)($h * 0.36), $shade);
+    $eye = max(2, (int)round($s * 0.20));
+    imagefilledellipse($im, $x - (int)($s * 0.36), $y - (int)($h * 0.62), $eye, $eye * 2, $inkCol);
+    imagefilledellipse($im, $x + (int)($s * 0.36), $y - (int)($h * 0.62), $eye, $eye * 2, $inkCol);
+    imagefilledellipse($im, $x - (int)($s * 0.78), $y - (int)($h * 0.46),
+                       max(2, (int)($s * 0.34)), max(2, (int)($s * 0.22)),
+                       vigil_rgb($im, [0xff, 0x9a, 0xb4], 30));
+    imagefilledellipse($im, $x + (int)($s * 0.78), $y - (int)($h * 0.46),
+                       max(2, (int)($s * 0.34)), max(2, (int)($s * 0.22)),
+                       vigil_rgb($im, [0xff, 0x9a, 0xb4], 30));
+}
+
+/** A simple bird glyph: two arcs, the anime "flying birds" mark. */
+function vigil_draw_birds($im, int $cx, int $cy, int $n, int $scale, $col): void
+{
+    imagesetthickness($im, max(1, (int)round($scale / 4)));
+    for ($i = 0; $i < $n; $i++) {
+        $row = (int)($i / 2) + 1;
+        $side = ($i % 2) ? 1 : -1;
+        $bx = (int)round($cx + $side * $row * $scale * 2.0) + random_int(-2, 2);
+        $by = (int)round($cy + $row * $scale * 1.2) + random_int(-2, 2);
+        $s = max(2, (int)round($scale * (1 - $row * 0.06)));
+        imagearc($im, $bx - $s, $by, $s * 2, (int)($s * 1.5), 200, 335, $col);
+        imagearc($im, $bx + $s, $by, $s * 2, (int)($s * 1.5), 205, 340, $col);
+    }
+    imagesetthickness($im, 1);
+}
+
+/** The meadow: flat cel bands, rounded hills, tufts, flowers, sparkles. */
+function vigil_draw_meadow($im, int $w, int $h, int $top, array $far,
+                           array $near, array $flowers, $inkCol): void
+{
+    // Rounded hills, back to front, each flat-shaded with one outline.
+    // Each hill is a wide, shallow ellipse. Its centre is placed so that the
+    // top of the arc lands exactly on $top: any higher and the first hill
+    // paints over the water it is supposed to stand behind.
+    $bands = 3;
+    $eh = (int)round(($h - $top) * 0.92);
+    $shapes = [[1.75, 0.28], [1.35, 0.74], [1.95, 0.46]];
+    for ($i = 0; $i < $bands; $i++) {
+        $t = $i / max(1, $bands - 1);
+        $col = vigil_rgb($im, vigil_mix($far, $near, 0.10 + $t * 0.72));
+        $cy = (int)round($top + $eh * (0.50 + 0.26 * $t));
+        $ew = (int)round($w * $shapes[$i][0]);
+        $cx = (int)round($w * $shapes[$i][1]);
+        vigil_inked_ellipse($im, $cx, $cy, $ew, $eh, $col, $inkCol, 2);
+    }
+    // Flat foreground, so the bottom of the frame is a solid colour.
+    imagefilledrectangle($im, 0, (int)round($top + ($h - $top) * 0.62), $w, $h,
+                         vigil_rgb($im, $near));
+
+    // Tufts: three short strokes each, angled away from the light.
+    $tufts = (int)($w * 1.5);
+    for ($i = 0; $i < $tufts; $i++) {
+        $x = random_int(0, $w);
+        $y = random_int((int)round($top + ($h - $top) * 0.42), $h);
+        $len = random_int(3, 8);
+        $col = vigil_rgb($im, vigil_mix($near, [0xff, 0xff, 0xff], random_int(0, 32) / 100));
+        imagesetthickness($im, 1);
+        imageline($im, $x, $y, $x - (int)round($len * 0.5), $y - $len, $col);
+        imageline($im, $x, $y, $x, $y - $len - 1, $col);
+        imageline($im, $x, $y, $x + (int)round($len * 0.55), $y - $len, $col);
+    }
+    // Flowers: a ring of petals around a bright centre.
+    $nf = (int)max(6, $w / 12);
+    for ($i = 0; $i < $nf; $i++) {
+        $x = random_int(4, max(5, $w - 4));
+        $y = random_int((int)round($top + ($h - $top) * 0.52), max(5, $h - 4));
+        $c = $flowers[array_rand($flowers)];
+        $r = random_int(2, 3);
+        for ($a = 0; $a < 5; $a++) {
+            $ang = 2 * M_PI * $a / 5;
+            imagefilledellipse($im, (int)round($x + cos($ang) * $r),
+                               (int)round($y + sin($ang) * $r),
+                               $r, $r, vigil_rgb($im, $c));
+        }
+        imagefilledellipse($im, $x, $y, 2, 2, vigil_rgb($im, [0xff, 0xf4, 0xb0]));
+    }
+    // Sparkles, for the きらきら the style wants.
+    for ($i = 0; $i < (int)max(3, $w / 34); $i++) {
+        vigil_draw_sparkle($im,
+            random_int(6, max(7, $w - 6)),
+            random_int((int)round($top + ($h - $top) * 0.45), max(7, $h - 6)),
+            random_int(3, 5),
+            vigil_rgb($im, [0xff, 0xff, 0xff], 26));
+    }
+    imagesetthickness($im, 1);
+}
+
+/**
+ * Thin, high-altitude cloud streaks.
+ *
+ * Cumulus alone makes a sky look like a diagram. A few translucent bands
+ * near the top give it the layered depth that anime skies have, and they are
+ * drawn flat rather than puffy precisely because they are far away.
+ */
+function vigil_draw_cirrus($im, int $w, int $y0, int $y1, array $col,
+                           int $count): void
+{
+    for ($i = 0; $i < $count; $i++) {
+        $cy = random_int($y0, max($y0, $y1));
+        $cx = random_int(-20, $w + 20);
+        $len = random_int((int)($w * 0.20), (int)($w * 0.62));
+        $th = random_int(2, 5);
+        $tilt = random_int(-3, 3);
+        $a = random_int(78, 106);
+        $c = vigil_rgb($im, $col, $a);
+        // A parallelogram, so the streak can lean without needing rotation.
+        vigil_polygon($im, [
+            $cx, $cy,
+            $cx + $len, $cy + $tilt,
+            $cx + $len, $cy + $tilt + $th,
+            $cx, $cy + $th,
+        ], $c);
+        imagefilledellipse($im, $cx, $cy + (int)($th / 2), $th * 3, $th,
+                           $c);
+    }
+}
+
+/**
+ * A path winding from the near edge to the horizon.
+ *
+ * The single most reliable way to make a flat band of green read as *ground
+ * with distance in it*: two converging edges give the eye a vanishing point
+ * that no amount of texture can fake.
+ */
+function vigil_draw_path($im, int $w, int $h, int $top, int $bot,
+                         array $col, $inkCol): void
+{
+    $xTop = random_int((int)($w * 0.26), (int)($w * 0.74));
+    $xBot = random_int((int)($w * 0.05), (int)($w * 0.95));
+    $midX = (int)(($xTop + $xBot) / 2) + random_int(-40, 40);
+    $steps = 14;
+    $left = [];
+    $right = [];
+    for ($i = 0; $i <= $steps; $i++) {
+        $t = $i / $steps;
+        $y = (int)round($bot + ($top - $bot) * $t);
+        // Quadratic wander, so the path curves rather than running straight.
+        $x = (int)round($xBot + ($xTop - $xBot) * $t
+             + ($midX - ($xTop + $xBot) / 2) * 4 * $t * (1 - $t));
+        // Perspective: wide at the bottom, pinching to nothing at the top.
+        $hw = (int)round((1 - $t) * (1 - $t) * random_int(14, 24) + 1);
+        $left[] = [$x - $hw, $y];
+        $right[] = [$x + $hw, $y];
+    }
+    $pts = [];
+    foreach ($left as $p) {
+        $pts[] = $p[0];
+        $pts[] = $p[1];
+    }
+    for ($i = count($right) - 1; $i >= 0; $i--) {
+        $pts[] = $right[$i][0];
+        $pts[] = $right[$i][1];
+    }
+    vigil_polygon($im, $pts, vigil_rgb($im, $col));
+    // A lighter verge on one side; bare edges read as a painted stripe.
+    imagesetthickness($im, 1);
+    for ($i = 0; $i < count($left) - 1; $i++) {
+        vigil_soft_line($im, $left[$i][0], $left[$i][1],
+                  $left[$i + 1][0], $left[$i + 1][1],
+                  vigil_rgb($im, vigil_light($col, 0.28), 60));
+    }
+}
+
+/**
+ * A field fence, in perspective.
+ *
+ * Post height and spacing both shrink with distance, which is what makes it
+ * sit on the ground instead of floating above it.
+ */
+function vigil_draw_fence($im, int $w, int $y0, int $y1, array $col,
+                          int $posts): void
+{
+    $ink = vigil_rgb($im, $col, 20);
+    imagesetthickness($im, 1);
+    $prev = null;
+    for ($i = 0; $i <= $posts; $i++) {
+        $t = $i / $posts;
+        $x = (int)round(-8 + ($w + 16) * $t);
+        $y = (int)round($y0 + ($y1 - $y0) * $t);
+        // Nearer posts are taller: distance is a scale, not a fade.
+        $hgt = (int)round(4 + 7 * $t);
+        vigil_soft_line($im, $x, $y, $x, $y - $hgt, $ink);
+        if ($prev !== null) {
+            vigil_soft_line($im, $prev[0], $prev[1] - (int)($prev[2] * 0.78),
+                      $x, $y - (int)($hgt * 0.78), $ink);
+            vigil_soft_line($im, $prev[0], $prev[1] - (int)($prev[2] * 0.42),
+                      $x, $y - (int)($hgt * 0.42), $ink);
+        }
+        $prev = [$x, $y, $hgt];
+    }
+}
+
+/** A small distant building: wall, roof, two windows. */
+function vigil_draw_house($im, int $x, int $y, int $s, array $wall,
+                          array $roof, $inkCol): void
+{
+    $w = $s;
+    $h = (int)round($s * 0.72);
+    vigil_inked_poly($im, [
+        $x, $y, $x + $w, $y, $x + $w, $y - $h, $x, $y - $h,
+    ], vigil_rgb($im, $wall), $inkCol, 1);
+    vigil_inked_poly($im, [
+        $x - (int)($s * 0.16), $y - $h,
+        $x + $w + (int)($s * 0.16), $y - $h,
+        $x + (int)($w / 2), $y - $h - (int)($s * 0.46),
+    ], vigil_rgb($im, $roof), $inkCol, 1);
+    if ($s >= 12) {
+        $win = vigil_rgb($im, vigil_light($wall, -0.0), 40);
+        imagefilledrectangle($im, $x + 2, $y - $h + 2, $x + 5, $y - $h + 6,
+                             vigil_rgb($im, [0xff, 0xe9, 0xa8]));
+        imagefilledrectangle($im, $x + $w - 6, $y - $h + 2, $x + $w - 3,
+                             $y - $h + 6, vigil_rgb($im, [0xff, 0xe9, 0xa8]));
+    }
+}
+
+/**
+ * A transmission pylon, in silhouette.
+ *
+ * Nothing says "Japanese countryside" to someone who has watched any anime
+ * set outside a city, and it costs eight lines.
+ */
+function vigil_draw_pylon($im, int $x, int $baseY, int $hgt, array $col): void
+{
+    $ink = vigil_rgb($im, $col, 24);
+    imagesetthickness($im, 1);
+    $top = $baseY - $hgt;
+    $half = (int)round($hgt * 0.13);
+    // Legs.
+    vigil_soft_line($im, $x - $half, $baseY, $x - (int)($half * 0.3), $top, $ink);
+    vigil_soft_line($im, $x + $half, $baseY, $x + (int)($half * 0.3), $top, $ink);
+    // Cross members.
+    for ($i = 1; $i <= 3; $i++) {
+        $t = $i / 4;
+        $ly = (int)round($baseY + ($top - $baseY) * $t);
+        $lh = (int)round($half * (1 - $t * 0.7));
+        vigil_soft_line($im, $x - $lh, $ly, $x + $lh, $ly, $ink);
+        vigil_soft_line($im, $x - $lh, $ly, $x + (int)($lh * 0.4), $ly - (int)($hgt * 0.08), $ink);
+    }
+    // Arms.
+    foreach ([0.30, 0.52] as $t) {
+        $ay = (int)round($baseY + ($top - $baseY) * $t);
+        $aw = (int)round($half * (2.4 - $t * 1.1));
+        vigil_soft_line($im, $x - $aw, $ay, $x + $aw, $ay, $ink);
+    }
+}
+
+/** A round bush: a blob with one outline and a lit crown. */
+function vigil_draw_bush($im, int $x, int $y, int $s, array $leaf,
+                         array $shade, $inkCol): void
+{
+    $r = max(3, (int)round($s * 0.5));
+    $lobes = [
+        [$x, $y - (int)($r * 0.55), $r * 2, (int)($r * 1.7)],
+        [$x - (int)($r * 0.7), $y - (int)($r * 0.2), (int)($r * 1.4), (int)($r * 1.2)],
+        [$x + (int)($r * 0.7), $y - (int)($r * 0.25), (int)($r * 1.5), (int)($r * 1.25)],
+    ];
+    vigil_inked_blob($im, $lobes, vigil_rgb($im, $leaf), $inkCol, 1);
+    foreach ($lobes as $L) {
+        imagefilledellipse($im, $L[0] + (int)($r * 0.12), $L[1] + (int)($r * 0.55),
+                           (int)($L[2] * 0.82), (int)($L[3] * 0.40),
+                           vigil_rgb($im, $shade));
+    }
+    imagefilledellipse($im, $x - (int)($r * 0.4), $y - (int)($r * 0.95),
+                       (int)($r * 0.9), (int)($r * 0.6),
+                       vigil_rgb($im, vigil_light($leaf, 0.45)));
+}
+
+/** A small rock, flat-shaded with a lit top. */
+function vigil_draw_rock($im, int $x, int $y, int $s, array $col, $inkCol): void
+{
+    $pts = [];
+    $n = 7;
+    for ($i = 0; $i < $n; $i++) {
+        $a = M_PI + M_PI * $i / ($n - 1);
+        $rr = $s * (0.72 + random_int(0, 40) / 100);
+        $pts[] = (int)round($x + cos($a) * $rr);
+        $pts[] = (int)round($y + sin($a) * $rr * 0.7);
+    }
+    vigil_inked_poly($im, $pts, vigil_rgb($im, $col), $inkCol, 1);
+    $lit = [];
+    $cn = (int)(count($pts) / 2);
+    for ($i = 0; $i < $cn; $i++) {
+        if ($pts[$i * 2 + 1] <= $y - (int)($s * 0.25)) {
+            $lit[] = $pts[$i * 2];
+            $lit[] = $pts[$i * 2 + 1];
+        }
+    }
+    if (count($lit) >= 6) {
+        vigil_polygon($im, $lit, vigil_rgb($im, vigil_light($col, 0.34)));
+    }
+}
+
+/**
+ * The near edge, out of focus.
+ *
+ * Tall blades crowding the bottom of the frame, drawn thick and dark. It
+ * frames the picture the way a foreground branch does in a photograph, and
+ * it is the cheapest large increase in perceived depth available.
+ */
+function vigil_draw_foreground($im, int $w, int $h, array $col, int $count): void
+{
+    $base = $h + 2;
+    for ($i = 0; $i < $count; $i++) {
+        $x = random_int(-10, $w + 10);
+        $len = random_int((int)($h * 0.08), (int)($h * 0.20));
+        $lean = random_int(-12, 12);
+        $th = random_int(2, 4);
+        // Now that alpha actually applies, the old 30-70 range reads as a
+        // solid dark band across the bottom of the frame.
+        $c = vigil_rgb($im, vigil_mix($col, [255, 255, 255], random_int(0, 24) / 100),
+                       random_int(74, 106));
+        imagesetthickness($im, $th);
+        $px = $x;
+        $py = $base;
+        for ($s = 1; $s <= 4; $s++) {
+            $nx = (int)round($x + $lean * $s / 4 + 3 * sin($s * 1.3 + $x / 11.0));
+            $ny = (int)round($base - $len * $s / 4);
+            vigil_soft_line($im, $px, $py, $nx, $ny, $c);
+            $px = $nx;
+            $py = $ny;
+        }
+    }
+    imagesetthickness($im, 1);
+}
+
+/**
+ * Ripples on the water, spaced by perspective.
+ *
+ * Evenly spaced lines read as a barcode; spacing them by the square of the
+ * distance is what makes the surface recede.
+ */
+function vigil_draw_ripples($im, int $w, int $top, int $bot, array $col): void
+{
+    $steps = 11;
+    for ($i = 1; $i <= $steps; $i++) {
+        $t = $i / $steps;
+        $y = (int)round($top + ($bot - $top) * ($t * $t));
+        if ($y <= $top + 1 || $y >= $bot) {
+            continue;
+        }
+        $a = random_int(112, 124);
+        $c = vigil_rgb($im, $col, $a);
+        // Sparse. Water drawn with many overlapping highlights stops looking
+        // like water and starts looking like a washed-out band -- the
+        // surface only needs enough glints to establish that it is level.
+        $n = (int)round(1 + 2 * $t);
+        for ($k = 0; $k < $n; $k++) {
+            $len = random_int((int)(5 + 18 * $t), (int)(14 + 40 * $t));
+            $x = random_int(-10, $w);
+            imagefilledellipse($im, $x + (int)($len / 2), $y, $len,
+                               random_int(1, 2), $c);
+        }
+    }
+}
+
+/**
+ * A contact shadow, so a thing sits on the ground instead of hovering.
+ *
+ * This is the single largest coherence fix available. Every object in the
+ * scene was drawn with its own flat fill and its own outline and nothing
+ * tying it to the surface underneath, which is exactly why the result read
+ * as stickers arranged on a background. Two nested translucent ellipses cost
+ * almost nothing and are enough to look like ground contact.
+ */
+function vigil_draw_shadow($im, int $x, int $y, int $rx, int $ry,
+                           array $inkRgb): void
+{
+    if ($rx < 2 || $ry < 1) {
+        return;
+    }
+    foreach ([[1.0, 112], [1.5, 120]] as $p) {
+        imagefilledellipse($im, $x, $y + 1,
+                           (int)round($rx * 2 * $p[0]),
+                           (int)round($ry * 2 * $p[0]),
+                           vigil_rgb($im, $inkRgb, $p[1]));
+    }
+}
+
+/**
+ * Aerial perspective, applied once over the finished picture.
+ *
+ * Distance is not a property of any single layer -- it is a relationship
+ * between them. Tinting the far ridges individually helped, but the layers
+ * still disagreed wherever they met. Washing the *whole* frame toward the
+ * horizon colour, strongest at the horizon and falling off both ways,
+ * forces every boundary to agree at once, which is what makes a stack of
+ * separately drawn bands read as one continuous place.
+ */
+function vigil_slider_haze($im, int $w, int $h, int $horizon,
+                           array $hazeCol, float $strength): void
+{
+    $spread = max(12.0, $h * 0.30);
+    for ($y = 0; $y < $h; $y++) {
+        $d = ($y - $horizon) / $spread;
+        $s = exp(-$d * $d);
+        // The ground is nearer than the sky, so it takes less of the wash.
+        if ($y > $horizon) {
+            $s *= 0.50;
+        }
+        $a = (int)round($strength * $s);
+        if ($a <= 1) {
+            continue;
+        }
+        imagefilledrectangle($im, 0, $y, $w, $y,
+                  vigil_rgb($im, $hazeCol, max(2, 127 - $a)));
+    }
+}
+
+/**
+ * One light, everywhere.
+ *
+ * A warm wash from the sun's side and a cool one away from it. Without this
+ * the sky, the ridges and the field each carry their own private lighting,
+ * and the eye reads the picture as three pictures. Two vertical ramps are
+ * enough to make them agree.
+ */
+function vigil_slider_lightwrap($im, int $w, int $h, int $sunX,
+                                array $warmCol, array $coolCol): void
+{
+    for ($x = 0; $x < $w; $x++) {
+        $d = abs($x - $sunX) / max(1, $w);
+        $warm = 1 - $d;
+        $a = (int)round(18 * $warm * $warm);
+        if ($a > 1) {
+            imagefilledrectangle($im, $x, 0, $x, $h,
+                      vigil_rgb($im, $warmCol, max(2, 127 - $a)));
+        }
+        $cool = $d;
+        $b = (int)round(9 * $cool * $cool);
+        if ($b > 1) {
+            imagefilledrectangle($im, $x, 0, $x, $h,
+                      vigil_rgb($im, $coolCol, max(2, 127 - $b)));
+        }
+    }
+}
+
+/**
+ * Sparse luminance noise, to stop the flats looking like vector art.
+ *
+ * Applied after the grade, so it breaks up the wash as well as the fills.
+ * Kept sparse on purpose: at one pixel in six it costs a few milliseconds,
+ * and a denser pass is not visible at this size anyway once the browser
+ * scales the image into the puzzle frame.
+ */
+function vigil_slider_dither($im, int $w, int $h, int $count): void
+{
+    for ($i = 0; $i < $count; $i++) {
+        $x = mt_rand(0, $w - 1);
+        $y = mt_rand(0, $h - 1);
+        $rgb = imagecolorat($im, $x, $y);
+        $j = mt_rand(-8, 8);
+        imagesetpixel($im, $x, $y, imagecolorallocate($im,
+            max(0, min(255, (($rgb >> 16) & 0xFF) + $j)),
+            max(0, min(255, (($rgb >> 8) & 0xFF) + $j)),
+            max(0, min(255, ($rgb & 0xFF) + $j))));
+    }
+}
+
+/**
+ * A soft, believable waterline.
+ *
+ * A two-pixel ink rule across the whole frame is a graphic device, and it
+ * made the water look cut out and laid over the bank. A shallow band of
+ * shore colour with a lighter edge where the light catches the water reads
+ * as the two meeting, which is what the picture needs.
+ */
+function vigil_draw_shore($im, int $w, int $y, int $thick,
+                          array $bankCol, array $lightCol, $inkCol): void
+{
+    for ($i = 0; $i < $thick; $i++) {
+        $c = vigil_mix($bankCol, $lightCol, $i / max(1, $thick - 1));
+        $a = 40 + $i * 26;
+        imagefilledrectangle($im, 0, $y + $i, $w, $y + $i,
+                  vigil_rgb($im, $c, min(126, $a)));
+    }
+    // A broken bright edge, not a solid rule.
+    for ($x = 0; $x < $w; $x += random_int(2, 7)) {
+        $len = random_int(3, 11);
+        imagefilledrectangle($im, $x, $y, $x + $len, $y,
+                  vigil_rgb($im, $lightCol, random_int(74, 108)));
+    }
+    imagesetthickness($im, 1);
+    imagefilledrectangle($im, 0, $y, $w, $y, vigil_rgb($im, $inkCol, 118));
+}
+
+/**
+ * A clump of trees rather than a lone specimen.
+ *
+ * Trees in a landscape grow in groups of overlapping sizes; a single tree at
+ * a single size, repeated, is what made the middle distance look stamped.
+ */
+function vigil_draw_grove($im, int $x, int $y, int $size, array $leaf,
+                          array $shade, $inkCol, $inkRgb, float $depth): void
+{
+    $n = random_int(2, 4);
+    $offsets = [[0, 0, 1.0]];
+    for ($i = 1; $i < $n; $i++) {
+        $offsets[] = [random_int(-1, 1) * (int)round($size * 1.05),
+                      random_int(-1, 1) * (int)round($size * 0.24),
+                      0.62 + random_int(0, 38) / 100];
+    }
+    usort($offsets, static fn($a, $b) => $b[2] <=> $a[2]);
+    foreach ($offsets as $o) {
+        $s = max(4, (int)round($size * $o[2]));
+        $cx = $x + $o[0];
+        $cy = $y + $o[1];
+        vigil_draw_shadow($im, $cx, $cy, (int)round($s * 0.72),
+                          max(1, (int)round($s * 0.20)), $inkRgb);
+        vigil_draw_tree($im, $cx, $cy, $s,
+                        vigil_mix($leaf, [255, 255, 255], (1 - $depth) * 0.30),
+                        vigil_mix($shade, [255, 255, 255], (1 - $depth) * 0.24),
+                        $inkCol, random_int(0, 3) === 0);
+    }
+}
+
+/**
+ * Draw the puzzle background.
+ *
+ * Back to front: sky, stars, sun or moon, two cloud layers, three ranges of
+ * chibi peaks, aerial haze, a treeline on the shore, water with the shore
+ * mirrored in it and light bars across it, rounded meadow hills, trees,
+ * critters, sparkles. One preset and one sun position light all of it.
+ *
+ * Nothing here moves. The live motion is layered over this still image in the
+ * browser: the painting is the thing being reassembled, so it has to stand on
+ * its own as a picture.
+ */
+function vigil_slider_background(int $w, int $h, ?string $forceScene = null): array
+{
+    $scenes = vigil_slider_scenes();
+    $keys = array_keys($scenes);
+    if ($forceScene !== null && isset($scenes[$forceScene])) {
+        $sceneName = $forceScene;
+    } else {
+        $sceneName = $keys[random_int(0, count($keys) - 1)];
+    }
+    $scene = $scenes[$sceneName];
+
+    // Five hand-tuned presets is five pictures, however much the clouds
+    // vary inside them: the eye reads "same picture again" from the palette
+    // long before it notices new trees. Rotating every colour by a random
+    // hue, and nudging saturation and brightness, multiplies the same
+    // composition into a much larger set while keeping each result coherent
+    // -- all the colours move together, so the light still agrees with
+    // itself.
+    if ($sceneName !== 'night') {
+        $scene = vigil_slider_recolor($scene, random_int(-46, 46),
+                                      random_int(88, 114) / 100,
+                                      random_int(94, 108) / 100);
+    }
+
+    $im = imagecreatetruecolor($w, $h);
+    imagealphablending($im, true);
+    imageantialias($im, true);
+
+    $horizon = (int)round($h * (0.46 + random_int(0, 6) / 100));
+    $sunX = (int)round($w * $scene['sun'][0]);
+    $sunY = (int)round($h * $scene['sun'][1]);
+    $sunSide = ($scene['sun'][0] >= 0.5) ? 1 : -1;
+    [$skyTop, $skyMid, $skyHor] = $scene['sky'];
+    $inkCol = vigil_rgb($im, $scene['ink']);
+
+    // The shoreline is fixed before anything is drawn, because the ranges and
+    // the treeline are positioned relative to it.
+    $hasWater = !empty($scene['water']);
+    $shore = $hasWater ? ($horizon + 16) : (int)round($h * 0.66);
+    $waterTop = $hasWater ? $shore : 0;
+    $waterBot = $hasWater ? $shore + (int)round(($h - $shore) * 0.34) : 0;
+
+    // --- sky ---------------------------------------------------------------
+    for ($y = 0; $y <= $horizon + 2; $y++) {
+        $t = $y / max(1, $horizon);
+        $c = $t < 0.58
+            ? vigil_mix($skyTop, $skyMid, $t / 0.58)
+            : vigil_mix($skyMid, $skyHor, ($t - 0.58) / 0.42);
+        imageline($im, 0, $y, $w, $y, vigil_rgb($im, $c));
+    }
+
+    if (!empty($scene['stars'])) {
+        for ($i = 0; $i < 70; $i++) {
+            $b = random_int(180, 255);
+            $sx = random_int(0, $w - 1);
+            $sy = random_int(0, max(1, (int)($horizon * 0.72)));
+            $c = vigil_rgb($im, [$b, $b, 255], random_int(0, 60));
+            imagesetpixel($im, $sx, $sy, $c);
+            if ($i % 9 === 0) {
+                vigil_draw_sparkle($im, $sx, $sy, random_int(3, 5), $c);
+            }
+        }
+    }
+
+    // --- sun or moon -------------------------------------------------------
+    $sunCore = $scene['sun'][2];
+    $sunGlow = $scene['sun'][3];
+    if (!empty($scene['rays'])) {
+        $rays = 12;
+        for ($i = 0; $i < $rays; $i++) {
+            $a = 2 * M_PI * $i / $rays;
+            $r0 = $h * 0.14;
+            $r1 = $h * (0.30 + random_int(0, 22) / 100);
+            $spr = 0.055;
+            vigil_polygon($im, [
+                (int)round($sunX + cos($a - $spr) * $r0), (int)round($sunY + sin($a - $spr) * $r0),
+                (int)round($sunX + cos($a + $spr) * $r0), (int)round($sunY + sin($a + $spr) * $r0),
+                (int)round($sunX + cos($a) * $r1), (int)round($sunY + sin($a) * $r1),
+            ], vigil_rgb($im, $sunGlow, 104));
+        }
+    }
+    // The halo has to be *most* transparent at its outer edge or the last
+    // ring reads as a drawn circle floating in the sky. Alpha runs from
+    // invisible at the rim to opaque at the core, which is a radial gradient
+    // built out of flat discs.
+    $haloR = (int)($h * 0.30);
+    for ($r = $haloR; $r > 0; $r -= 2) {
+        $t = $r / max(1, $haloR);
+        $a = 126 - (int)(106 * pow(1 - $t, 1.5));
+        imagefilledellipse($im, $sunX, $sunY, $r * 2, $r * 2,
+                           vigil_rgb($im, $sunGlow, max(8, min(126, $a))));
+    }
+    $sunR = (int)max(9, $h * 0.088);
+    vigil_inked_ellipse($im, $sunX, $sunY, $sunR * 2, $sunR * 2,
+                        vigil_rgb($im, $sunCore), $inkCol, 2);
+    if (!empty($scene['moon'])) {
+        // Crescent: cut with a disk in the sky colour, no outline.
+        imagefilledellipse($im, (int)round($sunX + $sunR * 0.62),
+                           (int)round($sunY - $sunR * 0.30),
+                           (int)($sunR * 1.72), (int)($sunR * 1.72),
+                           vigil_rgb($im, $skyTop));
+    } else {
+        imagefilledellipse($im, (int)round($sunX - $sunR * 0.30),
+                           (int)round($sunY - $sunR * 0.32),
+                           (int)($sunR * 0.72), (int)($sunR * 0.72),
+                           vigil_rgb($im, vigil_light($sunCore, 0.6)));
+    }
+
+    // --- clouds ------------------------------------------------------------
+    [$cloudBody, $cloudShade] = $scene['cloud'];
+    $clouds = (int)round(2.8 * (float)$scene['density']) + random_int(1, 1);
+    for ($i = 0; $i < $clouds; $i++) {
+        // Depth: the low clouds near the horizon are smaller and paler, the
+        // high ones are big, bright and in front.
+        $depth = $clouds > 1 ? $i / ($clouds - 1) : 1.0;
+        $cy = (int)round($h * (0.05 + 0.21 * $depth)) + random_int(-3, 3);
+        $cx = random_int(-16, $w + 16);
+        $scale = (int)(10 + 21 * $depth) + random_int(0, 4);
+        vigil_draw_cloud(
+            $im, $cx, $cy, $scale,
+            vigil_mix($cloudBody, $skyHor, (1 - $depth) * 0.45),
+            vigil_mix($cloudShade, $skyHor, (1 - $depth) * 0.40),
+            $inkCol
+        );
+    }
+
+    // Thin high cloud, so the sky has layers instead of one flat blue.
+    vigil_draw_cirrus($im, $w, 3, max(4, (int)($horizon * 0.34)),
+                      vigil_mix($cloudBody, $skyMid, 0.35), random_int(3, 5));
+
+    // --- ranges ------------------------------------------------------------
+    $ranges = $scene['ranges'];
+    // Aerial perspective, per layer. The global wash cannot put distance
+    // *between* two ridges that meet, so each range also carries some of the
+    // sky's own colour, and the amount rises with distance.
+    // Far range keeps enough of its own colour to stay a *shape*. At 0.24 it
+    // faded into the sky and only the white cap was left, which is exactly
+    // what a floating peak is: a summit with no mountain under it.
+    $aerial = [0.11, 0.06];
+    for ($k = 0; $k < 2; $k++) {
+        $ranges[$k][0] = vigil_mix($ranges[$k][0], $skyHor, $aerial[$k]);
+        $ranges[$k][1] = vigil_mix($ranges[$k][1], $skyHor, $aerial[$k] * 0.86);
+        if (!empty($ranges[$k][2])) {
+            $ranges[$k][2] = vigil_mix($ranges[$k][2], $skyHor, $aerial[$k] * 0.30);
+        }
+    }
+    // More peaks, and taller ones unevenly, so the range interlocks instead
+    // of reading as one row of identical triangles.
+    // Far range: tall, snow-capped, palest.
+    vigil_draw_range($im, $w, $h, $inkCol, $scene['ink'], $ranges[0][0], $ranges[0][1],
+                     $ranges[0][2], $sunSide, $horizon + 4,
+                     $horizon - (int)($h * 0.22), random_int(3, 4), $sunX,
+                     true, 1);
+    // Aerial haze between the ranges: distance is sold by contrast falling
+    // off, not by thinner outlines.
+    for ($y = max(0, $horizon - 26); $y < min($h, $horizon + 2); $y++) {
+        $d = abs($y - $horizon + 12) / 20.0;
+        $a = (int)(66 * max(0.0, 1 - $d));
+        if ($a > 0) {
+            // `$a` is a strength, not an alpha: the wash belongs at the
+            // horizon, so it has to be most opaque where `$a` is largest.
+            imagefilledrectangle($im, 0, $y, $w, $y,
+                                 vigil_rgb($im, $skyHor, 127 - (int)$a));
+        }
+    }
+    // Mid range: lower, sharper, no snow.
+    vigil_draw_range($im, $w, $h, $inkCol, $scene['ink'], $ranges[1][0], $ranges[1][1],
+                     $ranges[1][2], $sunSide, $horizon + 11,
+                     $horizon - (int)($h * 0.13), random_int(3, 4), $sunX,
+                     false, 2);
+
+    // Pylons straddling the ridge line, silhouetted against the sky. Drawn
+    // after the ranges and before the near bank, which is what puts them at
+    // a believable distance rather than in front of everything.
+    for ($i = 0, $pn = random_int(1, 3); $i < $pn; $i++) {
+        $px = random_int((int)($w * 0.08), (int)($w * 0.92));
+        $ph = random_int((int)($h * 0.10), (int)($h * 0.17));
+        // Pylons stand behind the bank, so only a hint of shadow shows.
+        vigil_draw_shadow($im, $px, $horizon + (int)($h * 0.02),
+                          (int)round($ph * 0.30), 2, $scene['ink']);
+        vigil_draw_pylon($im, $px, $horizon + 2, $ph, $ranges[1][1]);
+    }
+
+    // --- treeline on the shore ---------------------------------------------
+    vigil_draw_range($im, $w, $h, $inkCol, $scene['ink'], $ranges[2][0], $ranges[2][1],
+                     null, $sunSide, $shore + 3,
+                     $shore - (int)($h * 0.070), random_int(4, 5), $sunX, false);
+
+    // --- water -------------------------------------------------------------
+    if ($hasWater) {
+        [$wFar, $wNear] = $scene['water'];
+        $span = max(1, $waterBot - $waterTop);
+        for ($y = $waterTop; $y < $waterBot; $y++) {
+            $t = ($y - $waterTop) / $span;
+            imageline($im, 0, $y, $w, $y,
+                      vigil_rgb($im, vigil_mix($wFar, $wNear, pow($t, 0.7))));
+        }
+        // Reflection: the treeline mirrored as flat rounded blobs, so it reads
+        // as a reflection rather than as a second forest upside down.
+        $reflCol = vigil_rgb($im, vigil_mix($ranges[2][0], $wNear, 0.45));
+        for ($x = 0; $x <= $w; $x += 6) {
+            $bh = random_int(2, 5);
+            imagefilledellipse($im, $x, $waterTop + random_int(1, 4),
+                               random_int(8, 18), $bh * 2, $reflCol);
+        }
+        // Light bars: the anime shorthand for water.
+        $bars = (int)max(4, $w / 26);
+        for ($i = 0; $i < $bars; $i++) {
+            $t = random_int(0, 100) / 100;
+            $yy = (int)round($waterTop + 3 + $span * 0.86 * $t);
+            $spread = (int)(14 + 78 * $t);
+            $xx = $sunX + random_int(-$spread, $spread);
+            $len = random_int(8, 14 + (int)(30 * $t));
+            $th = random_int(1, 2 + (int)(2 * $t));
+            imagefilledellipse($im, $xx, $yy, $len, $th, vigil_rgb($im, [255, 255, 255], 62));
+        }
+        // Ripples, spaced by perspective so the surface recedes instead of
+        // reading as a barcode.
+        vigil_draw_ripples($im, $w, $waterTop + 2, $waterBot - 1,
+                           vigil_light($wFar, 0.42));
+        // The bank and the water meeting, rather than a rule drawn across
+        // the frame: a shallow band plus a broken bright edge.
+        vigil_draw_shore($im, $w, $waterTop, 3, $ranges[2][0],
+                         vigil_mix($wNear, [255, 255, 255], 0.45),
+                         $scene['ink']);
+        for ($i = 0; $i < 9; $i++) {
+            $rx = random_int(0, $w);
+            vigil_draw_shadow($im, $rx, $waterTop - 1, random_int(3, 6), 1,
+                              $scene['ink']);
+            vigil_draw_rock($im, $rx, $waterTop - 2, random_int(2, 4),
+                            vigil_mix($ranges[2][0], $sunGlow, 0.35), $inkCol);
+        }
+    }
+
+    // --- meadow ------------------------------------------------------------
+    $meadowTop = $waterBot > 0 ? $waterBot - 2 : $shore;
+    vigil_draw_meadow($im, $w, $h, $meadowTop, $scene['grass'][0],
+                      $scene['grass'][2], $scene['flower'], $inkCol);
+
+    // A path from the near edge to the horizon. Converging edges are the one
+    // thing that makes a band of green read as ground with distance in it,
+    // and no amount of texture substitutes for them.
+    vigil_draw_path($im, $w, $h, $meadowTop + 3, $h,
+                    vigil_mix($scene['grass'][0], [0xd8, 0xc0, 0x94], 0.62),
+                    $inkCol);
+    vigil_draw_fence($im, $w,
+                     (int)round($meadowTop + ($h - $meadowTop) * 0.34),
+                     (int)round($meadowTop + ($h - $meadowTop) * 0.54),
+                     vigil_mix($scene['grass'][2], [0x6a, 0x4a, 0x30], 0.55),
+                     random_int(12, 17));
+
+    // A building across the field, and scrub along this side of it.
+    for ($i = 0, $n = random_int(1, 2); $i < $n; $i++) {
+        $hx = random_int(8, max(9, $w - 28));
+        $hy = (int)round($meadowTop + ($h - $meadowTop) * 0.22);
+        $hs = random_int(10, 16);
+        vigil_draw_shadow($im, $hx + (int)($hs / 2), $hy + 1,
+                          (int)round($hs * 0.78), 2, $scene['ink']);
+        vigil_draw_house($im, $hx, $hy, $hs,
+                         vigil_light($scene['grass'][0], 0.55),
+                         vigil_mix($scene['grass'][2], [0x8a, 0x4a, 0x3a], 0.55),
+                         $inkCol);
+    }
+    for ($i = 0, $n = random_int(2, 4); $i < $n; $i++) {
+        $bx = random_int(6, max(7, $w - 6));
+        $by = (int)round($meadowTop + ($h - $meadowTop)
+                         * (0.40 + random_int(0, 40) / 100));
+        $bs = random_int(5, 10);
+        vigil_draw_shadow($im, $bx, $by, (int)round($bs * 0.66),
+                          max(1, (int)round($bs * 0.22)), $scene['ink']);
+        vigil_draw_bush($im, $bx, $by, $bs,
+                        vigil_mix($scene['grass'][1], [0x3f, 0x8a, 0x5a], 0.6),
+                        vigil_mix($scene['grass'][2], [0x1f, 0x4a, 0x3a], 0.5),
+                        $inkCol);
+    }
+    for ($i = 0, $n = random_int(2, 5); $i < $n; $i++) {
+        $kx = random_int(4, max(5, $w - 4));
+        $ky = (int)round($meadowTop + ($h - $meadowTop)
+                         * (0.55 + random_int(0, 42) / 100));
+        $ks = random_int(3, 6);
+        vigil_draw_shadow($im, $kx, $ky, (int)round($ks * 0.9),
+                          max(1, (int)round($ks * 0.28)), $scene['ink']);
+        vigil_draw_rock($im, $kx, $ky, $ks,
+                        vigil_mix($scene['grass'][2], [0xa8, 0xa0, 0x98], 0.6),
+                        $inkCol);
+    }
+
+    // --- trees -------------------------------------------------------------
+    // In clumps of overlapping sizes. One tree at one size, repeated, is
+    // what made the middle distance look stamped rather than grown.
+    for ($i = 0, $n = random_int(1, 3); $i < $n; $i++) {
+        $depth = 0.30 + random_int(0, 52) / 100;
+        $size = (int)round(7 + 11 * $depth);
+        $tx = random_int(16, max(17, $w - 16));
+        $ty = (int)round($meadowTop + ($h - $meadowTop) * $depth);
+        vigil_draw_grove($im, $tx, $ty, $size,
+                         vigil_mix($scene['grass'][1], [0x3f, 0x8a, 0x5a], 0.45),
+                         vigil_mix($scene['grass'][2], [0x1f, 0x4a, 0x3a], 0.50),
+                         $inkCol, $scene['ink'], $depth);
+    }
+
+    // --- critters ----------------------------------------------------------
+    for ($i = 0, $n = random_int(1, 2); $i < $n; $i++) {
+        vigil_draw_mascot($im,
+            random_int(16, max(17, $w - 16)),
+            random_int((int)round($meadowTop + ($h - $meadowTop) * 0.42), max(1, $h - 3)),
+            random_int(8, 10),
+            [[0xff, 0xff, 0xff], [0xff, 0xe0, 0xc0], [0xd8, 0xe8, 0xff],
+             [0xff, 0xc8, 0xd8]][random_int(0, 3)],
+            $inkCol, random_int(0, 1));
+    }
+
+    // --- birds and petals --------------------------------------------------
+    for ($i = 0, $flocks = random_int(1, 2); $i < $flocks; $i++) {
+        vigil_draw_birds($im,
+            random_int((int)($w * 0.16), (int)($w * 0.84)),
+            random_int(8, max(9, (int)($horizon * 0.5))),
+            random_int(5, 8), random_int(2, 3),
+            $inkCol);
+    }
+    if (!empty($scene['petals'])) {
+        for ($i = 0; $i < 26; $i++) {
+            $px = random_int(0, $w - 1);
+            $py = random_int(0, $h - 1);
+            $pr = random_int(2, 3);
+            imagefilledellipse($im, $px, $py, $pr * 2, $pr, vigil_rgb($im, [0xff, 0xd0, 0xe2], 20));
+        }
+    }
+
+    // --- grade -------------------------------------------------------------
+    // Three passes over the finished picture, and the reason it hangs
+    // together: air between the layers, one light across all of them, and a
+    // little noise so the flats stop looking like vector art.
+    // A hint of air, not a fog. At 50 the whole picture went milky and the
+    // ridges lost the separation the ranges were drawn to have.
+    vigil_slider_haze($im, $w, $h, $horizon, $skyHor,
+                      (float)random_int(15, 24));
+    vigil_slider_lightwrap($im, $w, $h, $sunX, $sunGlow, $skyTop);
+    vigil_slider_dither($im, $w, $h, (int)($w * $h / 7));
+
+    // --- foreground --------------------------------------------------------
+    // Tall blades crowding the near edge: thicker and darker than anything
+    // else in the frame, which is what tells the eye they are *closer*
+    // rather than merely lower.
+    // Fewer, shorter blades: enough to frame the near edge, not so many that
+    // they close the meadow off.
+    vigil_draw_foreground($im, $w, $h, $scene['grass'][2],
+                          random_int(12, 18));
+
+    // --- vignette ----------------------------------------------------------
+    // Kept deliberately faint: heavy corner darkening fights the flat cel look.
+    $vig = (int)round($h * 0.20);
+    $vigA = ($sceneName === 'night') ? 26 : 16;
+    for ($x = 0; $x < $vig; $x++) {
+        $t = 1 - $x / $vig;
+        $c = vigil_rgb($im, [40, 40, 80], 127 - (int)round($vigA * $t * $t));
+        imageline($im, $x, 0, $x, $h, $c);
+        imageline($im, $w - 1 - $x, 0, $w - 1 - $x, $h, $c);
+    }
+    for ($y = 0; $y < $vig; $y++) {
+        $t = 1 - $y / $vig;
+        $c = vigil_rgb($im, [40, 40, 80], 127 - (int)round($vigA * $t * $t));
+        imageline($im, 0, $y, $w, $y, $c);
+        imageline($im, 0, $h - 1 - $y, $w, $h - 1 - $y, $c);
+    }
+
+    return [
+        'image'     => $im,
+        'palette'   => [
+            'ink'    => $scene['ink'],
+            'glow'   => $scene['glow'],
+            'accent' => $scene['accent'],
+        ],
+        'scene'     => $sceneName,
+        'sun'       => [$sunX, $sunY],
+        'horizon'   => $horizon,
+        'waterline' => $waterTop,
+    ];
+}
+
+/**
+ * Choose how the picture is broken up before the solver touches it.
+ *
+ * Shifts are sent to the browser: they are presentation, not secret, and
+ * knowing them reveals nothing about where the piece belongs. Band heights
+ * are uneven, which reads as a torn picture rather than a venetian blind, and
+ * the magnitudes are deliberately unequal so that no single drag lines
+ * everything up at once.
+ */
+function vigil_slider_scramble(int $w, int $h, string $kind = 'art'): array
+{
+    // Two different failures to avoid.
+    //
+    // Painted art is made of flat shapes and heavy outlines, so a single
+    // sideways shift snaps the whole silhouette and is unmistakable: fewer
+    // bands and larger shifts are legible, and they make the picture look
+    // gloriously wrong.
+    //
+    // A photograph or an illustration has no such structure. Large shifts
+    // turn it into unreadable stripes, and the solver can no longer tell
+    // which band is out of place -- so it gets more seams and smaller
+    // shifts, which looks like a picture that is subtly, obviously wrong.
+    if ($kind === 'image') {
+        $bands = random_int(9, 14);
+        $lo = 0.035;
+        $hi = 0.115;
+    } else {
+        $bands = random_int(7, 11);
+        $lo = 0.06;
+        $hi = 0.19;
+    }
+    $weights = [];
+    $sum = 0.0;
+    for ($i = 0; $i < $bands; $i++) {
+        $k = 0.6 + random_int(0, 100) / 100;
+        $weights[] = $k;
+        $sum += $k;
+    }
+    $out = ['bands' => [], 'width' => $w, 'height' => $h];
+    $y = 0;
+    for ($i = 0; $i < $bands; $i++) {
+        $bh = ($i === $bands - 1)
+            ? ($h - $y)
+            : (int)round($h * $weights[$i] / $sum);
+        $bh = max(8, min($h - $y, $bh));
+        if ($bh <= 0) {
+            break;
+        }
+        $mag = random_int((int)($w * $lo), (int)($w * $hi));
+        $out['bands'][] = [
+            'y' => $y,
+            'h' => $bh,
+            'shift' => random_int(0, 1) ? $mag : -$mag,
+        ];
+        $y += $bh;
+    }
+    return $out;
+}
+
+/** Is (x,y) inside the jigsaw piece whose square starts at (ox,oy)? */
+function vigil_slider_inside(int $x, int $y, int $ox, int $oy, int $size,
+                             int $radius, string $shape = 'right'): bool
+{
+    if ($x >= $ox && $x < $ox + $size && $y >= $oy && $y < $oy + $size) {
+        return true;
+    }
+    // The knob sticks out on one side, and which side *is* the piece's
+    // shape. Several gaps are cut, each with a different knob, and only one
+    // piece has the knob that fits a given gap -- so the pieces are not
+    // interchangeable even before their positions are considered.
+    switch ($shape) {
+        case 'left':
+            $cx = $ox; $cy = $oy + (int)($size / 2);
+            break;
+        case 'top':
+            $cx = $ox + (int)($size / 2); $cy = $oy;
+            break;
+        case 'bottom':
+            $cx = $ox + (int)($size / 2); $cy = $oy + $size;
+            break;
+        default:
+            $cx = $ox + $size; $cy = $oy + (int)($size / 2);
+    }
+    $dx = $x - $cx;
+    $dy = $y - $cy;
+    return ($dx * $dx + $dy * $dy) <= ($radius * $radius);
+}
+
+/** Failure strikes so far, read-only (does not touch the rate counters). */
+function vigil_fail_count_direct(string $stateDir): int
+{
+    return (int)(vigil_fail_state($stateDir)['strikes'] ?? 0);
+}
+
+/**
+ * Build a slider challenge and write the two images.
+ *
+ * Returns the data the page needs. The correct offset stays server-side in
+ * the challenge file.
+ */
+/**
+ * Which kind of picture this challenge is built from.
+ *
+ * `auto` is the default and the reason the "new puzzle" link feels alive: the
+ * kind is re-rolled on every challenge, so one refresh can bring a painted
+ * valley and the next an illustration. The roll is deliberately not 50/50 --
+ * the generated art is always available and always the right shape, so it
+ * gets the heavier weight and the pool can never dominate a host's gate.
+ *
+ * Every path out of here is safe: an empty pool, an unreadable directory or a
+ * missing GD all degrade to generated art rather than to a broken page.
+ */
+function vigil_slider_pick_kind(array $cfg): string
+{
+    $want = (int)($cfg['scene_kind'] ?? 2);
+    if ($want === 0) {
+        return 'art';
+    }
+    $pool = vigil_slider_pool($cfg);
+    if ($want === 1) {
+        return $pool ? 'image' : 'art';
+    }
+    // Even odds, and never three of a kind in a row.
+    //
+    // A plain coin flip is even in the long run but clumps badly in the
+    // short run -- three valleys in a row out of four refreshes is exactly
+    // what a person notices and calls broken. The last two picks are kept,
+    // and a third repeat is replaced by the other kind. Two in a row stays
+    // possible, which is what keeps it from being a metronome.
+    $history = vigil_slider_kind_history($cfg);
+    $n = count($history);
+    if ($n >= 2 && $history[$n - 1] === $history[$n - 2]) {
+        $pick = $history[$n - 1] === 'art' ? 'image' : 'art';
+    } else {
+        $pick = random_int(0, 1) === 1 ? 'image' : 'art';
+    }
+    vigil_slider_kind_remember($cfg, $pick);
+    return $pick;
+}
+
+/**
+ * The last few kinds served, newest last.
+ *
+ * One small file per gate, read and written under an exclusive lock so two
+ * simultaneous challenges cannot both decide they are the second of a pair.
+ * Kept beside the state rather than in the session because the point is
+ * variety *across* visitors, not within one.
+ */
+function vigil_slider_kind_history(array $cfg): array
+{
+    $path = (string)($cfg['image_kind_state'] ?? '');
+    if ($path === '' || !is_file($path)) {
+        return [];
+    }
+    $raw = @file_get_contents($path);
+    $data = json_decode((string)$raw, true);
+    if (!is_array($data)) {
+        return [];
+    }
+    $out = [];
+    foreach ((array)($data['recent'] ?? []) as $v) {
+        if ($v === 'art' || $v === 'image') {
+            $out[] = $v;
+        }
+    }
+    return array_slice($out, -6);
+}
+
+/**
+ * Record a decision. Both arguments are optional on purpose: the kind is
+ * recorded when it is chosen, the picture when one is actually opened, and
+ * passing an empty kind from the second call stops a picture pick from being
+ * counted as a second kind pick.
+ */
+function vigil_slider_kind_remember(array $cfg, string $kind = '',
+                                   string $source = ''): void
+{
+    $path = (string)($cfg['image_kind_state'] ?? '');
+    if ($path === '') {
+        return;
+    }
+    $fp = @fopen($path, 'c+');
+    if (!$fp) {
+        return;
+    }
+    @flock($fp, LOCK_EX);
+    $raw = (string)stream_get_contents($fp);
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        $data = [];
+    }
+    if ($kind !== '') {
+        $recent = is_array($data['recent'] ?? null) ? $data['recent'] : [];
+        $recent[] = $kind;
+        $data['recent'] = array_slice($recent, -6);
+    }
+
+    // The last few pictures, so the same one does not come round twice in a
+    // handful of refreshes. With a pool of a hundred that would be rare by
+    // chance, but "rare" is not "never" and a repeat is the thing people
+    // actually complain about.
+    $seen = is_array($data['sources'] ?? null) ? $data['sources'] : [];
+    if ($source !== '') {
+        $seen[] = $source;
+    }
+    // How many recent pictures to refuse to repeat.
+    //
+    // This was 8, which is small enough that the same picture comes round
+    // again within a few dozen refreshes -- and "the same one again" is the
+    // single thing a person notices about a random pool. With a few hundred
+    // pictures, remembering the last 48 makes a repeat within one sitting
+    // very unlikely while still leaving the pool large enough to choose from
+    // (the selector falls back to the whole pool if too few remain fresh).
+    $data['sources'] = array_slice($seen, -48);
+
+    rewind($fp);
+    ftruncate($fp, 0);
+    fwrite($fp, (string)json_encode($data));
+    fflush($fp);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+    @chmod($path, 0600);
+}
+
+/**
+ * Every usable picture under the configured directories.
+ *
+ * Filtered hard, because a login gate is a bad place for a surprise. A file
+ * qualifies only if it decodes, is large enough to survive being cropped to a
+ * wide band, is landscape-ish, and is big enough on disk not to be a sticker
+ * or an icon. The result is cached against the directories' mtimes, so a
+ * challenge never walks the tree.
+ *
+ * This deliberately cannot tell a beautiful illustration from a screenshot of
+ * a chat message. The directory is the curation: point it at a folder you
+ * chose, not at a downloads or cache folder, which is why the installer
+ * probes for known art libraries and leaves this empty otherwise.
+ */
+function vigil_slider_pool(array $cfg): array
+{
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $dirs = $cfg['image_dirs'] ?? [];
+    if (!is_array($dirs) || !$dirs) {
+        return $memo = [];
+    }
+    $stamp = [];
+    foreach ($dirs as $d) {
+        $stamp[] = $d . '@' . (@filemtime((string)$d) ?: 0);
+    }
+    $sig = md5(implode('|', $stamp));
+    $cacheFile = (string)($cfg['image_pool'] ?? '');
+    if ($cacheFile !== '' && is_file($cacheFile)) {
+        $cached = json_decode((string)@file_get_contents($cacheFile), true);
+        if (is_array($cached) && ($cached['sig'] ?? '') === $sig) {
+            $files = [];
+            foreach ((array)($cached['files'] ?? []) as $f) {
+                if (is_string($f) && is_file($f)) {
+                    $files[] = $f;
+                }
+            }
+            return $memo = $files;
+        }
+    }
+    $found = [];
+    foreach ($dirs as $dir) {
+        $dir = (string)$dir;
+        if (!is_dir($dir)) {
+            continue;
+        }
+        $it = @scandir($dir);
+        if (!is_array($it)) {
+            continue;
+        }
+        foreach ($it as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            $path = rtrim($dir, '/') . '/' . $name;
+            if (!is_file($path)) {
+                continue;
+            }
+            $ext = strtolower((string)pathinfo($name, PATHINFO_EXTENSION));
+            if (!in_array($ext, ['jpg', 'jpeg', 'png', 'webp'], true)) {
+                continue;
+            }
+            if ((int)@filesize($path) < 45000) {
+                continue;
+            }
+            $info = @getimagesize($path);
+            if (!is_array($info)) {
+                continue;
+            }
+            $iw = (int)$info[0];
+            $ih = (int)$info[1];
+            if ($iw < 640 || $ih < 360) {
+                continue;
+            }
+            // Refuse anything that would not decode inside a sane budget.
+            //
+            // A 5120x2880 upload needs ~85 MB just to become a GD image, and
+            // PHP-FPM's 128 MB limit is shared with everything else the
+            // request has done. The normalised copy avoids the decode on
+            // *later* uses, but the first use decodes the original -- so a
+            // single oversized file makes challenge generation fail
+            // intermittently, depending on which picture the shuffle picks.
+            // "Intermittently, depending on the shuffle" is the worst kind of
+            // bug to be told about, so the pool simply will not take them.
+            if ($iw > 4096 || $ih > 4096) {
+                continue;
+            }
+            $ratio = $iw / max(1, $ih);
+            // Portrait is allowed, but only mildly: below roughly 0.85 the
+            // wide crop throws away so much of the frame that the result
+            // stops being a picture and becomes a texture.
+            if ($ratio < 0.85 || $ratio > 3.6) {
+                continue;
+            }
+            $found[] = $path;
+        }
+    }
+    // The operator's reject list wins over everything else. It is applied
+    // here rather than at download time so that blocking a picture also
+    // removes one that is already in the directory, and so that re-fetching
+    // cannot resurrect something that was rejected once.
+    $blocked = vigil_slider_blocked($cfg);
+    if ($blocked) {
+        $kept = [];
+        foreach ($found as $path) {
+            if (!vigil_slider_is_blocked($path, $blocked)) {
+                $kept[] = $path;
+            }
+        }
+        $found = $kept;
+    }
+    sort($found);
+    if ($cacheFile !== '') {
+        $tmp = $cacheFile . '.' . bin2hex(random_bytes(4));
+        if (@file_put_contents($tmp, (string)json_encode(
+                ['sig' => $sig, 'files' => $found]), LOCK_EX) !== false) {
+            @chmod($tmp, 0600);
+            @rename($tmp, $cacheFile);
+        }
+    }
+    return $memo = $found;
+}
+
+/**
+ * The operator's reject list, as ``key => reason``.
+ *
+ * Read once per request. A malformed or missing file is treated as "nothing
+ * blocked", because failing to read a preference must never take the gate
+ * down -- and the consequence of the empty list is merely that a picture the
+ * operator disliked shows up again, which is visible and fixable.
+ */
+function vigil_slider_blocked(array $cfg): array
+{
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    // Two sources, merged. The per-gate file is where `vigil gate scene
+    // block` writes; a file inside the picture directory is also honoured,
+    // because two gates can share one library and a rejection is a property
+    // of the *picture*, not of whichever gate happened to reject it first.
+    $sources = [];
+    $own = (string)($cfg['image_block'] ?? '');
+    if ($own !== '') {
+        $sources[] = $own;
+    }
+    foreach ((array)($cfg['image_dirs'] ?? []) as $dir) {
+        $sources[] = rtrim((string)$dir, '/') . '/.blocklist.json';
+    }
+    $out = [];
+    foreach ($sources as $path) {
+        if (!is_file($path)) {
+            continue;
+        }
+        $data = json_decode((string)@file_get_contents($path), true);
+        $entries = is_array($data) ? ($data['blocked'] ?? $data) : [];
+        if (!is_array($entries)) {
+            continue;
+        }
+        foreach ($entries as $key => $reason) {
+            if (is_string($key) && $key !== '') {
+                $out[$key] = (string)$reason;
+            }
+        }
+    }
+    return $memo = $out;
+}
+
+/** Is this file on the reject list? Matches the upload id or the filename. */
+function vigil_slider_is_blocked(string $path, array $blocked): bool
+{
+    $base = basename($path);
+    if (isset($blocked[$base])) {
+        return true;
+    }
+    $stem = (string)pathinfo($base, PATHINFO_FILENAME);
+    if (isset($blocked[$stem])) {
+        return true;
+    }
+    $dash = strpos($stem, '-');
+    if ($dash !== false) {
+        $head = substr($stem, 0, $dash);
+        $tail = substr($stem, $dash + 1);
+        if ($tail !== '' && in_array($head, ['wallhaven', 'konachan', 'openverse'], true)
+                && isset($blocked[$tail])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Which theme each picture belongs to, from the credits book beside them.
+ *
+ * Returns an empty map when there is no credits file, which makes the caller
+ * fall back to a flat shuffle -- the right behaviour for a hand-curated
+ * directory that never went through `vigil gate scene fetch`.
+ */
+function vigil_slider_themes(array $cfg): array
+{
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $out = [];
+    foreach ((array)($cfg['image_dirs'] ?? []) as $dir) {
+        $book = rtrim((string)$dir, '/') . '/credits.json';
+        if (!is_file($book)) {
+            continue;
+        }
+        $data = json_decode((string)@file_get_contents($book), true);
+        if (!is_array($data)) {
+            continue;
+        }
+        foreach ((array)($data['pictures'] ?? []) as $entry) {
+            $name = $entry['file'] ?? '';
+            $theme = $entry['theme'] ?? '';
+            if (is_string($name) && $name !== '' && is_string($theme) && $theme !== '') {
+                $out[$name] = $theme;
+            }
+        }
+    }
+    return $memo = $out;
+}
+
+/** Decode a picture into a truecolour GD image, or null if unsupported. */
+function vigil_slider_open(string $path)
+{
+    $info = @getimagesize($path);
+    if (!is_array($info)) {
+        return null;
+    }
+    $im = null;
+    if ($info[2] === IMAGETYPE_JPEG) {
+        $im = @imagecreatefromjpeg($path);
+    } elseif ($info[2] === IMAGETYPE_PNG) {
+        $im = @imagecreatefrompng($path);
+    } elseif ($info[2] === IMAGETYPE_WEBP && function_exists('imagecreatefromwebp')) {
+        $im = @imagecreatefromwebp($path);
+    }
+    return $im ?: null;
+}
+
+/**
+ * Cover-crop a picture into the puzzle frame.
+ *
+ * $biasY chooses which slice of a tall picture survives: 0 keeps the very top,
+ * 1 the very bottom. Portraits use a low bias, because the subject of an
+ * illustration is nearly always in the upper half and a centred crop of a
+ * full-body figure reliably cuts the head off -- which is the single worst
+ * thing a crop can do to a picture someone chose.
+ */
+function vigil_slider_fit($src, int $sw, int $sh, int $w, int $h, float $biasY)
+{
+    $dst = imagecreatetruecolor($w, $h);
+    imagealphablending($dst, true);
+    $scale = max($w / max(1, $sw), $h / max(1, $sh));
+    $cw = max(1, min($sw, (int)round($w / $scale)));
+    $ch = max(1, min($sh, (int)round($h / $scale)));
+    $sx = (int)round(($sw - $cw) / 2);
+    $sy = (int)round(($sh - $ch) * max(0.0, min(1.0, $biasY)));
+    imagecopyresampled($dst, $src, 0, 0, $sx, $sy, $w, $h, $cw, $ch);
+    return $dst;
+}
+
+
+
+/**
+ * Rotate a whole scene's palette by a hue offset.
+ *
+ * Applied to every colour at once, including the ink and the glow, so the
+ * picture keeps one light source and one mood. Shifting only some of them
+ * would produce the thing this is meant to avoid: a composition whose parts
+ * disagree about what time of day it is.
+ *
+ * Night is exempt at the call site -- rotating it produces skies that are
+ * no longer night, and a moonlit scene with a green sky is not variety, it
+ * is a bug.
+ */
+function vigil_slider_recolor(array $scene, int $hueShift,
+                              float $satScale = 1.0,
+                              float $valScale = 1.0): array
+{
+    $conv = static function (array $rgb) use ($hueShift, $satScale, $valScale): array {
+        [$h, $s, $v] = vigil_rgb_to_hsv($rgb);
+        $h = fmod($h + $hueShift + 360.0, 360.0);
+        return vigil_hsv_to_rgb($h, max(0.0, min(1.0, $s * $satScale)),
+                                max(0.0, min(1.0, $v * $valScale)));
+    };
+    $walk = static function ($node) use (&$walk, $conv) {
+        if (!is_array($node)) {
+            return $node;
+        }
+        // A leaf is three integers; anything else is a container.
+        if (count($node) === 3 && isset($node[0], $node[1], $node[2])
+                && is_int($node[0]) && is_int($node[1]) && is_int($node[2])) {
+            return $conv($node);
+        }
+        $out = [];
+        foreach ($node as $k => $v) {
+            $out[$k] = $walk($v);
+        }
+        return $out;
+    };
+    return $walk($scene);
+}
+
+/** RGB 0-255 triple to HSV (h in degrees, s and v in 0..1). */
+function vigil_rgb_to_hsv(array $rgb): array
+{
+    $r = max(0, min(255, (int)$rgb[0])) / 255;
+    $g = max(0, min(255, (int)$rgb[1])) / 255;
+    $b = max(0, min(255, (int)$rgb[2])) / 255;
+    $max = max($r, $g, $b);
+    $min = min($r, $g, $b);
+    $d = $max - $min;
+    $h = 0.0;
+    if ($d > 0.00001) {
+        if ($max === $r) {
+            $h = 60 * fmod((($g - $b) / $d), 6);
+        } elseif ($max === $g) {
+            $h = 60 * ((($b - $r) / $d) + 2);
+        } else {
+            $h = 60 * ((($r - $g) / $d) + 4);
+        }
+    }
+    if ($h < 0) {
+        $h += 360;
+    }
+    return [$h, $max > 0 ? $d / $max : 0.0, $max];
+}
+
+/** HSV back to an RGB 0-255 triple. */
+function vigil_hsv_to_rgb(float $h, float $s, float $v): array
+{
+    $c = $v * $s;
+    $x = $c * (1 - abs(fmod($h / 60.0, 2) - 1));
+    $m = $v - $c;
+    $seg = (int)floor($h / 60) % 6;
+    $rgb = [[$c, $x, 0], [$x, $c, 0], [0, $c, $x],
+            [0, $x, $c], [$x, 0, $c], [$c, 0, $x]][$seg];
+    return [
+        (int)round(($rgb[0] + $m) * 255),
+        (int)round(($rgb[1] + $m) * 255),
+        (int)round(($rgb[2] + $m) * 255),
+    ];
+}
+
+/**
+ * Downscale a picture to fit inside a box, keeping its shape.
+ *
+ * Separate from :func:`vigil_slider_fit` on purpose: normalising must not
+ * crop. The crop direction depends on whether the picture is portrait, and
+ * that decision belongs to the caller that knows the puzzle's bias.
+ */
+function vigil_slider_scale($src, int $kw, int $kh)
+{
+    $sw = imagesx($src);
+    $sh = imagesy($src);
+    if ($sw <= 0 || $sh <= 0) {
+        return null;
+    }
+    $k = min($kw / $sw, $kh / $sh, 1.0);
+    $nw = max(1, (int)round($sw * $k));
+    $nh = max(1, (int)round($sh * $k));
+    $dst = imagecreatetruecolor($nw, $nh);
+    imagealphablending($dst, true);
+    imagecopyresampled($dst, $src, 0, 0, 0, 0, $nw, $nh, $sw, $sh);
+    return $dst;
+}
+
+/**
+ * A right-sized copy of a pool picture, cached on disk.
+ *
+ * The wallpaper sources serve 4000x2500 originals, and the puzzle shows
+ * 340x200 of one. Decoding a full-size JPEG on every challenge would put a
+ * fifth of a second of work on the critical path of a login page -- twice,
+ * once for the display image and once for the matching copy -- for detail
+ * nobody will ever see. The first use writes a normalised copy beside the
+ * pool and every later challenge reads that instead.
+ *
+ * The cache key carries the source's size and mtime, so replacing or editing
+ * a picture invalidates its copy automatically, and the caller never has to
+ * remember to clear anything.
+ */
+function vigil_slider_normalize(string $path, string $cacheDir,
+                                int $kw, int $kh): ?string
+{
+    if (!is_dir($cacheDir)) {
+        @mkdir($cacheDir, 0700, true);
+        @chmod($cacheDir, 0700);
+    }
+    if (!is_dir($cacheDir)) {
+        return null;                      // nowhere to cache: caller falls back
+    }
+    $stat = @stat($path);
+    $key = md5($path . '|' . ((int)($stat['size'] ?? 0)) . '|'
+             . ((int)($stat['mtime'] ?? 0)) . '|' . $kw . 'x' . $kh);
+    $out = rtrim($cacheDir, '/') . '/' . $key . '.jpg';
+    if (is_file($out) && (int)@filesize($out) > 2048) {
+        return $out;
+    }
+    $src = vigil_slider_open($path);
+    if (!$src) {
+        return null;
+    }
+    $small = vigil_slider_scale($src, $kw, $kh);
+    imagedestroy($src);
+    if (!$small) {
+        return null;
+    }
+    $tmp = $out . '.' . bin2hex(random_bytes(4));
+    $ok = @imagejpeg($small, $tmp, 88);
+    imagedestroy($small);
+    if (!$ok) {
+        @unlink($tmp);
+        return null;
+    }
+    @chmod($tmp, 0600);
+    @rename($tmp, $out);
+    return is_file($out) ? $out : null;
+}
+
+/**
+ * Average brightness of a frame, 0..255.
+ *
+ * Used to choose the gap outline: a dark outline on a dark illustration is
+ * invisible, and the outline is half of what makes the gap findable.
+ */
+function vigil_slider_luma($im, int $w, int $h): int
+{
+    $total = 0;
+    $n = 0;
+    for ($y = 0; $y < $h; $y += 4) {
+        for ($x = 0; $x < $w; $x += 4) {
+            $rgb = imagecolorat($im, $x, $y);
+            $total += (int)(0.299 * (($rgb >> 16) & 0xFF)
+                          + 0.587 * (($rgb >> 8) & 0xFF)
+                          + 0.114 * ($rgb & 0xFF));
+            $n++;
+        }
+    }
+    return $n > 0 ? (int)round($total / $n) : 128;
+}
+
+/** A shallow vignette, so a flat illustration gains a little depth. */
+function vigil_slider_grade($im, int $w, int $h): void
+{
+    $vig = (int)round($h * 0.22);
+    for ($x = 0; $x < $vig; $x++) {
+        $t = 1 - $x / $vig;
+        $c = imagecolorallocatealpha($im, 8, 10, 24, 127 - (int)round(20 * $t * $t));
+        imageline($im, $x, 0, $x, $h, $c);
+        imageline($im, $w - 1 - $x, 0, $w - 1 - $x, $h, $c);
+    }
+    for ($y = 0; $y < $vig; $y++) {
+        $t = 1 - $y / $vig;
+        $c = imagecolorallocatealpha($im, 8, 10, 24, 127 - (int)round(20 * $t * $t));
+        imageline($im, 0, $y, $w, $y, $c);
+        imageline($im, 0, $h - 1 - $y, $w, $h - 1 - $y, $c);
+    }
+}
+
+/**
+ * Build the puzzle background.
+ */
+function vigil_slider_plate(int $w, int $h, array $cfg, string &$kind,
+                            string &$source): array
+{
+    $kind = vigil_slider_pick_kind($cfg);
+    if ($kind === 'image') {
+        $pool = vigil_slider_pool($cfg);
+        shuffle($pool);
+        // A handful of tries, not one: a single unreadable file in the pool
+        // must not turn every challenge into generated art.
+        $cacheDir = (string)($cfg['image_cache'] ?? '');
+        if ($cacheDir === '') {
+            $poolFile = (string)($cfg['image_pool'] ?? '');
+            $cacheDir = $poolFile !== ''
+                ? dirname($poolFile) . '/image-cache'
+                : sys_get_temp_dir() . '/vigil-image-cache';
+        }
+        // Skip anything served in the last few challenges. Falls back to the
+        // full pool if the recent list happens to cover everything.
+        $recentSources = [];
+        $kindState = (string)($cfg['image_kind_state'] ?? '');
+        if ($kindState !== '' && is_file($kindState)) {
+            $st = json_decode((string)@file_get_contents($kindState), true);
+            if (is_array($st) && is_array($st['sources'] ?? null)) {
+                $recentSources = $st['sources'];
+            }
+        }
+        // Draw evenly from each theme rather than in proportion to how many
+        // pictures each one contributed. With a hundred Blue Archive images
+        // and thirty Lucky Star ones, a flat shuffle is "random" and still
+        // shows Blue Archive three times as often -- which is not what
+        // "randomly" means to the person refreshing.
+        $themes = vigil_slider_themes($cfg);
+        if ($themes) {
+            $byTheme = [];
+            foreach ($pool as $cand) {
+                $t = $themes[basename((string)$cand)] ?? '';
+                $byTheme[$t][] = $cand;
+            }
+            // An empty key would let untagged files outvote a real theme.
+            unset($byTheme['']);
+            if (count($byTheme) > 1) {
+                $names = array_keys($byTheme);
+                $chosen = $names[random_int(0, count($names) - 1)];
+                $pool = $byTheme[$chosen];
+            }
+        }
+
+        if ($recentSources) {
+            $fresh = [];
+            foreach ($pool as $cand) {
+                if (!in_array(basename((string)$cand), $recentSources, true)) {
+                    $fresh[] = $cand;
+                }
+            }
+            if (count($fresh) >= 6) {
+                $pool = $fresh;
+            }
+        }
+        foreach (array_slice($pool, 0, 6) as $candidate) {
+            // Normalise first: everything downstream then works on a small
+            // image, and a huge original is never decoded twice.
+            $ready = vigil_slider_normalize((string)$candidate, $cacheDir,
+                                            1024, 1024);
+            if ($ready === null) {
+                $ready = (string)$candidate;
+            }
+            $src = vigil_slider_open($ready);
+            if (!$src) {
+                continue;
+            }
+            $sw = imagesx($src);
+            $sh = imagesy($src);
+            $ratio = $sw / max(1, $sh);
+            // Tall pictures keep their top; wide ones are cropped centrally,
+            // biased slightly up so a face is not clipped by the frame.
+            $bias = $ratio < 1.25 ? 0.13 : 0.40;
+            $bg = vigil_slider_fit($src, $sw, $sh, $w, $h, $bias);
+            imagedestroy($src);
+            vigil_slider_grade($bg, $w, $h);
+            $luma = vigil_slider_luma($bg, $w, $h);
+            // Outline in whichever direction contrasts with the picture.
+            $ink = $luma > 140 ? [16, 20, 42] : [255, 255, 255];
+            vigil_slider_kind_remember($cfg, '',
+                                       basename((string)$candidate));
+            // Assign the by-reference parameter as well as the array key.
+            // Only the key was set, so the challenge record stored an empty
+            // `source` for every picture-based puzzle -- the record could not
+            // say which picture had been served, which makes "why did this
+            // one look wrong" unanswerable and hides which pool a picture
+            // came from.
+            $source = basename((string)$candidate);
+            return [
+                'image'  => $bg,
+                'palette' => ['ink' => $ink, 'glow' => [255, 255, 255],
+                              'accent' => [255, 206, 120]],
+                'scene'  => 'image',
+                'sun'    => null,
+                'horizon' => (int)round($h * 0.5),
+                'waterline' => 0,
+                'source' => basename((string)$candidate),
+            ];
+        }
+        $kind = 'art';
+    }
+    $art = vigil_slider_background($w, $h);
+    $art['source'] = '';
+    return $art;
+}
+
+/**
+ * Where a slider asset lives, given its part name.
+ *
+ * One resolver, used by both the asset endpoint and the page that inlines the
+ * pictures. The two used to agree only because a human kept them in step: the
+ * endpoint enumerated `slider-piece1` and `slider-piece2` while the page had
+ * learned to ask for `slider-piece3`, so the third picture 404'd and the login
+ * page rendered nothing. A name that the generator can produce must be
+ * resolvable by every reader of it, so that is what this encodes.
+ *
+ * Returns '' for anything unrecognised -- the caller must not be able to turn
+ * `part` into a path.
+ */
+/**
+ * Draw a text challenge and return the PNG bytes.
+ *
+ * Returns '' if GD is unavailable or the drawing failed, so callers can fall
+ * back instead of serving a broken image.
+ *
+ * This is the *only* place the text challenge is drawn. It used to be drawn
+ * inline in the endpoint, which made the picture reachable only by fetching
+ * that endpoint -- and when the fetch did not happen (a blocked URL, a page
+ * that never got that far) there was a blank box and nothing in the log to
+ * explain it. Both the endpoint and the page that inlines the picture call
+ * this, so the two cannot disagree about what the challenge looks like.
+ */
+function vigil_captcha_png(string $code, int $weight): string
+{
+    if (!function_exists('imagecreatetruecolor')) {
+        return '';
+    }
+    $len = strlen($code);
+    if ($len < 4) {
+        return '';
+    }
+    $weight = max(0, min(3, $weight));
+    // Two dials, because they are not the same kind of difficulty.
+    //
+    // `$weight` adds *noise* -- more lines, more arcs, more blobs -- which a
+    // person reads through and a classifier has to work around. `$wv` (below)
+    // drives everything that *deforms* the glyphs: rotation, size spread and
+    // both warp amplitudes. Deformation past a point stops being difficulty
+    // and becomes illegibility: at the first attempt at this, weight 3
+    // rendered as a field of waves with no letters in it at all, which is a
+    // locked door rather than a harder CAPTCHA. So the deformation is capped
+    // and only the noise keeps growing. Both were checked by rendering the
+    // image and looking at it.
+    $wv = min(2, $weight);
+    $w = 40 + $len * 30;
+    $h = 74;
+
+    $im = imagecreatetruecolor($w, $h);
+    imagealphablending($im, true);
+
+    $bg = [[246, 248, 251], [248, 246, 244], [244, 248, 246]][random_int(0, 2)];
+    imagefilledrectangle($im, 0, 0, $w, $h,
+        imagecolorallocate($im, $bg[0], $bg[1], $bg[2]));
+
+    $speckle = [[203, 213, 225], [186, 200, 214], [214, 222, 232]];
+    for ($i = 0; $i < ($w * $h) / 26; $i++) {
+        $c = $speckle[array_rand($speckle)];
+        imagesetpixel($im, random_int(0, $w - 1), random_int(0, $h - 1),
+            imagecolorallocate($im, $c[0], $c[1], $c[2]));
+    }
+
+    $font = null;
+    foreach ([
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
+    ] as $candidate) {
+        if (is_readable($candidate)) { $font = $candidate; break; }
+    }
+
+    $ink = [[30, 41, 59], [15, 23, 42], [51, 65, 85]][random_int(0, 2)];
+    $inkCol = imagecolorallocate($im, $ink[0], $ink[1], $ink[2]);
+
+    // Characters are placed with deliberately uneven advance, size and
+    // baseline, and are allowed to overlap.
+    //
+    // The old loop walked a fixed 24..31px advance at a near-constant
+    // baseline with a narrow angle range. That is exactly the regularity a
+    // segmentation step looks for: find the vertical gaps between glyphs,
+    // cut, classify each. Random advance plus overlap removes the gaps, and
+    // varying the baseline breaks the "all glyphs share one line" assumption
+    // that both segmentation and the recognition step depend on.
+    $x = 20 + random_int(0, 6);
+    for ($i = 0; $i < $len; $i++) {
+        $size = random_int(22, 27) + $wv;
+        $angle = random_int(-15 - $wv * 5, 15 + $wv * 5);
+        $y = random_int(46, 58);
+        if ($font !== null) {
+            imagettftext($im, $size, $angle, $x, $y, $inkCol, $font, $code[$i]);
+        } else {
+            imagestring($im, 5, $x, 24, $code[$i], $inkCol);
+        }
+        // Advance proportional to the glyph just drawn, jittered: neighbours
+        // may touch, but nothing lands on top of anything else. The first
+        // version used a flat 14..38 and at high `weight` the characters
+        // became an unreadable pile -- verified by rendering it and looking
+        // at the image, which is the only way to check this. A CAPTCHA that a
+        // person cannot read is not a harder CAPTCHA, it is a locked door.
+        $x += max(17, (int)round($size * (random_int(82, 108) / 100)));
+    }
+
+    // Interference, now with varying stroke width: a single-pixel line
+    // crosses a glyph and is easy to discount, a 3px line through the middle
+    // of a character has to be worked around by a person as well -- which is
+    // the point of the balance being struck here.
+    $linePalette = [[148, 163, 184], [165, 180, 197], [120, 140, 165],
+                    [139, 152, 172], [158, 170, 188]];
+    for ($i = 0; $i < 3 + $weight; $i++) {
+        $c = $linePalette[array_rand($linePalette)];
+        imagesetthickness($im, random_int(1, 2));
+        $col = imagecolorallocate($im, $c[0], $c[1], $c[2]);
+        imageline($im, random_int(0, $w), random_int(0, $h - 1),
+            random_int(0, $w), random_int(0, $h - 1), $col);
+    }
+    for ($i = 0; $i < 2 + $weight; $i++) {
+        $c = $linePalette[array_rand($linePalette)];
+        imagesetthickness($im, random_int(1, 2));
+        imagearc($im, random_int(0, $w), random_int(0, $h),
+            random_int(50, 180), random_int(24, 90),
+            random_int(0, 360), random_int(0, 360),
+            imagecolorallocate($im, $c[0], $c[1], $c[2]));
+    }
+    // A handful of filled blobs, the same colour family as the glyphs, to
+    // give a classifier something that looks like ink but is not a letter.
+    for ($i = 0; $i < 4 + $weight; $i++) {
+        $c = $ink;
+        $col = imagecolorallocate($im, min(255, $c[0] + random_int(40, 90)),
+                                  min(255, $c[1] + random_int(40, 90)),
+                                  min(255, $c[2] + random_int(40, 90)));
+        imagefilledellipse($im, random_int(0, $w), random_int(0, $h),
+                           random_int(3, 9), random_int(2, 6), $col);
+    }
+    imagesetthickness($im, 1);
+
+    // Sine-wave warp: breaks the character segmentation every OCR pipeline
+    // depends on, and reads to a person as "handwriting-ish".
+    $warp = imagecreatetruecolor($w, $h);
+    imagecopy($warp, $im, 0, 0, 0, 0, $w, $h);
+    $amp = 3 + $wv;
+    $period = random_int(24, 48);
+    $phase = random_int(0, 100) / 100 * M_PI * 2;
+    $bgCol = imagecolorallocate($warp, $bg[0], $bg[1], $bg[2]);
+    for ($y = 0; $y < $h; $y++) {
+        $offset = (int)round($amp * sin(2 * M_PI * $y / $period + $phase));
+        imagecopy($warp, $im, $offset, $y, 0, $y, $w, 1);
+        if ($offset > 0) {
+            imagefilledrectangle($warp, 0, $y, $offset - 1, $y, $bgCol);
+        } elseif ($offset < 0) {
+            imagefilledrectangle($warp, $w + $offset, $y, $w - 1, $y, $bgCol);
+        }
+    }
+
+    // A second warp on the other axis. The row shift above moves glyphs
+    // left and right, which the old comment called "handwriting-ish"; it does
+    // nothing about the vertical band a glyph sits in, so a row-projection
+    // still finds the text band cleanly. Displacing columns vertically as
+    // well means the band itself waves, and the two axes together no longer
+    // leave a straight line anywhere in the image for a projection to lock
+    // onto.
+    $vamp = 1 + $wv;
+    $vperiod = random_int(20, 40);
+    $vphase = random_int(0, 100) / 100 * M_PI * 2;
+    $warp2 = imagecreatetruecolor($w, $h);
+    imagefill($warp2, 0, 0, $bgCol);
+    for ($x = 0; $x < $w; $x++) {
+        $voff = (int)round($vamp * sin(2 * M_PI * $x / $vperiod + $vphase));
+        imagecopy($warp2, $warp, $x, $voff, $x, 0, 1, $h);
+    }
+    imagedestroy($warp);
+    $warp = $warp2;
+
+    // Buffered: the bytes are needed both as an HTTP body and as a `data:`
+    // URI, and the caller decides which.
+    ob_start();
+    imagepng($warp);
+    $png = (string)ob_get_clean();
+    imagedestroy($warp);
+    imagedestroy($im);
+    return $png;
+}
+
+function vigil_slider_suffix(string $part): string
+{
+    if ($part === 'slider-bg') {
+        return '.bg.png';
+    }
+    if ($part === 'slider-objects') {
+        return '.objects.png';
+    }
+    if (preg_match('/^slider-piece(\d{1,2})$/', $part, $m)) {
+        $n = (int)$m[1];
+        // Bounded: `slider-piece999` must not become a path walk.
+        if ($n >= 1 && $n <= 16) {
+            return '.piece' . $n . '.png';
+        }
+    }
+    return '';
+}
+
+/** Absolute path of one slider asset, or null when it is not there. */
+function vigil_slider_asset(string $stateDir, string $cid, string $part): ?string
+{
+    $suffix = vigil_slider_suffix($part);
+    if ($suffix === '' || !preg_match('/^[A-Za-z0-9]{8,64}$/', $cid)) {
+        return null;
+    }
+    $file = rtrim($stateDir, '/') . '/slider/' . $cid . $suffix;
+    return is_file($file) ? $file : null;
+}
+
+/**
+ * The same asset as a `data:` URI, for pages that carry their own pictures.
+ *
+ * A picture fetched by URL can fail to be fetched, and when it did the server
+ * saw nothing whatsoever -- no request, no log entry, no way to tell a broken
+ * page from a slow one. Inlined, the picture is present in the page or the
+ * page was not served.
+ *
+ * Returns '' if the file is missing, empty or implausibly large; the caller
+ * then falls back to the URL, so this is never the reason a page breaks.
+ */
+function vigil_slider_data_uri(string $stateDir, string $cid, string $part): string
+{
+    $file = vigil_slider_asset($stateDir, $cid, $part);
+    if ($file === null) {
+        return '';
+    }
+    $size = (int)@filesize($file);
+    if ($size <= 0 || $size > 4 * 1024 * 1024) {
+        return '';
+    }
+    $bytes = @file_get_contents($file);
+    if ($bytes === false || $bytes === '') {
+        return '';
+    }
+    return 'data:image/png;base64,' . base64_encode($bytes);
+}
+
+/**
+ * Where each piece rests in the tray, if the solver never touches it.
+ *
+ * The checker needs this to answer "did this piece get placed, or is it still
+ * sitting where it started?" -- and it must answer from geometry rather than
+ * from a flag the page sends, because "did you follow the instruction" is the
+ * one thing a client cannot be trusted about. The formula mirrors the page's
+ * exactly; a test pins the numbers for the shipped geometry (480x280, piece
+ * 46, radius 9) so the two cannot drift apart silently.
+ */
+/**
+ * How far a gap must stay from its own tray position, in pixels.
+ *
+ * Placement tolerance is 16px and the tray test uses 10px, so 48px leaves a
+ * 38px dead band between "in the gap" and "still in the tray". Nothing can be
+ * both, which is the property the checker relies on.
+ */
+const VIGIL_TRAY_CLEAR = 48;
+
+/**
+ * Is this drop still sitting where the piece started?
+ *
+ * 10px rather than the 3px this began with: "drag the extra one back" is done
+ * with a thumb, and 3px is not a target a person can hit. It is safe to be
+ * generous because the generator keeps every gap at least VIGIL_TRAY_CLEAR
+ * away from the tray position, so a piece in its gap is never near its tray.
+ */
+function vigil_slider_in_tray(?array $drop, ?array $rest): bool
+{
+    if (!is_array($drop) || !is_array($rest)) {
+        return false;
+    }
+    if (!isset($drop['x'], $drop['y'])) {
+        return false;
+    }
+    return abs((float)$drop['x'] - (float)$rest['x']) <= 10
+        && abs((float)$drop['y'] - (float)$rest['y']) <= 10;
+}
+
+function vigil_slider_tray(array $slots, array $geom): array
+{
+    $n = count($slots);
+    if ($n < 1) {
+        return [];
+    }
+    $w = (int)$geom['width'];
+    $h = (int)$geom['height'];
+    $pw = (int)$geom['piece'] + (int)$geom['radius'];
+    $ph = (int)$geom['piece'] + (int)$geom['radius'] * 2;
+    $max = $w - (int)$geom['piece'] - (int)$geom['radius'];
+    $maxY = max(0, $h - $ph);
+    $out = [];
+    for ($i = 0; $i < $n; $i++) {
+        $tx = (int)round(($i + 0.5) * ($w / $n) - $pw / 2);
+        $out[] = ['x' => max(0, min($max, $tx)), 'y' => max(0, $maxY - $i * 5)];
+    }
+    return $out;
+}
+
+function vigil_new_slider(string $stateDir, array $policy,
+                           array $cfg = []): array
+{
+    if (!function_exists('imagecreatetruecolor')) {
+        return ['ok' => false, 'reason' => 'NO_GD'];
+    }
+    $g = vigil_slider_geometry($stateDir, $policy);
+    $w = $g['width']; $h = $g['height'];
+    $size = $g['piece']; $radius = $g['radius'];
+
+    $kind = 'art';
+    $source = '';
+    $art = vigil_slider_plate($w, $h, $cfg, $kind, $source);
+    $bg = $art['image'];
+    $pal = $art['palette'];
+
+    // Keep the pieces fully inside the frame, with the nubs clear of the edge.
+    //
+    // The lower bound leaves the top band free for the passcode: the pieces
+    // are drawn over the picture, so if one could reach the code it would
+    // hide the very thing the solver has to read.
+    // The question shapes are scattered across the whole frame and drawn on
+    // a layer *above* the pieces, so no band has to be reserved for them and
+    // a dragged piece can never hide one. The pieces only keep a small margin
+    // from the edges.
+    $pw = $size + $radius;
+    $bandTop = 26;
+    $bandBottom = $h - $size - 24;
+
+    // Two pieces, at two different heights.
+    //
+    // With one piece the answer space is the track width divided by the
+    // tolerance -- a few dozen outcomes -- and the picture hands the solver
+    // the target outright, so the only real work is finding the marker. Two
+    // pieces must *both* be placed: the search space is squared, and each
+    // region of the picture has to be judged separately instead of finding
+    // one rectangle and stopping.
+    // Three rows, evenly spread then jittered.
+    //
+    // Random placement with a minimum separation was the first attempt, but
+    // the rows have to be far enough apart that the pieces cannot collide and
+    // the band is only just tall enough for three -- so the sampler almost
+    // never found a valid triple and fell back to the same three positions
+    // on every challenge. Evenly spaced rows with a small jitter always
+    // satisfy the constraint and still differ every time.
+    $rows = 3;
+    $span = max(0, $bandBottom - $bandTop);
+    $step = $rows > 1 ? (int)($span / ($rows - 1)) : 0;
+    $ys = [];
+    for ($i = 0; $i < $rows; $i++) {
+        $base = $bandTop + $i * $step;
+        $jitter = ($i === 0 || $i === $rows - 1) ? random_int(0, 5)
+                                                 : random_int(-6, 6);
+        $ys[] = max($bandTop, min($bandBottom, $base + $jitter));
+    }
+    sort($ys);
+
+    // A different knob on every gap. The pieces are therefore not
+    // interchangeable: only one of them has the knob that fits a given gap,
+    // so the solver has to match shape *and* position.
+    $shapes = ['right', 'left', 'top', 'bottom'];
+    shuffle($shapes);
+
+    $xs = [];
+    $place = [];
+    $pieces = [];
+    foreach ($ys as $slotNo => $y) {
+        $shape = $shapes[$slotNo % count($shapes)];
+        // The left edge starts further in than before: several pieces need
+        // room to sit at different x without any hugging the frame.
+        //
+        // The gap must also stay clear of *its own* tray position. The page
+        // starts piece i at a fixed x along the bottom, and the checker
+        // decides whether that piece was placed by comparing the drop with
+        // that same point -- so a gap sitting within a few pixels of it makes
+        // "correctly placed" and "never touched" the same coordinates. The
+        // solver then does everything right and is told it did not place two
+        // pieces. Measured before this guard: 2 of 120 sampled slots landed
+        // within 12px of their tray x, the closest 1px apart. The clear
+        // margin is much larger than any placement tolerance, so the two
+        // cases can never be confused.
+        $trayPw = $size + $radius;
+        $trayMax = $w - $size - $radius;
+        $trayX = max(0, min($trayMax,
+            (int)round(($slotNo + 0.5) * ($w / max(1, $rows)) - $trayPw / 2)));
+        $lo = (int)($w * 0.22);
+        $hi = $w - $size - $radius - 8;
+        $x = random_int($lo, $hi);
+        for ($try = 0; $try < 24 && abs($x - $trayX) < VIGIL_TRAY_CLEAR; $try++) {
+            $x = random_int($lo, $hi);
+        }
+        if (abs($x - $trayX) < VIGIL_TRAY_CLEAR) {
+            // Deterministic fallback: the constraint must hold every time,
+            // not merely usually.
+            $x = ($trayX + VIGIL_TRAY_CLEAR <= $hi) ? $trayX + VIGIL_TRAY_CLEAR
+                                                    : max($lo, $trayX - VIGIL_TRAY_CLEAR);
+            $x = max($lo, min($hi, $x));
+        }
+        $xs[] = $x;
+        // A knob on the left has to be offset inside its own canvas, or it
+        // would be clipped off the edge of the piece image.
+        $ox = ($shape === 'left') ? $radius : 0;
+        $oy = $radius;
+        $place[] = ['shape' => $shape, 'ox' => $ox, 'oy' => $oy];
+
+        // 1. Cut the piece from the *clean* artwork, so it looks like a real
+        //    fragment of the picture rather than a muddy patch.
+        $piece = imagecreatetruecolor($pw, $size + $radius * 2);
+        imagealphablending($piece, false);
+        imagesavealpha($piece, true);
+        imagefilledrectangle($piece, 0, 0, $pw, $size + $radius * 2,
+            imagecolorallocatealpha($piece, 0, 0, 0, 127));
+        for ($py = 0; $py < $size + $radius * 2; $py++) {
+            for ($px = 0; $px < $pw; $px++) {
+                if (!vigil_slider_inside($px, $py, $ox, $oy, $size, $radius,
+                                         $shape)) {
+                    continue;
+                }
+                $sx = $x + $px;
+                $sy = $y + $py - $oy;
+                if ($sx < 0 || $sx >= $w || $sy < 0 || $sy >= $h) { continue; }
+                imagesetpixel($piece, $px, $py, imagecolorat($bg, $sx, $sy));
+            }
+        }
+        $pieces[] = $piece;
+    }
+
+    // 2. Mark both gaps. A *soft shadow*, not a black hole, and not a hard
+    //    rectangle either: a person needs to see the target, and a marker
+    //    drawn as a crisp high-contrast box is the easiest possible thing for
+    //    a script to find. A shallow darkening plus a thin contrast outline
+    //    is legible to the eye and far less machine-obvious.
+    $edgeInk = imagecolorallocate($bg, $pal['ink'][0], $pal['ink'][1],
+                                  $pal['ink'][2]);
+    $edgeGlow = imagecolorallocatealpha($bg, $pal['glow'][0], $pal['glow'][1],
+                                        $pal['glow'][2], 72);
+    foreach ($ys as $slot => $y) {
+        $x = $xs[$slot];
+        $shape = $place[$slot]['shape'];
+        $ox = $place[$slot]['ox'];
+        for ($py = 0; $py < $h; $py++) {
+            for ($px = 0; $px < $w; $px++) {
+                if (!vigil_slider_inside($px, $py, $x, $y, $size, $radius,
+                                         $shape)) {
+                    continue;
+                }
+                $rgb = imagecolorat($bg, $px, $py);
+                // Note the variable names: `$g` already holds the geometry
+                // array in this scope, and shadowing it here silently turned
+                // the tolerance into null.
+                $cr = ($rgb >> 16) & 0xFF;
+                $cg = ($rgb >> 8) & 0xFF;
+                $cb = $rgb & 0xFF;
+                // An illustration has no flat shapes to snap, so the gap is
+                // the only alignment cue it has left: deepen it a little.
+                $k = $kind === 'image' ? 0.36 : 0.44;
+                // Build the darkened colour as an integer instead of calling
+                // imagecolorallocate per pixel.
+                //
+                // The allocating version burned through PHP's memory_limit:
+                // a 480x280 frame is 134k pixels, three gaps makes 400k
+                // allocations in this loop alone, and PHP-FPM (128M) would
+                // die part-way through building a challenge -- intermittently,
+                // depending on what else the request had done, so the visitor
+                // got a broken page rather than an error. A truecolour pixel
+                // is just an int, so this preserves the alpha bits and
+                // allocates nothing.
+                imagesetpixel($bg, $px, $py,
+                    ($rgb & 0xFF000000)
+                    | ((int)($cr * $k) << 16)
+                    | ((int)($cg * $k) << 8)
+                    | (int)($cb * $k));
+            }
+        }
+        // 3. A thin outline so the target is unambiguous even on a dark part
+        //    of the picture.
+        for ($py = 0; $py <= $h; $py++) {
+            for ($px = 0; $px <= $w; $px++) {
+                if (!vigil_slider_inside($px, $py, $x, $y, $size, $radius,
+                                         $shape)) {
+                    continue;
+                }
+                if ($px < 0 || $px >= $w || $py < 0 || $py >= $h) { continue; }
+                $e2 = !vigil_slider_inside($px - 2, $py, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px + 2, $py, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px, $py - 2, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px, $py + 2, $x, $y, $size, $radius, $shape);
+                if (!$e2) { continue; }
+                $e4 = !vigil_slider_inside($px - 4, $py, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px + 4, $py, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px, $py - 4, $x, $y, $size, $radius, $shape)
+                   || !vigil_slider_inside($px, $py + 4, $x, $y, $size, $radius, $shape);
+                imagesetpixel($bg, $px, $py, $e4 ? $edgeGlow : $edgeInk);
+            }
+        }
+    }
+
+    // --- 图文阅读理解：第二重因素 -------------------------------------
+    //
+    // 画面上散落着若干个图形，题目问的是它们的数量或颜色。要点是**不要让人
+    // 一眼看出"这是系统画上去的"**，因为那正是机器最好切分的东西：
+    //
+    //   · 散落而不是排成一行 —— 没有固定的区域，也就没有"只看顶部那条带子"
+    //     这种取巧的检测方式；
+    //   · 半透明并带随机旋转、随机大小 —— 颜色阈值切不出它们，因为它们与背景
+    //     混在一起；形状匹配也不稳，因为每个实例的角度和尺寸都不同；
+    //   · 图形单独一层，由浏览器画在拼片**之上** —— 否则拼片拖过去就把要数的
+    //     东西盖住了，人会数错，而这不是难度，是缺陷。
+    //
+    // 但人仍然看得清：轮廓保留一点深色描边，颜色是明确的红/蓝/绿/黄。
+    // 目标是"人一眼能数，脚本难以切分"，而不是"谁也看不清"。
+    $shapeNames = ['圆形', '三角形', '方形', '五角星', '菱形'];
+    $colorNames = ['红色', '蓝色', '绿色', '黄色'];
+    $paletteRgb = [
+        '红色' => [226, 62, 62],
+        '蓝色' => [58, 112, 224],
+        '绿色' => [58, 172, 92],
+        '黄色' => [238, 190, 58],
+    ];
+
+    $shapeIdx = random_int(0, count($shapeNames) - 1);
+    $colorIdx = random_int(0, count($colorNames) - 1);
+    $wantCount = random_int(1, 3);
+    $shape = $shapeNames[$shapeIdx];
+    $colour = $colorNames[$colorIdx];
+    $rgb = $paletteRgb[$colour];
+
+    $layer = imagecreatetruecolor($w, $h);
+    imagealphablending($layer, false);
+    imagesavealpha($layer, true);
+    imagefilledrectangle($layer, 0, 0, $w, $h,
+                         imagecolorallocatealpha($layer, 0, 0, 0, 127));
+    imagealphablending($layer, true);
+
+    // 半透明：约六成不透明。再淡人就要眯眼，再浓就成了贴纸。
+    $bodyAlpha = random_int(38, 58);
+    $edgeAlpha = max(12, $bodyAlpha - 26);
+
+    // 顶点表，可按随机角度旋转
+    $shapePoints = static function ($kind, $cx, $cy, $r, $rot) {
+        $raw = [];
+        if ($kind === '五角星') {
+            for ($i = 0; $i < 10; $i++) {
+                $rad = ($i % 2 === 0) ? $r : $r * 0.42;
+                $ang = -M_PI / 2 + $i * M_PI / 5 + $rot;
+                $raw[] = [cos($ang) * $rad, sin($ang) * $rad];
+            }
+        } elseif ($kind === '三角形') {
+            foreach ([[0, -1], [0.92, 0.72], [-0.92, 0.72]] as $pt) {
+                $ang = $rot;
+                $x = $pt[0] * $r; $y = $pt[1] * $r;
+                $raw[] = [$x * cos($ang) - $y * sin($ang),
+                          $x * sin($ang) + $y * cos($ang)];
+            }
+        } elseif ($kind === '菱形') {
+            foreach ([[0, -1], [0.78, 0], [0, 1], [-0.78, 0]] as $pt) {
+                $ang = $rot;
+                $x = $pt[0] * $r; $y = $pt[1] * $r;
+                $raw[] = [$x * cos($ang) - $y * sin($ang),
+                          $x * sin($ang) + $y * cos($ang)];
+            }
+        } elseif ($kind === '方形') {
+            foreach ([[-1, -1], [1, -1], [1, 1], [-1, 1]] as $pt) {
+                $ang = $rot;
+                $x = $pt[0] * $r * 0.82; $y = $pt[1] * $r * 0.82;
+                $raw[] = [$x * cos($ang) - $y * sin($ang),
+                          $x * sin($ang) + $y * cos($ang)];
+            }
+        }
+        $out = [];
+        foreach ($raw as $pt) {
+            $out[] = (int)round($cx + $pt[0]);
+            $out[] = (int)round($cy + $pt[1]);
+        }
+        return $out;
+    };
+
+    $baseR = (int)max(11, min($w, $h) * 0.075);
+    // One shape per column, at a random height.
+    //
+    // Uniform random placement was the obvious thing and it looked wrong: the
+    // self-test measured the shapes covering as little as 18% of the height
+    // and 39px of width, because three random points in a 480x280 frame
+    // cluster far more often than intuition suggests. Columns guarantee the
+    // spread the request asked for ("散落") while the height stays random, so
+    // the layout still differs every time.
+    $colW = (int)($w / max(1, $wantCount));
+    for ($i = 0; $i < $wantCount; $i++) {
+        $r = $baseR + random_int(-3, 5);
+        $loX = $i * $colW + $r + 6;
+        $hiX = ($i + 1) * $colW - $r - 6;
+        if ($hiX < $loX) { $hiX = $loX; }
+        $cx = random_int(max($r + 4, min($loX, $w - $r - 4)),
+                         max($r + 4, min($hiX, $w - $r - 4)));
+        $cy = random_int($r + 6, max($r + 6, $h - $r - 6));
+        $placed[] = [$cx, $cy, $r, $r];
+        $rot = random_int(0, 628) / 100.0;
+        $body = imagecolorallocatealpha($layer, $rgb[0], $rgb[1], $rgb[2],
+                                        $bodyAlpha);
+        $edge = imagecolorallocatealpha($layer,
+                                        (int)($rgb[0] * 0.35),
+                                        (int)($rgb[1] * 0.35),
+                                        (int)($rgb[2] * 0.35), $edgeAlpha);
+        if ($shape === '圆形') {
+            imagefilledellipse($layer, $cx, $cy, $r * 2 + 3, $r * 2 + 3, $edge);
+            imagefilledellipse($layer, $cx, $cy, $r * 2, $r * 2, $body);
+            continue;
+        }
+        $pts = $shapePoints($shape, $cx, $cy, $r, $rot);
+        $outPts = $shapePoints($shape, $cx, $cy, $r + 2, $rot);
+        imagefilledpolygon($layer, $outPts, $edge);
+        imagefilledpolygon($layer, $pts, $body);
+    }
+
+    // 出题：三种问法随机选一种，全部只需要"看图"就能回答。
+    $askKind = random_int(0, 2);
+    if ($askKind === 0) {
+        $qText = sprintf('图中有几个%s？', $shape);
+        $qOpts = ['1 个', '2 个', '3 个'];
+        $qAns = $wantCount - 1;
+    } elseif ($askKind === 1) {
+        $qText = sprintf('%s是什么颜色？', $shape);
+        $wrong = [];
+        foreach ($colorNames as $cn) {
+            if ($cn !== $colour) { $wrong[] = $cn; }
+        }
+        shuffle($wrong);
+        $qOpts = [$colour, $wrong[0], $wrong[1]];
+        shuffle($qOpts);
+        $qAns = array_search($colour, $qOpts, true);
+    } else {
+        $qText = '图中画的是什么形状？';
+        $wrong = [];
+        foreach ($shapeNames as $sn) {
+            if ($sn !== $shape) { $wrong[] = $sn; }
+        }
+        shuffle($wrong);
+        $qOpts = [$shape, $wrong[0], $wrong[1]];
+        shuffle($qOpts);
+        $qAns = array_search($shape, $qOpts, true);
+    }
+    $qAns = (int)$qAns;
+
+    $id = bin2hex(random_bytes(16));
+    $dir = rtrim($stateDir, '/') . '/slider';
+    if (!is_dir($dir)) { @mkdir($dir, 0700, true); @chmod($dir, 0700); }
+    imagepng($bg, $dir . '/' . $id . '.bg.png');
+    @chmod($dir . '/' . $id . '.bg.png', 0600);
+    // The question shapes travel as their own transparent layer so the page
+    // can composite them over the pieces.
+    imagepng($layer, $dir . '/' . $id . '.objects.png');
+    @chmod($dir . '/' . $id . '.objects.png', 0600);
+    imagedestroy($layer);
+    foreach ($pieces as $slot => $pieceIm) {
+        $pf = $dir . '/' . $id . '.piece' . ($slot + 1) . '.png';
+        imagepng($pieceIm, $pf);
+        @chmod($pf, 0600);
+    }
+    // Retire the single-piece name: a page that expects every piece must not
+    // be able to pick up a stale one-piece file from an earlier challenge.
+    @unlink($dir . '/' . $id . '.piece.png');
+    // The unmarked scene is deliberately NOT written any more.
+    //
+    // It was served alongside the marked background so the page could tell
+    // where the gap was by differencing the two images -- and that is exactly
+    // the defect: the answer was computable in the browser. Two PNGs that are
+    // identical except for the gap marker give the gap's position to anyone
+    // who can subtract them, no image understanding required. A bot could
+    // read the offset out of the pixels, synthesise a plausible drag track
+    // long enough to satisfy the timing checks, and submit.
+    //
+    // The answer is still *visible* -- that is the puzzle -- but it now has
+    // to be found by looking at the marked picture, which is the whole point
+    // of using a picture at all.
+    @unlink($dir . '/' . $id . '.scene.png');
+    imagedestroy($bg);
+    foreach ($pieces as $pieceIm) { imagedestroy($pieceIm); }
+
+    $payload = json_encode([
+        'mode'   => 'slider',
+        // Both answers, as an explicit list. `x`/`y` are kept as the first
+        // slot so an older reader still finds something sensible, but the
+        // verifier iterates `slots` -- it must never validate only the first
+        // piece and call the challenge solved.
+        'slots'  => [],
+        'x'      => $xs[0],
+        'y'      => $ys[0],
+        'size'   => $size,
+        'radius' => $radius,
+        'exp'    => time() + (int)$policy['captcha_ttl'],
+        'born'   => time(),
+        'bind'   => vigil_client_binding(),
+        'weight' => vigil_fail_count_direct($stateDir),
+        // Auditable: which kind of picture was served, and which file.
+        'kind'   => $kind,
+        'source' => $source,
+        // The answer stays server-side, exactly like the offsets. The page
+        // is told the question and the options; which option is correct is
+        // never sent.
+        'q_text' => $qText,
+        'q_opts' => $qOpts,
+        'q_ans'  => $qAns,
+        // How many shapes were drawn. Checked by the self-test, which needs
+        // to know whether "spread out" is even a meaningful expectation --
+        // one shape cannot span the frame.
+        'q_n'    => $wantCount,
+    ], JSON_UNESCAPED_SLASHES);
+    // Fill the slot list in before writing. Built from the same $xs/$ys the
+    // images were cut from, so the answers cannot drift apart from them.
+    $slotList = [];
+    foreach ($xs as $slot => $sx) {
+        // The *piece's* top-left is what the page will drop, so that is what
+        // is compared -- not the gap body, which is offset by the knob.
+        $slotList[] = ['x' => $sx - $place[$slot]['ox'],
+                       'y' => $ys[$slot] - $place[$slot]['oy'],
+                       'shape' => $place[$slot]['shape']];
+    }
+    $payload = str_replace('"slots":[]',
+                           '"slots":' . json_encode($slotList,
+                                                   JSON_UNESCAPED_SLASHES),
+                           (string)$payload);
+    $file = rtrim($stateDir, '/') . '/captcha/' . $id . '.json';
+    file_put_contents($file, (string)$payload, LOCK_EX);
+    @chmod($file, 0600);
+
+    return [
+        'ok' => true, 'id' => $id, 'width' => $w, 'height' => $h,
+        'piece' => $size, 'radius' => $radius, 'piece_y' => $ys[0],
+        // Everything the page needs for every piece, in one list.
+        'pieces' => array_map(static function ($sx, $sy) {
+            return ['x' => $sx, 'y' => $sy];
+        }, $xs, $ys),
+        'piece_count' => count($xs),
+        'min_x' => 0, 'max_x' => $w - $size - $radius,
+        'tolerance' => $g['tolerance'], 'approach' => $g['approach'],
+        // The question is presentation; the answer is not in this array.
+        'q_text' => $qText, 'q_opts' => $qOpts,
+        'glow' => $pal['glow'], 'accent' => $pal['accent'],
+        // Which renderer produced this picture. The browser animates the two
+        // kinds differently: painted art gets drifting clouds and wildlife,
+        // while a photograph or illustration gets a focus pull instead, since
+        // cartoon birds over someone's artwork would be vandalism.
+        'kind' => $kind,
+        // Presentation only: where the light is, so the browser can cast the
+        // same rays the painting was lit by, and where the shoreline sits, so
+        // the live ripples land on water instead of on grass.
+        'sun' => $art['sun'] ?? null,
+        'horizon' => (int)($art['horizon'] ?? (int)($h * 0.5)),
+        'waterline' => (int)($art['waterline'] ?? 0),
+        'ink' => $pal['ink'],
+    ];
+}
+
+/**
+ * Verify a slider submission.
+ *
+ * Beyond the offset itself, the trajectory must look like a hand: several
+ * samples, variable speed, forward motion, plausible duration. A script
+ * that jumps straight to the right pixel is rejected even when the offset
+ * is correct, which is the whole point -- a bot that can solve the image but
+ * not fake the motion still fails.
+ */
+function vigil_check_slider(string $stateDir, array $policy, string $cid,
+                            string $dropsJson, bool $honeypotTripped,
+                            string $qAnswer = ''): array
+{
+    if ($honeypotTripped) {
+        return ['ok' => false, 'reason' => 'HONEYPOT'];
+    }
+    if (!preg_match('/^[0-9a-f]{32}$/', $cid)) {
+        return ['ok' => false, 'reason' => 'BAD_ID'];
+    }
+    $file = rtrim($stateDir, '/') . '/captcha/' . $cid . '.json';
+    if (!is_file($file)) {
+        return ['ok' => false, 'reason' => 'MISSING'];
+    }
+    $raw = (string)@file_get_contents($file);
+    @unlink($file);
+    // The images are single-use too.
+    $sliderDir = rtrim($stateDir, '/') . '/slider/' . $cid;
+    foreach (glob($sliderDir . '.*') ?: [] as $stale) { @unlink($stale); }
+
+    $d = json_decode($raw, true);
+    if (!is_array($d) || ($d['mode'] ?? '') !== 'slider') {
+        return ['ok' => false, 'reason' => 'CORRUPT'];
+    }
+    if ((int)($d['exp'] ?? 0) < time()) {
+        return ['ok' => false, 'reason' => 'EXPIRED'];
+    }
+    if (!hash_equals((string)($d['bind'] ?? ''), vigil_client_binding())) {
+        return ['ok' => false, 'reason' => 'BINDING'];
+    }
+    if ((time() - (int)($d['born'] ?? 0)) < (int)$policy['captcha_min_seconds']) {
+        return ['ok' => false, 'reason' => 'TOO_FAST'];
+    }
+
+    // --- the picture question, first -------------------------------------
+    //
+    // Checked before the positions, deliberately. A bot that cannot read the
+    // picture should not learn from this request whether its drag was
+    // accurate, and the failure message never says which factor was wrong --
+    // otherwise the two can be searched independently.
+    if (array_key_exists('q_ans', $d)) {
+        $wantAns = (string)(int)$d['q_ans'];
+        $gotAns = trim($qAnswer);
+        if ($gotAns === '' || !hash_equals($wantAns, $gotAns)) {
+            return ['ok' => false, 'reason' => 'WRONG_ANSWER'];
+        }
+    }
+
+    $drops = json_decode($dropsJson, true);
+    if (!is_array($drops) || !$drops) {
+        return ['ok' => false, 'reason' => 'NO_TRACK'];
+    }
+
+    // --- the drag path ---------------------------------------------------
+    //
+    // Two-dimensional now: the piece is dragged freely, so samples are
+    // (x, y, t). Step *lengths* are what a hand varies -- accelerating,
+    // overshooting, correcting -- and a generated path does not. Judged by
+    // the coefficient of variation so the measure does not depend on how
+    // fast or how far the drag went.
+    // Judge the track of the piece that was carried furthest, not blindly
+    // `drops[0]`: only two pieces need placing now, so slot 0 may well be the
+    // one deliberately left in the tray, and its empty track is not evidence
+    // of anything.
+    $primary = [];
+    foreach ($drops as $cand) {
+        $track = is_array($cand) ? (array)($cand['track'] ?? []) : [];
+        if (count($track) > count($primary)) {
+            $primary = $track;
+        }
+    }
+    $pts = [];
+    foreach ($primary as $pt) {
+        if (is_array($pt) && count($pt) >= 3) {
+            $pts[] = [(float)$pt[0], (float)$pt[1], (float)$pt[2]];
+        }
+    }
+    if (count($pts) < 5) {
+        return ['ok' => false, 'reason' => 'SHORT_TRACK'];
+    }
+    $steps = [];
+    $ts = [];
+    for ($i = 1; $i < count($pts); $i++) {
+        $dx = $pts[$i][0] - $pts[$i - 1][0];
+        $dy = $pts[$i][1] - $pts[$i - 1][1];
+        $steps[] = sqrt($dx * $dx + $dy * $dy);
+        $ts[] = $pts[$i][2];
+    }
+    $travelled = array_sum($steps);
+    if ($travelled < 24) {
+        return ['ok' => false, 'reason' => 'NO_MOVEMENT'];
+    }
+    $mean = array_sum($steps) / max(1, count($steps));
+    if ($mean <= 0.0) {
+        return ['ok' => false, 'reason' => 'NO_MOVEMENT'];
+    }
+    $var = 0.0;
+    foreach ($steps as $sv) { $var += ($sv - $mean) * ($sv - $mean); }
+    $var /= max(1, count($steps));
+    $cv = sqrt($var) / max(0.001, abs($mean));
+    if ($cv < 0.12) {
+        return ['ok' => false, 'reason' => 'ROBOTIC_SPEED'];
+    }
+    $distinct = [];
+    foreach ($steps as $sv) { $distinct[(string)round($sv)] = true; }
+    if (count($distinct) < 3) {
+        return ['ok' => false, 'reason' => 'UNIFORM_STEPS'];
+    }
+    // Timing: literally every interval identical is the signature of a
+    // generator. A browser aligns pointer events to the display, so a human
+    // drag can be near-constant -- requiring *zero* variation costs a person
+    // nothing and still catches a computed timestamp loop.
+    $intervals = [];
+    for ($i = 1; $i < count($ts); $i++) { $intervals[] = $ts[$i] - $ts[$i - 1]; }
+    $positive = array_values(array_filter($intervals, static fn($v) => $v > 0));
+    if (count($positive) >= 6 && count(array_unique($positive)) === 1) {
+        return ['ok' => false, 'reason' => 'ROBOTIC_TIMING'];
+    }
+    $duration = (int)($ts[count($ts) - 1] ?? 0);
+    if ($duration < 100 || $duration > 20000) {
+        return ['ok' => false, 'reason' => 'BAD_DURATION'];
+    }
+
+    // --- every piece, in its own gap -------------------------------------
+    //
+    // Walked generically: hardcoding "slot 0 and slot 1" would hand a bot
+    // any third piece for free, which is the sort of half-check this codebase
+    // keeps finding in other people's software.
+    $slots = is_array($d['slots'] ?? null) ? $d['slots'] : [];
+    if (count($slots) < 1) {
+        return ['ok' => false, 'reason' => 'CORRUPT'];
+    }
+    if (count($drops) < count($slots)) {
+        return ['ok' => false, 'reason' => 'MISSING_PIECE'];
+    }
+    $geom = vigil_slider_geometry($stateDir, $policy);
+    $tol = (int)$geom['tolerance'];
+    $tray = vigil_slider_tray($slots, $geom);
+
+    // --- how many pieces were actually placed -----------------------------
+    //
+    // Three pieces are drawn and the page asks for **two**, leaving the third
+    // where it started. That is an instruction-compliance check, and it is
+    // the only part of this puzzle that a competent solver can fail: a script
+    // that finds every gap and fills every piece it can see has not read the
+    // sentence, which is precisely what being a script means. A person reads
+    // "只需要两块" and does that.
+    //
+    // "Placed" is computed here from the tray geometry, never taken from the
+    // page. The client cannot be trusted about whether it followed the
+    // instruction -- that is the whole question being asked.
+    $required = min(2, count($slots));
+    $placed = 0;
+    foreach ($slots as $idx => $slot) {
+        $drop = $drops[$idx] ?? null;
+        if (!is_array($drop) || !isset($drop['x'], $drop['y'])) {
+            return ['ok' => false, 'reason' => 'MISSING_PIECE'];
+        }
+        if (!vigil_slider_in_tray($drop, $tray[$idx] ?? null)) {
+            $placed++;
+        }
+    }
+    if ($placed > $required) {
+        // Everything was fitted. Told the answer, a person leaves one alone;
+        // a solver does not.
+        return ['ok' => false, 'reason' => 'OVERPLACED'];
+    }
+    if ($placed < $required) {
+        return ['ok' => false, 'reason' => 'UNDERPLACED'];
+    }
+    // Exactly the required number are out of the tray, so those are the ones
+    // that must be in their gaps. The untouched one is not checked: it is
+    // where it should be.
+    $correct = 0;
+    foreach ($slots as $idx => $slot) {
+        $drop = $drops[$idx] ?? null;
+        if (vigil_slider_in_tray($drop, $tray[$idx] ?? null)) {
+            continue;
+        }
+        if (abs((float)$drop['x'] - (float)$slot['x']) > $tol
+                || abs((float)$drop['y'] - (float)$slot['y']) > $tol) {
+            return ['ok' => false, 'reason' => 'MISALIGNED'];
+        }
+        $correct++;
+    }
+    if ($correct !== $required) {
+        return ['ok' => false, 'reason' => 'MISALIGNED'];
+    }
+    return ['ok' => true, 'reason' => 'OK'];
+}
+
+// --------------------------------------------------------------------------
+// Sessions
+// --------------------------------------------------------------------------
+
+/**
+ * Mint a session ticket.
+ *
+ * The bindings are stored as **digests, never as the raw values**. Three
+ * reasons, all of which matter:
+ *
+ *   1. the file is written by PHP and read by Lua; a raw User-Agent
+ *      containing a newline could inject extra lines into the file and
+ *      forge an expiry, which is a complete bypass;
+ *   2. the ticket directory is the one thing an attacker who reaches it
+ *      wants, and it should not also hand them every visitor's address;
+ *   3. comparing fixed-length hex cannot leak information through length.
+ *
+ * The digest MUST be md5 here, because Lua computes it with ngx.md5. PHP's
+ * hash('md5', ...) and Lua's ngx.md5() both return lowercase hex and agree
+ * byte for byte. Changing one side alone silently invalidates every session
+ * — which is exactly what happened the first time this was written.
+ */
+function vigil_issue_ticket(string $stateDir, int $ttl, string $ua, string $ip): string
+{
+    $tok = bin2hex(random_bytes(32));
+    // Timestamps are decimal. They were briefly hex, which the Lua reader
+    // parsed with tonumber() -> nil -> 0 -> "expired", invalidating every
+    // session the moment it was created. Decimal digits are still valid
+    // hex characters, so the reader's strict shape check accepts them.
+    $body = sprintf("exp=%d\niat=%d\nuah=%s\niph=%s\n",
+        time() + $ttl, time(),
+        hash('md5', $ua), hash('md5', $ip));
+    $f = rtrim($stateDir, '/') . '/sessions/' . $tok;
+    file_put_contents($f, $body, LOCK_EX);
+    @chmod($f, 0600);
+    return $tok;
+}
+
+/** Cookie options shared by every gate. */
+function vigil_cookie_options(int $lifetime = 0): array
+{
+    return [
+        'expires'  => $lifetime > 0 ? time() + $lifetime : 0,
+        'path'     => '/',
+        'secure'   => true,        // the gate is only ever served over TLS
+        'httponly' => true,        // unreachable from JavaScript
+        'samesite' => 'Lax',       // survives normal navigation, blocks CSRF POSTs
+    ];
+}
+
+// --------------------------------------------------------------------------
+// Housekeeping
+// --------------------------------------------------------------------------
+
+/**
+ * Prune expired challenges and sessions.
+ *
+ * Both stores are attacker-influenced, so neither may grow unbounded. Runs
+ * on every form render rather than from a cron job: fewer moving parts and
+ * it cannot fall behind after a restart.
+ */
+function vigil_prune(string $stateDir, array $policy): void
+{
+    // Sidecar files written by the Lua gate to remember the last accepted
+    // navigation, which is how it tells a reload from a click. They are
+    // removed once their session ticket is gone, so the sessions directory
+    // does not slowly fill with orphans.
+    $navFiles = glob(rtrim($stateDir, '/') . '/sessions/*.nav');
+    if (is_array($navFiles)) {
+        foreach ($navFiles as $navFile) {
+            $base = substr($navFile, 0, -4);
+            if (!is_file($base)) {
+                @unlink($navFile);
+            }
+        }
+    }
+
+    // Lockout records are pruned here too: this function already runs on
+    // every render and submit, and the sweeper throttles itself to once an
+    // hour, so `fails/` cannot grow into append-only history.
+    vigil_fail_sweep($stateDir);
+
+    $now = time();
+    $capDir = rtrim($stateDir, '/') . '/captcha';
+    $files = glob($capDir . '/*.json') ?: [];
+    // Hard ceiling: if something went very wrong, drop the oldest half
+    // rather than let the directory grow without limit.
+    $limit = max(200, (int)$policy['captcha_per_minute'] * 20);
+    if (count($files) > $limit) {
+        sort($files);
+        foreach (array_slice($files, 0, count($files) - $limit) as $f) {
+            @unlink($f);
+        }
+        $files = array_slice($files, -$limit);
+    }
+    foreach ($files as $f) {
+        $d = json_decode((string)@file_get_contents($f), true);
+        if (!is_array($d) || (int)($d['exp'] ?? 0) < $now - 60) {
+            @unlink($f);
+        }
+    }
+
+    // Slider assets are files too, and are attacker-influenced: prune them
+    // on the same schedule as the challenges they belong to.
+    $sliderDir = rtrim($stateDir, '/') . '/slider';
+    if (is_dir($sliderDir)) {
+        $alive = [];
+        foreach (glob($capDir . '/*.json') ?: [] as $f) {
+            $alive[basename($f, '.json')] = true;
+        }
+        foreach (glob($sliderDir . '/*.png') ?: [] as $f) {
+            $id = preg_replace('/\.(bg|scene|piece)\.png$/', '', basename($f));
+            if (!isset($alive[$id]) || @filemtime($f) < $now - 3600) {
+                @unlink($f);
+            }
+        }
+    }
+
+    $sessDir = rtrim($stateDir, '/') . '/sessions';
+    $live = [];
+    foreach (glob($sessDir . '/*') ?: [] as $f) {
+        $body = (string)@file_get_contents($f);
+        if (preg_match('/^exp=(\d+)/m', $body, $m) && (int)$m[1] > $now) {
+            $live[$f] = @filemtime($f) ?: 0;
+        } else {
+            @unlink($f);
+        }
+    }
+    $max = (int)$policy['max_sessions'];
+    if (count($live) > $max) {
+        asort($live);                       // least recently active first
+        $excess = count($live) - $max;
+        foreach (array_keys($live) as $f) {
+            if ($excess-- <= 0) {
+                break;
+            }
+            @unlink($f);
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
+// Audit
+// --------------------------------------------------------------------------
+
+function vigil_audit(string $stateDir, string $result, string $note = ''): void
+{
+    $dir = rtrim($stateDir, '/') . '/logs';
+    $log = $dir . '/auth.log';
+    if (is_file($log) && (int)@filesize($log) > 2 * 1024 * 1024) {
+        @rename($log, $log . '.1');
+    }
+    $line = sprintf("%s\t%s\t%s\t%s\t%s\n",
+        date('c'), $result, vigil_client_ip(),
+        str_replace(["\t", "\n"], ' ', (string)($_SERVER['HTTP_USER_AGENT'] ?? '')),
+        str_replace(["\t", "\n"], ' ', $note));
+    @file_put_contents($log, $line, FILE_APPEND | LOCK_EX);
+    @chmod($log, 0600);
+}
+
+// --------------------------------------------------------------------------
+// HTTP helpers
+// --------------------------------------------------------------------------
+
+/** Reject anything that is not a same-site absolute path. */
+function vigil_safe_next(string $next, string $selfPrefix, string $fallback = '/'): string
+{
+    $next = trim($next);
+    if ($next === '' || $next[0] !== '/') {
+        return $fallback;
+    }
+    if (str_starts_with($next, '//') || str_starts_with($next, '/\\')) {
+        return $fallback;
+    }
+    if (preg_match('/[\r\n\\\\]/', $next)) {
+        return $fallback;
+    }
+    if (str_starts_with($next, rtrim($selfPrefix, '/'))) {
+        return $fallback;
+    }
+    return $next;
+}
+
+/**
+ * Security headers for every gate response.
+ *
+ * noindex matters more than it looks: an admin gate that search engines
+ * have indexed is a permanent, public invitation to attack it.
+ */
+function vigil_send_security_headers(string $scriptNonce = ''): void
+{
+    header('X-Robots-Tag: noindex, nofollow, noarchive, nosnippet');
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header('Referrer-Policy: no-referrer');
+    header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+    header('Cache-Control: no-store, no-cache, must-revalidate, private');
+    header('Pragma: no-cache');
+    // Strict by default. The slider needs a little JavaScript, and it is
+    // allowed only through a per-response nonce -- so an injected string
+    // still cannot execute, because it cannot know the nonce.
+    $script = $scriptNonce !== ''
+        ? "script-src 'nonce-" . $scriptNonce . "'"
+        : "script-src 'none'";
+    header("Content-Security-Policy: default-src 'none'; "
+         . "img-src 'self' data:; style-src 'unsafe-inline'; "
+         . $script . "; connect-src 'self'; "
+         . "form-action 'self'; base-uri 'none'; frame-ancestors 'none'");
+}
+
+/** A plausible-looking dummy hash, used to equalise timing on unknown users. */
+function vigil_dummy_verify(string $password): void
+{
+    // Cost-10 bcrypt of a random string. Comparing against it makes a
+    // "user does not exist" path take the same time as a wrong password,
+    // so response timing does not reveal which accounts are real.
+    @password_verify($password,
+        '$2y$10$usesomesillystringfore7hnbRJHxXVLeakoG8K30oukPsA.ztMG');
+}

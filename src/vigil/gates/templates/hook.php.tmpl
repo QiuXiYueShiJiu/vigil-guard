@@ -1,0 +1,72 @@
+<?php
+/**
+ * Post-login hook — GENERATED FILE.
+ *
+ * Runs after the gate has verified the visitor, while the browser is still
+ * waiting for the redirect. Its job is to obtain the *upstream*
+ * application's own session, because the gate is only a front door: the app
+ * behind it still expects to be authenticated in its own way.
+ *
+ * For this application that means exchanging a per-process launch token for
+ * a session cookie:
+ *
+ *   1. read the token from a file written at service start (it changes on
+ *      every restart, so it cannot be baked into this file);
+ *   2. call the loopback endpoint with the browser's own Host header — the
+ *      app validates the token against the authority it was issued for;
+ *   3. replay whatever Set-Cookie the app returns into our response.
+ *
+ * Failures are deliberately non-fatal: if the token is stale the visitor
+ * still reaches the gate-protected page and simply sees the app's own login
+ * prompt, which is far better than a 500.
+ *
+ * @return callable
+ */
+declare(strict_types=1);
+
+return static function (array $cfg): void {
+    $tokenFile = (string)($cfg['upstream_token_file'] ?? '');
+    if ($tokenFile === '' || !is_readable($tokenFile)) {
+        return;
+    }
+    $token = trim((string)@file_get_contents($tokenFile));
+    if ($token === '' || !preg_match('/^[A-Za-z0-9_\-]{16,128}$/', $token)) {
+        return;
+    }
+    if (!function_exists('curl_init')) {
+        return;
+    }
+
+    $target = (string)($cfg['upstream_mint_url'] ?? '');
+    if ($target === '') {
+        return;
+    }
+    $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+
+    $ch = curl_init($target . '?token=' . rawurlencode($token));
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER         => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_TIMEOUT        => 8,
+        CURLOPT_CONNECTTIMEOUT => 4,
+        CURLOPT_HTTPHEADER     => ['Host: ' . $host],
+    ]);
+    $response = curl_exec($ch);
+    $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+    curl_close($ch);
+
+    if (!is_string($response) || $response === '') {
+        return;
+    }
+    $rawHeaders = substr($response, 0, (int)$headerSize);
+    foreach (preg_split('/\r\n|\n/', $rawHeaders) ?: [] as $line) {
+        if (stripos($line, 'Set-Cookie:') === 0) {
+            // Re-emit verbatim, but strip any Domain attribute: the cookie
+            // must stay on the host the visitor actually used.
+            $cookie = trim(substr($line, strlen('Set-Cookie:')));
+            $cookie = preg_replace('/;\s*Domain=[^;]*/i', '', $cookie) ?? $cookie;
+            header('Set-Cookie: ' . $cookie, false);
+        }
+    }
+};

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "hostname": "",
+  "mail": {
+    "providers": [
+      {
+        "provider": "resend",
+        "api_key": "",
+        "from_address": ""
+      }
+    ],
+    "recipients": [
+      "ops@example.com"
+    ],
+    "login_recipients": [],
+    "from_address": "",
+    "from_name": "Server Monitor",
+    "reply_to": "",
+    "language": "zh"
+  },
+  "threat": {
+    "enabled": true,
+    "whitelist": [
+      "127.0.0.1/8",
+      "::1",
+      "203.0.113.10/32"
+    ],
+    "notify_bans": true,
+    "notify_ssh_success": true
+  },
+  "checks": {
+    "enabled": true,
+    "disk": {
+      "warn_pct": 80,
+      "crit_pct": 90,
+      "paths": [
+        "/"
+      ]
+    },
+    "services": [
+      "nginx",
+      "sshd"
+    ],
+    "ports": [
+      {
+        "port": 22,
+        "proto": "tcp"
+      }
+    ]
+  }
+}

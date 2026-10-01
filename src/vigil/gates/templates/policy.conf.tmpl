@@ -1,0 +1,42 @@
+# Vigil gate policy — GENERATED FILE.
+#
+# Reloaded on every request, so edits apply immediately without an nginx
+# reload. Only integer values are read; anything else is ignored, which
+# means a malformed line can never weaken a protection.
+#
+# Regenerate with: vigil gate reconfigure <kind>
+
+# ---- sessions ----------------------------------------------------------
+session_ttl=__SESSION_TTL__      # sliding idle timeout (seconds)
+abs_ttl=__ABS_TTL__              # absolute lifetime (seconds); re-login after
+bind_ua=__BIND_UA__              # 1 = ticket is bound to the browser's UA
+bind_ip=__BIND_IP__              # 1 = also bind to the client address
+max_sessions=__MAX_SESSIONS__    # cap on live tickets (oldest evicted)
+
+# ---- CAPTCHA -----------------------------------------------------------
+captcha_ttl=__CAPTCHA_TTL__          # how long a challenge stays valid
+captcha_length=__CAPTCHA_LENGTH__    # base number of characters (4-8)
+captcha_min_seconds=__CAPTCHA_MIN__  # fastest a human can plausibly answer
+captcha_max_tries=6                  # (informational; used by the policy clamp)
+captcha_per_minute=__CAPTCHA_PER_MIN__  # challenges issued per address/minute
+
+# ---- lockout -----------------------------------------------------------
+lock_max=__LOCK_MAX__            # challenge failures before a lockout
+lock_secs=__LOCK_SECS__          # ceiling for the lockout duration (seconds)
+lock_first_secs=__LOCK_FIRST__   # first lockout length (seconds)
+lock_backoff=__LOCK_BACKOFF__    # multiplier applied per repeat lockout
+cred_max=__CRED_MAX__            # wrong *passwords* before a credential lock
+cred_lock_secs=__CRED_LOCK__     # credential lock length (seconds)
+
+# ---- one-time navigation ticket (login gate only) ----------------------
+nav_ttl=__NAV_TTL__
+
+# 0 = a valid session is enough for a navigation too.
+# 1 = a navigation (page load or reload) is accepted ONLY with a one-time
+#     navigation ticket, so pressing F5 always asks for verification again.
+#     Background requests still use the session ticket, so a single-page app
+#     keeps working. Right for SPAs; wrong for a multi-page app, where every
+#     menu click is a navigation and would re-prompt.
+# 2 = only a *reload* is refused. F5 re-prompts; navigating to a different
+#     page does not. Right for classic multi-page applications.
+strict_nav=__STRICT_NAV__

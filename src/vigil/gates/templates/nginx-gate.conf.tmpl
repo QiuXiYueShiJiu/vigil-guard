@@ -1,0 +1,57 @@
+# Vigil access gate — nginx wiring (generated).
+#
+# This file is included at SERVER scope on purpose. A gate attached only to
+# `location /` leaves every other location open, which is a common and
+# silent way to ship a useless gate. Server scope means the whole vhost is
+# protected, and the two gate endpoints below are explicitly exempted inside
+# the Lua hook.
+#
+# Rate-limit zones used here live in the http{} block; they are created by
+# the same installer so this file can never reference an undefined zone
+# (which would make `nginx -t` fail and stop every future reload).
+
+# --- gate endpoints (exempt from the hook) -------------------------------
+location = __ENTRY_PATH__ {
+    limit_req  zone=__ZONE_REQ__ burst=20 nodelay;
+    limit_conn __ZONE_CONN__ 16;
+    limit_req_status 429;
+    limit_conn_status 429;
+    limit_except GET POST { deny all; }
+    root __WEBROOT__;
+    include __FASTCGI_CONF__;
+    fastcgi_param SCRIPT_FILENAME __WEBROOT__/verify.php;
+    fastcgi_param HTTP_HOST $host;
+    fastcgi_pass __FASTCGI_PASS__;
+}
+
+location = __CAPTCHA_PATH__ {
+    limit_req  zone=__ZONE_CAP__ burst=40 nodelay;
+    limit_conn __ZONE_CONN__ 24;
+    limit_req_status 429;
+    limit_except GET { deny all; }
+    root __WEBROOT__;
+    include __FASTCGI_CONF__;
+    fastcgi_param SCRIPT_FILENAME __WEBROOT__/captcha.php;
+    fastcgi_param HTTP_HOST $host;
+    fastcgi_pass __FASTCGI_PASS__;
+}
+
+location = __LOGOUT_PATH__ {
+    limit_conn __ZONE_CONN__ 8;
+    limit_except GET POST { deny all; }
+    root __WEBROOT__;
+    include __FASTCGI_CONF__;
+    fastcgi_param SCRIPT_FILENAME __WEBROOT__/logout.php;
+    fastcgi_param HTTP_HOST $host;
+    fastcgi_pass __FASTCGI_PASS__;
+}
+
+# Anything else under the gate prefix is a 404. Handled in the rewrite phase
+# so it never reaches PHP.
+location ^~ __PREFIX__ { return 404; }
+
+# --- the gate itself -----------------------------------------------------
+access_by_lua_file __LUA_FILE__;
+
+# ACME must never be gated or certificates stop renewing.
+location ^~ /.well-known/ { allow all; try_files $uri =404; }

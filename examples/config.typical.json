@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "hostname": "web-01",
+  "mail": {
+    "providers": [
+      {
+        "provider": "resend",
+        "api_key": "",
+        "secret": true,
+        "from_address": "alerts@mail.example.com",
+        "from_name": "Server Monitor"
+      },
+      {
+        "provider": "smtp",
+        "preset": "qq",
+        "host": "smtp.qq.com",
+        "port": 465,
+        "tls": "ssl",
+        "username": "you@example.com",
+        "password": "",
+        "from_address": "you@example.com"
+      }
+    ],
+    "recipients": [
+      "ops@example.com",
+      "oncall@example.com"
+    ],
+    "login_recipients": [
+      "ops@example.com"
+    ],
+    "from_address": "",
+    "from_name": "Server Monitor",
+    "reply_to": "",
+    "language": "zh"
+  },
+  "threat": {
+    "enabled": true,
+    "whitelist": [
+      "127.0.0.1/8",
+      "::1",
+      "203.0.113.10/32"
+    ],
+    "notify_bans": true,
+    "notify_ssh_success": true,
+    "ssh": {
+      "enabled": true,
+      "max_failures": 5,
+      "window_seconds": 300,
+      "ban_seconds": [
+        600,
+        3600,
+        21600,
+        86400
+      ]
+    },
+    "http": {
+      "enabled": true,
+      "max_attacks": 10,
+      "window_seconds": 300,
+      "ban_seconds": [
+        600,
+        3600,
+        21600,
+        86400
+      ]
+    },
+    "recidivist_bans": 3
+  },
+  "checks": {
+    "enabled": true,
+    "disk": {
+      "warn_pct": 80,
+      "crit_pct": 90,
+      "paths": [
+        "/"
+      ]
+    },
+    "services": [
+      "nginx",
+      "sshd"
+    ],
+    "ports": [
+      {
+        "port": 22,
+        "proto": "tcp"
+      }
+    ],
+    "web_roots": [
+      "/www/wwwroot"
+    ],
+    "backup": {
+      "warn_hours": 36,
+      "crit_hours": 72,
+      "globs": [
+        "/root/backup/*.tar.gz"
+      ]
+    },
+    "certificates": {
+      "warn_days": 21,
+      "crit_days": 7,
+      "dirs": [
+        "/www/server/panel/vhost/cert"
+      ]
+    }
+  },
+  "gate": {
+    "bt_panel": {
+      "enabled": true,
+      "state_dir": "/www/server/bt-gate",
+      "webroot": "/www/wwwroot/bt-gate",
+      "entry_path": "/__btgate",
+      "cookie": "btgate",
+      "nav_cookie": "btnav",
+      "scene_kind": "auto",
+      "image_dirs": [
+        "/var/lib/vigil-pictures"
+      ]
+    },
+    "dsh_gate": {
+      "enabled": true,
+      "state_dir": "/www/server/dsh-gate",
+      "webroot": "/www/wwwroot/dsh-gate",
+      "entry_path": "/__gate/login",
+      "cookie": "dshgate",
+      "nav_cookie": "dshnav",
+      "strict_nav": 1,
+      "scene_kind": "auto",
+      "image_dirs": [
+        "/var/lib/vigil-pictures"
+      ]
+    },
+    "login_alerts": true
+  },
+  "auditd": {
+    "enabled": true,
+    "key": "vigil_watch",
+    "immutable": true
+  },
+  "loadshed": {
+    "enabled": true,
+    "protect_load": 6.0,
+    "protect_conn": 800
+  }
+}

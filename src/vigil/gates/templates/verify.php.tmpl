@@ -1,0 +1,1357 @@
+<?php
+/**
+ * Vigil gate — human verification page (and optionally sign-in).
+ *
+ * One template serves both gate types: `bt_panel` renders the challenge
+ * alone, `login` adds a username and password.
+ *
+ * The challenge is a **jigsaw slider fused with a passcode**.
+ *
+ * OCR alone loses to the slider, and image analysis alone loses to the
+ * passcode -- the two ask for different kinds of work, and both answers are
+ * checked on the server against a single one-time challenge. A text-only
+ * challenge remains available as the no-JavaScript fallback.
+ *
+ * Anti-automation layers, all verified server-side:
+ *   · neither the offset nor the passcode is ever sent to the browser;
+ *   · the failure message does not say which of the two was wrong, so the
+ *     two cannot be searched independently;
+ *   · the puzzle is cut from a randomly generated background, so there is
+ *     nothing to pre-compute;
+ *   · the drag trajectory must be sampled, variable-speed and forward-only,
+ *     which rejects "set the value and submit" scripts even when they guess
+ *     the offset correctly;
+ *   · a hidden honeypot field catches form scrapers;
+ *   · a minimum solve time is enforced against the challenge's own
+ *     creation timestamp, so it cannot be bypassed by editing the form;
+ *   · the challenge is consumed before comparison, so replay is impossible;
+ *   · tolerance tightens as failures accumulate.
+ */
+declare(strict_types=1);
+
+$cfg = require '__CONFIG_PATH__';
+$policy = vigil_policy($cfg['policy']);
+
+$stateDir  = rtrim($cfg['state_dir'], '/');
+$entryPath = (string)$cfg['entry_path'];
+$needPass  = !empty($cfg['require_password']);
+$lang      = (string)($cfg['lang'] ?? 'zh');
+vigil_state_dirs($stateDir);
+
+$t = static function (string $zh, string $en) use ($lang): string {
+    return $lang === 'en' ? $en : $zh;
+};
+
+$next = vigil_safe_next((string)($_REQUEST['next'] ?? '/'), rtrim($entryPath, '/'));
+$error = '';
+$status = 200;
+$useSlider = (($_REQUEST['fallback'] ?? '') !== 'text');
+
+// ---------------------------------------------------------------- submit
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $honeypot = trim((string)($_POST['website'] ?? ''));
+    $lockedFor = vigil_locked_for($stateDir);
+
+    if ($lockedFor > 0) {
+        vigil_audit($stateDir, 'LOCKED', 'remaining=' . $lockedFor);
+        $error = sprintf($t('尝试次数过多，请在 %d 分钟后重试。',
+                            'Too many attempts. Try again in %d minutes.'),
+                         (int)ceil($lockedFor / 60));
+        $status = 429;
+    } else {
+        $mode = (string)($_POST['mode'] ?? 'slider');
+        if ($mode === 'slider') {
+            $check = vigil_check_slider(
+                $stateDir, $policy,
+                (string)($_POST['cid'] ?? ''),
+                (string)($_POST['drops'] ?? ''),
+                $honeypot !== '',
+                (string)($_POST['q_answer'] ?? ''));
+        } else {
+            $useSlider = false;
+            $check = vigil_check_captcha(
+                $stateDir, $policy,
+                (string)($_POST['cid'] ?? ''),
+                (string)($_POST['cap'] ?? ''),
+                $honeypot !== '');
+        }
+
+        $ok = (bool)$check['ok'];
+        $reason = (string)$check['reason'];
+
+        if ($ok && $needPass) {
+            $user = (string)($_POST['u'] ?? '');
+            $pass = (string)($_POST['p'] ?? '');
+            $userOk = hash_equals((string)$cfg['user'], $user);
+            if ($userOk) {
+                $passOk = password_verify($pass, (string)$cfg['pass_hash']);
+            } else {
+                // Burn equivalent time so the response cannot reveal
+                // whether the account exists.
+                vigil_dummy_verify($pass);
+                $passOk = false;
+            }
+            if (!$userOk || !$passOk) {
+                $ok = false;
+                $reason = 'BAD_CRED';
+                usleep(500000);
+            }
+        }
+
+        if ($ok) {
+            vigil_fail_clear($stateDir);
+            vigil_prune($stateDir, $policy);
+            $bindUa = ((int)$policy['bind_ua']) >= 1
+                ? (string)($_SERVER['HTTP_USER_AGENT'] ?? '') : '';
+            $bindIp = ((int)$policy['bind_ip']) >= 1 ? vigil_client_ip() : '';
+            $tok = vigil_issue_ticket($stateDir, (int)$policy['session_ttl'],
+                                      $bindUa, $bindIp);
+            setcookie((string)$cfg['cookie'], $tok,
+                      vigil_cookie_options((int)($cfg['cookie_lifetime'] ?? 0)));
+            if (!empty($cfg['nav_cookie'])) {
+                $nav = vigil_issue_ticket($stateDir, (int)$policy['nav_ttl'],
+                                          $bindUa, $bindIp);
+                setcookie((string)$cfg['nav_cookie'], $nav,
+                          vigil_cookie_options(0));
+            }
+            if (is_callable($cfg['on_success'] ?? null)) {
+                ($cfg['on_success'])($cfg);
+            }
+            vigil_audit($stateDir, 'OK', 'mode=' . $mode . ' next=' . $next);
+            header('Cache-Control: no-store');
+            header('Location: ' . $next, true, 302);
+            exit;
+        }
+
+        // The two failure kinds are counted separately: see vigil_fail_bump.
+        vigil_fail_bump($stateDir, $policy,
+                        $reason === 'BAD_CRED' ? 'BAD_CRED' : 'CHALLENGE');
+        vigil_audit($stateDir, 'FAIL', 'mode=' . $mode . ' reason=' . $reason);
+        $remaining = vigil_locked_for($stateDir);
+        if ($remaining > 0) {
+            $error = sprintf($t('尝试次数过多，请在 %d 分钟后重试。',
+                                'Too many attempts. Try again in %d minutes.'),
+                             (int)ceil($remaining / 60));
+            $status = 429;
+        } else {
+            // Deliberately does not say *which* factor failed. Telling a
+            // script "the position was right, the code was wrong" hands it a
+            // free oracle to search the two independently; a person only
+            // needs to know both must be right.
+            // No count in this message on purpose: on the submit path the
+            // challenge has already been consumed, so the real number is not
+            // available here -- and a number that can disagree with the page
+            // is worse than no number. "每一块" is always true.
+            // Mode-specific, because telling somebody who mistyped a text
+            // code to "check that the two pieces are in their gaps" is an
+            // error message about a screen they are not looking at.
+            //
+            // It still does not say *which* factor failed within a mode:
+            // inside the puzzle, "position" and "question" stay merged so they
+            // cannot be searched independently.
+            if ($mode === 'slider') {
+                $error = $t('验证未通过：请确认拖出的两块拼片都对准了缺口（另有一块需留在原处），且问题回答正确。',
+                            'Not verified: check the two moved pieces are in their gaps (exactly one must be left alone) and that the question is answered.');
+            } else {
+                $error = $t('验证码不正确，请重新输入图中的字符。',
+                            'That code was not correct. Please type the characters in the picture again.');
+            }
+            $status = 401;
+        }
+    }
+    if ($status !== 200) {
+        http_response_code($status);
+    }
+}
+
+// ---------------------------------------------------------------- render
+vigil_prune($stateDir, $policy);
+
+$nonce = base64_encode(random_bytes(16));
+vigil_send_security_headers($useSlider ? $nonce : '');
+
+if (!vigil_can_issue($stateDir, $policy)) {
+    http_response_code(429);
+    $wait = $t('请求过于频繁，请稍后再试。', 'Too many requests, please slow down.');
+    echo '<!DOCTYPE html><html lang="' . htmlspecialchars($lang, ENT_QUOTES)
+       . '"><meta charset="utf-8"><body style="font:15px/1.6 system-ui,sans-serif;padding:2rem">'
+       . '<p>' . htmlspecialchars($wait, ENT_QUOTES) . '</p></body></html>';
+    exit;
+}
+
+$slider = null;
+$chal = null;
+if ($useSlider) {
+    $slider = vigil_new_slider($stateDir, $policy, $cfg);
+    if (empty($slider['ok'])) {
+        // GD missing or the puzzle could not be built: fall back rather
+        // than show a person a broken page.
+        $useSlider = false;
+        $chal = vigil_new_captcha($stateDir, $policy);
+    }
+} else {
+    $chal = vigil_new_captcha($stateDir, $policy);
+}
+
+$e = static fn(string $s): string => htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
+$bgW = $useSlider ? (int)$slider['width'] : 220;
+?>
+<!DOCTYPE html>
+<html lang="<?= $e($lang) ?>">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">
+<title><?= $e((string)$cfg['title']) ?></title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ink:#1b2233; --sub:#6b7688; --line:#e3e8f0;
+    --card:#ffffff; --field:#ffffff; --ring:rgba(96,150,255,.28);
+    --brand1:#4f9dff; --brand2:#7d6bff; --accent:#ffb648;
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body {
+    margin:0; min-height:100vh; display:flex; align-items:center;
+    justify-content:center; color:var(--ink); position:relative;
+    background:
+      radial-gradient(1100px 520px at 12% -10%, #dceaff 0%, transparent 62%),
+      radial-gradient(900px 480px at 108% 6%, #ffe9d6 0%, transparent 58%),
+      linear-gradient(178deg, #f2f7ff 0%, #e8f0fb 46%, #eef3fa 100%);
+    font:15px/1.62 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",
+         "Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  .box {
+    width:100%; max-width:412px; margin:22px; padding:26px 26px 22px;
+    background:var(--card); border:1px solid rgba(255,255,255,.7);
+    border-radius:18px;
+    box-shadow:0 1px 2px rgba(20,32,58,.05), 0 10px 26px rgba(20,32,58,.09),
+               0 28px 64px -22px rgba(20,32,58,.22);
+    backdrop-filter:saturate(140%) blur(6px);
+  }
+  .brand { display:flex; align-items:center; gap:10px; margin-bottom:5px; }
+  .dot { width:11px; height:11px; border-radius:50%; flex:0 0 auto;
+         background:linear-gradient(140deg,var(--brand1),var(--brand2));
+         box-shadow:0 0 0 4px rgba(96,150,255,.15); }
+  h1 { margin:0; font-size:18.5px; font-weight:680; letter-spacing:.1px; }
+  p.sub { margin:2px 0 18px; color:var(--sub); font-size:13px; }
+  label { display:block; font-size:12.5px; color:#4c586b; margin:14px 0 6px;
+          font-weight:560; letter-spacing:.2px; }
+  input[type=text], input[type=password] {
+    width:100%; padding:11px 13px; font-size:15px; color:inherit;
+    border:1px solid var(--line); border-radius:11px; background:var(--field);
+    transition:border-color .16s, box-shadow .16s; }
+  input:focus { outline:none; border-color:#8fb8ff; box-shadow:0 0 0 3.5px var(--ring); }
+  .puzzle { position:relative; width:100%; user-select:none; overflow:hidden;
+            border-radius:13px; background:#101728; touch-action:none;
+            box-shadow:inset 0 0 0 1px rgba(255,255,255,.10),
+                       0 6px 18px -8px rgba(16,23,40,.55); }
+  .puzzle canvas { display:block; width:100%; height:auto;
+                   touch-action:none; cursor:crosshair; }
+  .opts { display:flex; gap:8px; flex-wrap:wrap; margin-top:2px; }
+  .opt { flex:1 1 auto; min-width:88px; display:flex; align-items:center;
+         gap:7px; margin:0; padding:10px 12px; cursor:pointer;
+         border:1px solid var(--line); border-radius:11px;
+         background:var(--field); font-size:14px; font-weight:560;
+         transition:border-color .16s, box-shadow .16s, background .16s; }
+  .opt:hover { border-color:#a9c4ee; }
+  .opt input { accent-color:#5b8def; width:15px; height:15px; margin:0; }
+  .opt:has(input:checked) { border-color:#7ba7f0; box-shadow:0 0 0 3px var(--ring);
+                            background:rgba(120,170,255,.10); }
+  .hint2 { display:flex; justify-content:space-between; align-items:center;
+           gap:8px; margin-top:9px; font-size:11.5px; color:#9aa4b4; }
+  .hint2 a { color:#7c8798; text-decoration:none; border-bottom:1px dashed #c7d0dc;
+             padding-bottom:1px; }
+  .hint2 a:hover { color:#4f6b93; }
+  .track { position:relative; margin-top:13px; height:46px; border-radius:12px;
+           background:linear-gradient(180deg,#f4f7fb,#eaf0f8);
+           border:1px solid #e2e8f1; overflow:hidden;
+           box-shadow:inset 0 1px 2px rgba(20,32,58,.05); }
+  .track .fill { position:absolute; inset:0 auto 0 0; width:46px;
+                 background:linear-gradient(90deg,rgba(79,157,255,.10),
+                                            rgba(125,107,255,.30));
+                 transition:none; }
+  .track .handle { position:absolute; top:0; left:0; width:46px; height:44px;
+                   display:flex; align-items:center; justify-content:center;
+                   background:linear-gradient(180deg,#ffffff,#f3f6fb);
+                   border:1px solid #cdd7e5; border-radius:11px;
+                   cursor:grab; font-size:16px; color:#5a6c85;
+                   box-shadow:0 2px 6px rgba(20,32,58,.14);
+                   transition:box-shadow .16s, transform .06s; }
+  .track .handle:active { cursor:grabbing; transform:translateY(1px);
+                          box-shadow:0 1px 3px rgba(20,32,58,.18); }
+  .track .label { position:absolute; inset:0; display:flex; align-items:center;
+                  justify-content:center; font-size:12.5px; color:#9aa6b8;
+                  pointer-events:none; letter-spacing:.3px; }
+  button { width:100%; margin-top:19px; padding:12.5px; font-size:15px;
+           font-weight:640; color:#fff; border:none; border-radius:11px;
+           cursor:pointer; letter-spacing:.3px;
+           background:linear-gradient(135deg,var(--brand1),var(--brand2));
+           box-shadow:0 6px 16px -6px rgba(79,120,255,.62);
+           transition:filter .16s, transform .06s; }
+  button:hover { filter:brightness(1.06); }
+  button:active { transform:translateY(1px); }
+  button[disabled] { background:#cdd6e2; box-shadow:none; cursor:not-allowed;
+                     filter:none; }
+  .err { margin-top:15px; padding:11px 13px; background:#fff1f1;
+         border-left:3px solid #e2555f; border-radius:9px; color:#9c2630;
+         font-size:13px; }
+  .honey { position:absolute; left:-9999px; top:-9999px; width:1px; height:1px;
+           opacity:0; pointer-events:none; }
+  .tip { margin-top:15px; font-size:11.5px; color:#a2abba; text-align:center; }
+  .row { display:flex; gap:10px; align-items:stretch; }
+  .row input { flex:1; min-width:0; letter-spacing:2px; font-weight:620;
+               text-transform:uppercase; }
+  .cap { flex:0 0 auto; }
+  .cap img { display:block; border-radius:11px; border:1px solid var(--line);
+             background:#f8fafc; }
+  .cap a { position:absolute; inset:0; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#e7edf6; --sub:#94a0b3; --line:#2b3547; --card:#151b28;
+            --field:#0f1520; --ring:rgba(96,150,255,.24); }
+    body { background:
+      radial-gradient(1100px 520px at 12% -10%, #16233d 0%, transparent 62%),
+      radial-gradient(900px 480px at 108% 6%, #2a2135 0%, transparent 58%),
+      linear-gradient(178deg,#0b101b 0%,#0d1420 100%); }
+    .box { border-color:rgba(255,255,255,.06); }
+    h1 { color:#eef3fb; }
+    .track { background:linear-gradient(180deg,#141b28,#111825);
+             border-color:#26303f; }
+    .track .handle { background:linear-gradient(180deg,#232c3c,#1a2231);
+                     border-color:#333f52; color:#a9b6c9; }
+    .err { background:#2c1418; color:#ff9ea6; }
+    .cap img { background:#0f1520; border-color:#2b3547; }
+  }
+</style>
+</head>
+<body>
+<form class="box" method="post" action="<?= $e($entryPath) ?>" autocomplete="off" id="f">
+  <input type="hidden" name="cid" value="<?= $e($useSlider ? $slider['id'] : $chal['id']) ?>">
+  <input type="hidden" name="next" value="<?= $e($next) ?>">
+  <input type="hidden" name="mode" value="<?= $useSlider ? 'slider' : 'text' ?>" id="mode">
+  <input type="hidden" name="drops" value="" id="drops">
+  <input type="hidden" name="q_answer_hidden" value="" id="qa">
+
+  <!-- Off-screen and aria-hidden: invisible to a person and to a screen
+       reader, but a form-scraping bot fills it in. -->
+  <div class="honey" aria-hidden="true">
+    <label for="website">Website</label>
+    <input id="website" type="text" name="website" tabindex="-1"
+           autocomplete="off" value="">
+  </div>
+
+  <div class="brand"><span class="dot"></span><h1><?= $e((string)$cfg['title']) ?></h1></div>
+  <p class="sub"><?= $e((string)$cfg['subtitle']) ?></p>
+
+  <?php if ($needPass): ?>
+    <label for="u"><?= $e($t('账号', 'Account')) ?></label>
+    <input id="u" type="text" name="u" required autocapitalize="off"
+           autocorrect="off" spellcheck="false" autocomplete="username">
+    <label for="p"><?= $e($t('密码', 'Password')) ?></label>
+    <input id="p" type="password" name="p" required autocomplete="current-password">
+  <?php endif; ?>
+
+  <?php if ($useSlider): ?>
+    <?php
+    // Counted here, before anything uses the count. This was first written
+    // after the label, so the sentence rendered as "拖动  块拼片" -- an empty
+    // number rather than a wrong one, and only visible by looking at the
+    // page. `$pieceList` below is built from the same array.
+    $nPieces = count($slider['pieces'] ?? []);
+    $zhCount = [2 => '两', 3 => '三', 4 => '四', 5 => '五',
+                6 => '六', 7 => '七', 8 => '八', 9 => '九'][$nPieces]
+               ?? (string)$nPieces;
+    // How many have to be placed. The puzzle *draws* $nPieces and asks for
+    // this many, which is the point: a solver that fills every piece it can
+    // find has not read the instruction.
+    $needPieces = min(2, $nPieces);
+    $zhNeed = [2 => '两', 3 => '三', 4 => '四', 5 => '五'][$needPieces]
+              ?? (string)$needPieces;
+    ?>
+    <label><?= $e($t(
+        sprintf('图中共 %s 块拼片，只需完成其中任意 %s 块：把这 %s 块拖到'
+                . '各自缺口，其余留在原处，并回答下面的问题',
+                $zhCount, $zhNeed, $zhNeed),
+        sprintf('There are %d pieces; any %d of them will do. Drag those %d '
+                . 'into their gaps, leave the rest where they are, and answer '
+                . 'the question below.', $nPieces, $needPieces, $needPieces))) ?></label>
+    <?php
+    // Where a picture comes from.
+    //
+    // By default it is carried inside this page as a `data:` URI. A picture
+    // that has to be fetched is a picture that can fail to be fetched, and
+    // when it did fail the server saw nothing at all: no request, no log
+    // line, no way to tell a broken page from a slow one. Inlined, either the
+    // picture is in the page or the page was not served.
+    //
+    // If the file cannot be read the URL is used instead, so this can never be
+    // the reason a challenge is unsolvable.
+    $inlinePics = !empty($cfg['inline_images']);
+    $srcOf = static function (string $part) use ($inlinePics, $cfg, $slider, $stateDir): string {
+        if ($inlinePics) {
+            $uri = vigil_slider_data_uri($stateDir, (string)$slider['id'], $part);
+            if ($uri !== '') {
+                return $uri;
+            }
+        }
+        return (string)$cfg['captcha'] . '?cid=' . $slider['id'] . '&part=' . $part;
+    };
+
+    // Each piece is described by where it belongs (y) and where to fetch it.
+    // The x it must reach is deliberately absent: that is the answer.
+    // The heading's number comes from `$nPieces`, which is this same array:
+    // a number written into a translated string is a second source of truth
+    // about the puzzle and drifts exactly like the endpoint's piece list did.
+    $pieceList = [];
+    foreach (($slider['pieces'] ?? []) as $slotNo => $pinfo) {
+        $pieceList[] = [
+            'y' => (int)$pinfo['y'] - (int)$slider['radius'],
+            'u' => $srcOf('slider-piece' . ($slotNo + 1)),
+        ];
+    }
+    $bgSrc = $srcOf('slider-bg');
+    $objSrc = $srcOf('slider-objects');
+    ?>
+    <div class="puzzle" id="puzzle"
+         data-w="<?= (int)$slider['width'] ?>"
+         data-h="<?= (int)$slider['height'] ?>"
+         data-pw="<?= (int)($slider['piece'] + $slider['radius']) ?>"
+         data-ph="<?= (int)($slider['piece'] + $slider['radius'] * 2) ?>"
+         data-max="<?= (int)($slider['width'] - $slider['piece'] - $slider['radius']) ?>"
+         data-bg="<?= $e($bgSrc) ?>"
+         data-glow="<?= $e(implode(',', $slider['glow'] ?? [120, 200, 255])) ?>"
+         data-pieces="<?= $e(json_encode($pieceList, JSON_UNESCAPED_SLASHES)) ?>"
+         data-objects="<?= $e($objSrc) ?>"
+         data-kind="<?= $e((string)($slider['kind'] ?? 'art')) ?>"
+         data-ink="<?= $e(implode(',', $slider['ink'] ?? [255, 255, 255])) ?>"
+         data-sun="<?= $e($slider['sun'] ? implode(',', $slider['sun']) : '') ?>"
+         data-water="<?= (int)($slider['waterline'] ?? 0) ?>"
+         data-fallback="<?= $e($entryPath) ?>?fallback=text&amp;next=<?= $e(rawurlencode($next)) ?>"
+         data-need="<?= (int)$needPieces ?>">
+      <canvas id="cv" class="cv"></canvas>
+    </div>
+    <!-- Shown only if the script below dies before it draws anything. It
+         starts hidden so a working page never shows it; if JavaScript is
+         switched off entirely the <noscript> block at the foot of the page
+         says the same thing. An empty box with no message is the one outcome
+         nobody can act on. -->
+    <div class="err" id="jsfail" role="alert" style="display:none">
+      <?= $e($t('验证画面未能加载，正在切换到文字验证码。',
+                'The puzzle could not start. Switching to the text challenge.')) ?>
+      <a href="<?= $e($entryPath) ?>?fallback=text&amp;next=<?= $e(rawurlencode($next)) ?>"
+         style="margin-left:6px;white-space:nowrap">
+        <?= $e($t('改用文字验证码', 'Use the text challenge')) ?>
+      </a>
+      <span id="jsfail-why"
+            style="display:block;margin-top:5px;color:#b4727a;font-size:11.5px;
+                   word-break:break-all"></span>
+    </div>
+    <div class="trayhint" id="trayhint">
+      <?= $e($t(
+        sprintf('拖动 %s 块拼片到缺口处（位置和轨迹都会被校验）；'
+                . '多拖的那块请拖回原处', $zhNeed),
+        sprintf('Drag %d pieces to their gaps (position and path are both '
+                . 'checked); put any extra piece back', $needPieces))) ?>
+    </div>
+    <label><?= $e((string)($slider['q_text'] ?? '')) ?></label>
+    <div class="opts" role="radiogroup"
+         aria-label="<?= $e((string)($slider['q_text'] ?? '')) ?>">
+      <?php foreach (($slider['q_opts'] ?? []) as $oi => $opt): ?>
+        <label class="opt">
+          <input type="radio" name="q_answer" value="<?= (int)$oi ?>" required>
+          <span><?= $e((string)$opt) ?></span>
+        </label>
+      <?php endforeach; ?>
+    </div>
+    <div class="hint2">
+      <span id="distance" style="font-weight:600"></span>
+      <span style="color:#94a3b8"><?= $e($t(
+        sprintf('%s 块对准缺口，并回答上面的问题即可', $zhNeed),
+        sprintf('%d pieces in their gaps, plus the question, is enough',
+                $needPieces))) ?></span>
+      <a href="<?= $e($entryPath) ?>?next=<?= $e(rawurlencode($next)) ?>"><?= $e($t('换一张', 'New puzzle')) ?></a>
+      <!-- No script needed: if the picture never appears, this still works. -->
+      <a href="<?= $e($entryPath) ?>?fallback=text&amp;next=<?= $e(rawurlencode($next)) ?>"
+         style="color:#8a94a6"><?= $e($t('文字验证码', 'text challenge')) ?></a>
+    </div>
+  <?php else: ?>
+    <label for="cap"><?= $e($t('验证码', 'Verification code')) ?></label>
+    <div class="row">
+      <input id="cap" type="text" name="cap" required
+             maxlength="<?= (int)$policy['captcha_length'] + 3 ?>"
+             autocapitalize="characters" autocorrect="off" spellcheck="false"
+             autocomplete="off" inputmode="latin" placeholder="······">
+      <?php
+      // Drawn here and carried in the page. The text challenge is the escape
+      // hatch, so it must not depend on a second request succeeding: if the
+      // picture has to be fetched, the fallback can fail in exactly the way
+      // it exists to survive.
+      $capSrc = (string)$cfg['captcha'] . '?cid=' . $chal['id'];
+      if (!empty($cfg['inline_images'])) {
+          $capPng = vigil_captcha_png((string)$chal['code'], (int)($chal['weight'] ?? 0));
+          if ($capPng !== '') {
+              $capSrc = 'data:image/png;base64,' . base64_encode($capPng);
+          }
+      }
+      ?>
+      <div class="cap" style="position:relative">
+        <img src="<?= $e($capSrc) ?>"
+             width="<?= 40 + (int)$chal['length'] * 30 ?>" height="74" alt="">
+        <a href="<?= $e($entryPath) ?>?next=<?= $e(rawurlencode($next)) ?>"></a>
+      </div>
+    </div>
+  <?php endif; ?>
+
+  <?php if ($error !== ''): ?>
+    <div class="err" role="alert"><?= $e($error) ?></div>
+  <?php endif; ?>
+
+  <button type="submit" id="go"><?= $e($t('进入', 'Continue')) ?></button>
+  <div class="tip"><?= $e($t('本页面用于确认访问者为真人，请勿分享链接。',
+                              'This step confirms you are a person. Do not share the link.')) ?></div>
+</form>
+
+<?php if ($useSlider): ?>
+<script nonce="<?= $e($nonce) ?>">
+/* Slider puzzle.
+ *
+ * The picture is shown whole and still. The piece is dragged into the marked
+ * gap, and the characters printed across the top of the picture are typed
+ * into the field below. Both are checked by the server; neither answer is
+ * present on this page.
+ *
+ * The picture used to be scrambled into drifting bands that knitted back
+ * together as the piece approached the gap. That settle was the guidance --
+ * and it required the page to know where the gap was, which meant serving an
+ * unmarked copy of the background so the two could be differenced. Two PNGs
+ * differing only by the gap marker hand the answer to anyone who subtracts
+ * them. Any "you are close" feedback is also a hint a bot can read, so the
+ * animation went and the alignment became exact instead.
+ *
+ * Two kinds of picture, animated differently on purpose:
+ *
+ *   art   -- generated Q-style landscape. It is a place, so it gets weather:
+ *            drifting cloud shadow, turning sun rays, a flock, butterflies,
+ *            swaying grass, motes. Everything here is drawn, so nothing
+ *            clashes.
+ *   image -- a photograph or an illustration from the host's own pool. It
+ *            gets a *focus pull* instead: blurred and desaturated while the
+ *            picture is broken, sharpening to full colour as it comes
+ *            together. Cartoon birds over someone's artwork would be
+ *            vandalism, and the focus pull reads as the same promise --
+ *            chaos resolving into clarity -- without touching the art.
+ *
+ * Everything animates through requestAnimationFrame towards a target rather
+ * than being set directly, so no input can produce a jump. Plain DOM APIs,
+ * no dependencies, nonce'd for the strict CSP.
+ */
+(function () {
+  "use strict";
+  var host  = document.getElementById("puzzle");
+  var cv    = document.getElementById("cv");
+  var hint  = document.getElementById("distance");
+  var form  = document.getElementById("f");
+  var go    = document.getElementById("go");
+  // One slider per piece. Each drives its own slot, so the two drags cannot
+  // be confused with each other and each gets its own recorded track.
+  // One hidden field trio per piece: where it was dropped, and the path it
+  // took to get there. There is no slider any more -- the piece is dragged
+  // freely, so the path is two-dimensional and carries far more than a
+  // single number ever could.
+  var fDrops = document.getElementById("drops");
+  if (!host || !cv) { return; }
+  var fallbackUrl = host.dataset.fallback;
+
+  /* ---------------- if this ever breaks, say so ----------------
+   *
+   * The script once died on its first statement that mentioned a variable a
+   * refactor had deleted. The visitor got an empty box: no picture, no
+   * message, nothing in the access log, and no way to tell a broken page from
+   * a slow one. A failed challenge must be *legibly* failed.
+   *
+   * An uncaught error anywhere in this script -- including inside a drag
+   * handler, where a try/catch around the setup would never see it -- lands
+   * here. The message is shown truncated: it is a diagnostic, not a stack
+   * trace, and on an inline script it can only name our own variables.
+   */
+  var fail = document.getElementById("jsfail");
+  var failWhy = document.getElementById("jsfail-why");
+  var escaped = false;
+  function showFail(why) {
+    if (!fail) { return; }
+    if (failWhy && why) { failWhy.textContent = String(why).slice(0, 140); }
+    fail.style.display = "block";
+  }
+  /* If the puzzle cannot be drawn, the visitor must still be able to get in.
+   *
+   * The message is shown first and the page then moves itself to the text
+   * challenge, which is drawn server-side into the page and needs no script
+   * at all. Being stuck behind a blank box is not an acceptable outcome for a
+   * login gate, and "we logged it for the operator" is no help to the person
+   * standing at the door. Three seconds is enough to read one line.
+   */
+  function escapeToText(why) {
+    showFail(why);
+    if (escaped) { return; }
+    escaped = true;
+    setTimeout(function () {
+      window.location.replace(fallbackUrl);
+    }, 3000);
+  }
+  window.addEventListener("error", function (ev) {
+    escapeToText(ev && ev.message ? ev.message : "");
+  }, false);
+
+  var W = parseInt(host.dataset.w, 10) || 340;
+  var H = parseInt(host.dataset.h, 10) || 200;
+  var PW = parseInt(host.dataset.pw, 10) || 55;
+  var PH = parseInt(host.dataset.ph, 10) || 64;
+  var MAX = parseInt(host.dataset.max, 10) || (W - PW);
+  var MAXY = Math.max(0, H - PH);
+  var glow = (host.dataset.glow || "120,200,255").split(",").map(Number);
+  var sunRaw = host.dataset.sun || "";
+  var sun = sunRaw ? sunRaw.split(",").map(Number) : null;
+  var ART = (host.dataset.kind || "art") !== "image";
+
+  /* ---------------- ask for the pictures first ----------------
+   *
+   * Every image is requested here, before a single canvas is created and
+   * before the animation loop exists. Decoding a photograph is the slowest
+   * thing this page does, and it must not be gated behind work that can
+   * throw: when it was, one bad statement above meant the browser never asked
+   * for anything at all and the page sat empty.
+   *
+   * `pieces` is a JSON list of {y, u} handed over by the server: the y each
+   * piece belongs at, and where to fetch it. It deliberately carries no x --
+   * that is the answer.
+   */
+  var pieces = [];
+  try { pieces = JSON.parse(host.dataset.pieces || "[]") || []; }
+  catch (e) { pieces = []; }
+  if (!pieces.length) { pieces = [{ y: 0, u: host.dataset.piece }]; }
+
+  var wanted = [host.dataset.bg || "", host.dataset.objects || ""], wi;
+  for (wi = 0; wi < pieces.length; wi++) { wanted.push(pieces[wi].u || ""); }
+  var pre = [];
+  for (wi = 0; wi < wanted.length; wi++) {
+    // No crossOrigin: the pictures are same-origin and the canvas is never
+    // read back, so asking for CORS would only add a new way to fail.
+    var pim = new Image();
+    pim.src = wanted[wi];
+    pre.push(pim);
+  }
+  var PRE_BG = 0, PRE_OBJ = 1, PRE_PIECE = 2;
+
+  cv.width = W; cv.height = H;
+  var ctx = cv.getContext("2d");
+  // Canvas filters are the cheap way to do the focus pull, but they are not
+  // universal; the puzzle must not depend on them to be solvable.
+  var canFilter = (typeof ctx.filter === "string");
+
+  var bgCanvas = document.createElement("canvas");
+  bgCanvas.width = W; bgCanvas.height = H;
+  var bgCtx = bgCanvas.getContext("2d", { willReadFrequently: true });
+  var tops = [];
+  var pieceCanvas = [], pieceCtx = [];
+  for (var pi = 0; pi < pieces.length; pi++) {
+    tops.push(parseInt(pieces[pi].y, 10) || 0);
+    var pc = document.createElement("canvas");
+    pc.width = PW; pc.height = PH;
+    pieceCanvas.push(pc);
+    pieceCtx.push(pc.getContext("2d", { willReadFrequently: true }));
+  }
+  // Bands are composed here first, so the warp and the focus pull are applied
+  // once to a finished frame instead of to each band separately.
+  var stage = document.createElement("canvas");
+  stage.width = W; stage.height = H;
+  var stageCtx = stage.getContext("2d");
+  // The question shapes, on their own layer. Drawn *after* the pieces so a
+  // piece dragged over one cannot hide it -- a hidden shape would make the
+  // count question unanswerable, which is a defect rather than difficulty.
+  var objCanvas = document.createElement("canvas");
+  objCanvas.width = W; objCanvas.height = H;
+  var objCtx = objCanvas.getContext("2d", { willReadFrequently: true });
+
+  // Matches vigil_slider_in_tray() on the server. Generous because "drag the
+  // extra piece back" is done with a thumb; safe because the generator keeps
+  // every gap at least 48px away from its tray position.
+  var TRAY_TOL = 10;
+  var curs = [], dragging = false, active = 0, grabDX = 0, grabDY = 0;
+  var trajs = [], t0 = 0;
+  var tray = [];
+  for (var ci = 0; ci < pieces.length; ci++) {
+    // Start in a tray along the bottom, spread out. They are *not* started
+    // at their gaps -- the piece has to be carried there, which is the whole
+    // point of watching the path.
+    var tx = Math.round((ci + 0.5) * (W / pieces.length) - PW / 2);
+    var ty = Math.max(0, MAXY - ci * 5);
+    curs.push({ x: Math.max(0, Math.min(MAX, tx)), y: ty });
+    trajs.push([]);
+    tray.push({ x: Math.max(0, Math.min(MAX, tx)), y: ty });
+  }
+  var shown = 0, target = 0;
+  var boost = 0;              // decays; nudged by interaction for feedback
+
+  function rnd(a, b) { return a + Math.random() * (b - a); }
+
+  /* ---------------- the little ecosystem ----------------
+   *
+   * Counts are deliberately modest. This runs on every frame, on whatever
+   * device is asking for the page -- including a phone on a train -- so the
+   * scene has to feel alive without becoming the reason the page stutters.
+   */
+  var birds = [], bugs = [], motes = [], petals = [], ripples = [];
+  var i;
+  for (i = 0; i < 7; i++) {
+    birds.push({ x: rnd(-30, W + 30), y: rnd(H * 0.05, H * 0.40),
+                 s: rnd(2.0, 3.4), v: rnd(9, 22), ph: rnd(0, 6.28),
+                 bob: rnd(3, 9) });
+  }
+  for (i = 0; i < 12; i++) {
+    bugs.push({ x: rnd(0, W), y: rnd(H * 0.55, H * 0.96), s: rnd(1.5, 2.7),
+                ph: rnd(0, 6.28), vx: rnd(-7, 7), vy: rnd(-3, 3),
+                hue: i % 3 });
+  }
+  for (i = 0; i < 34; i++) {
+    motes.push({ x: rnd(0, W), y: rnd(0, H), r: rnd(0.6, 1.7),
+                 ph: rnd(0, 6.28), vy: rnd(-5, -1.2) });
+  }
+  for (i = 0; i < 14; i++) {
+    petals.push({ x: rnd(0, W), y: rnd(-H, H), s: rnd(1.8, 3.6),
+                  vy: rnd(5, 14), ph: rnd(0, 6.28) });
+  }
+
+  /* How far along the track the piece is, 0..1.
+   *
+   * This used to be "how close to the gap", which meant the page had to know
+   * where the gap was -- and it worked that out by differencing the marked
+   * background against an unmarked copy. That made the answer computable in
+   * the browser: two PNGs differing only by the gap marker give the gap's
+   * position to anyone who subtracts them, and a bot could lift the offset
+   * straight out of the pixels.
+   *
+   * So the settle animation is now driven by the drag itself. It is
+   * decoration and deliberately carries no correctness signal: it settles
+   * wherever the piece happens to be, so reading it tells an attacker
+   * nothing about whether the answer is right. Lining the picture up is done
+   * by eye, against the gap that is visibly marked in the background. */
+  function progressFor(px) {
+    if (!(MAX > 0)) { return 0; }
+    var p = px / MAX;
+    if (p < 0) { p = 0; }
+    if (p > 1) { p = 1; }
+    return p;
+  }
+
+  // The picture is static, so there are no bands to compose: the frame is
+  // the background. `stage` and `present` are kept because the ambient
+  // effects composite through them, but the scramble machinery that used to
+  // live here is gone with the animation it existed for.
+  function compose(t, chaos) {
+    stageCtx.clearRect(0, 0, W, H);
+    stageCtx.drawImage(bgCanvas, 0, 0);
+  }
+
+  /* Present the composed frame.
+   *
+   * Art gets a travelling heat haze -- horizontal strips displaced
+   * vertically, amplitude tied to how broken the picture still is -- which
+   * is what makes the mid-drag state shimmer. An image gets the focus pull
+   * instead, because haze over a photograph reads as a rendering fault. */
+  function present(t, p, chaos) {
+    ctx.clearRect(0, 0, W, H);
+    if (ART) {
+      if (chaos > 0.006) {
+        var n = 22, hh = H / n;
+        for (var s = 0; s < n; s++) {
+          var sy = s * hh;
+          var dy = chaos * (3.4 * Math.sin(sy / 8.5 + t * 0.0022)
+                          + 1.5 * Math.sin(sy / 3.4 - t * 0.0034));
+          var src = Math.max(0, sy - 2);
+          ctx.drawImage(stage, 0, src, W, Math.min(H - src, hh + 4),
+                        0, sy + dy, W, hh + 4);
+        }
+      } else {
+        ctx.drawImage(stage, 0, 0);
+      }
+      return;
+    }
+    if (canFilter && chaos > 0.02) {
+      ctx.save();
+      ctx.filter = "blur(" + (chaos * 3.6).toFixed(2) + "px) saturate("
+                 + (0.62 + 0.38 * p).toFixed(3) + ")";
+      ctx.drawImage(stage, 0, 0);
+      ctx.restore();
+      ctx.filter = "none";
+    } else {
+      ctx.drawImage(stage, 0, 0);
+    }
+  }
+
+  /* ---------------- ambient life ---------------- */
+
+  function drawRays(t, a) {
+    if (!sun) { return; }
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.translate(sun[0], sun[1]);
+    ctx.rotate(t * 0.00006);
+    var n = 10;
+    for (var k = 0; k < n; k++) {
+      var ang = (k / n) * Math.PI * 2;
+      var len = H * (0.34 + 0.14 * Math.sin(t * 0.0009 + k));
+      ctx.beginPath();
+      ctx.moveTo(0, 0);
+      ctx.lineTo(Math.cos(ang - 0.045) * len, Math.sin(ang - 0.045) * len);
+      ctx.lineTo(Math.cos(ang + 0.045) * len, Math.sin(ang + 0.045) * len);
+      ctx.closePath();
+      ctx.fillStyle = "rgba(" + glow.join(",") + "," + (0.045 * a).toFixed(3) + ")";
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawCloudShadow(t, a) {
+    ctx.save();
+    for (var k = 0; k < 3; k++) {
+      var px = ((t * 0.0042 * (1 + k * 0.45) + k * 190) % (W + 220)) - 110;
+      var py = H * (0.30 + k * 0.16);
+      var rx = 96 + k * 30, ry = 26 + k * 8;
+      var g = ctx.createRadialGradient(px, py, 0, px, py, rx);
+      g.addColorStop(0, "rgba(24,32,58," + (0.085 * a).toFixed(3) + ")");
+      g.addColorStop(1, "rgba(24,32,58,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.ellipse(px, py, rx, ry, 0, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawBirds(t, a, dt) {
+    ctx.save();
+    ctx.strokeStyle = "rgba(28,34,58," + (0.5 * a).toFixed(3) + ")";
+    ctx.lineWidth = 1.4;
+    ctx.lineCap = "round";
+    for (var k = 0; k < birds.length; k++) {
+      var b = birds[k];
+      b.x += b.v * dt / 1000;
+      if (b.x > W + 30) { b.x = -30; b.y = rnd(H * 0.05, H * 0.40); }
+      var fl = Math.sin(t * 0.0075 + b.ph);
+      var by = b.y + Math.sin(t * 0.0012 + b.ph) * b.bob;
+      var sp = b.s * (0.55 + 0.45 * Math.abs(fl));
+      ctx.beginPath();
+      ctx.moveTo(b.x - sp, by + sp * 0.5 * fl);
+      ctx.quadraticCurveTo(b.x - sp * 0.4, by - sp * 0.35, b.x, by);
+      ctx.quadraticCurveTo(b.x + sp * 0.4, by - sp * 0.35, b.x + sp, by + sp * 0.5 * fl);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawBugs(t, a, dt) {
+    ctx.save();
+    for (var k = 0; k < bugs.length; k++) {
+      var g = bugs[k];
+      g.x += g.vx * dt / 1000;
+      g.y += g.vy * dt / 1000;
+      if (g.x < -6) { g.x = W + 6; }
+      if (g.x > W + 6) { g.x = -6; }
+      if (g.y < H * 0.5) { g.vy = Math.abs(g.vy); }
+      if (g.y > H - 2) { g.vy = -Math.abs(g.vy); }
+      g.vx += rnd(-9, 9) * dt / 1000;
+      g.vy += rnd(-6, 6) * dt / 1000;
+      g.vx = Math.max(-16, Math.min(16, g.vx));
+      g.vy = Math.max(-9, Math.min(9, g.vy));
+      var flap = 0.35 + 0.65 * Math.abs(Math.sin(t * 0.019 + g.ph));
+      var by = g.y + Math.sin(t * 0.006 + g.ph) * 2.4;
+      if (ART) {
+        var cols = ["255,196,120", "255,150,190", "180,220,255"];
+        ctx.fillStyle = "rgba(" + cols[g.hue] + "," + (0.72 * a).toFixed(3) + ")";
+        ctx.beginPath();
+        ctx.ellipse(g.x - g.s * 0.85, by, g.s * flap, g.s * 0.62, -0.4, 0, 6.2832);
+        ctx.ellipse(g.x + g.s * 0.85, by, g.s * flap, g.s * 0.62, 0.4, 0, 6.2832);
+        ctx.fill();
+      } else {
+        // On artwork the same swarm becomes bokeh, which flatters a picture
+        // instead of drawing on top of it.
+        var rg = ctx.createRadialGradient(g.x, by, 0, g.x, by, g.s * 5);
+        rg.addColorStop(0, "rgba(255,244,214," + (0.30 * a).toFixed(3) + ")");
+        rg.addColorStop(1, "rgba(255,244,214,0)");
+        ctx.fillStyle = rg;
+        ctx.beginPath();
+        ctx.arc(g.x, by, g.s * 5, 0, 6.2832);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  }
+
+  function drawMotes(t, a, dt) {
+    ctx.save();
+    for (var k = 0; k < motes.length; k++) {
+      var m = motes[k];
+      m.y += m.vy * dt / 1000;
+      m.x += Math.sin(t * 0.0011 + m.ph) * 0.25;
+      if (m.y < -4) { m.y = H + 4; m.x = rnd(0, W); }
+      ctx.fillStyle = ART
+        ? "rgba(255,255,255," + (0.42 * a).toFixed(3) + ")"
+        : "rgba(255,250,235," + (0.30 * a).toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.arc(m.x, m.y, m.r, 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawPetals(t, a, dt) {
+    ctx.save();
+    for (var k = 0; k < petals.length; k++) {
+      var p = petals[k];
+      p.y += p.vy * dt / 1000;
+      p.x += Math.sin(t * 0.0016 + p.ph) * 0.7;
+      if (p.y > H + 6) { p.y = -6; p.x = rnd(0, W); }
+      ctx.fillStyle = ART
+        ? "rgba(255,190,215," + (0.72 * a).toFixed(3) + ")"
+        : "rgba(255,238,246," + (0.40 * a).toFixed(3) + ")";
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, p.s, p.s * 0.55, Math.sin(t * 0.002 + p.ph), 0, 6.2832);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function drawGrassSway(t, a) {
+    var base = H - 2;
+    ctx.save();
+    ctx.strokeStyle = "rgba(30,62,44," + (0.34 * a).toFixed(3) + ")";
+    ctx.lineWidth = 1.1;
+    ctx.lineCap = "round";
+    for (var k = 0; k < 26; k++) {
+      var x = (k + 0.5) * (W / 26) + Math.sin(k * 3.1) * 6;
+      var hgt = 5 + (k % 5) * 2.2;
+      var lean = Math.sin(t * 0.0022 + k * 0.7) * (2.4 + (k % 3));
+      ctx.beginPath();
+      ctx.moveTo(x, base);
+      ctx.quadraticCurveTo(x + lean * 0.5, base - hgt * 0.6, x + lean, base - hgt);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawSweep(t, a) {
+    var px = ((t * 0.022) % (W + 260)) - 130;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    var g = ctx.createLinearGradient(px - 60, 0, px + 60, H);
+    g.addColorStop(0, "rgba(255,255,255,0)");
+    g.addColorStop(0.5, "rgba(255,255,255," + (0.085 * a).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.fillRect(px - 70, 0, 140, H);
+    ctx.restore();
+  }
+
+  function drawRipples(dt) {
+    ctx.save();
+    for (var k = ripples.length - 1; k >= 0; k--) {
+      var r = ripples[k];
+      r.r += dt * 0.16;
+      r.life -= dt / 620;
+      if (r.life <= 0) { ripples.splice(k, 1); continue; }
+      ctx.strokeStyle = "rgba(" + glow.join(",") + ","
+                      + (r.life * 0.5).toFixed(3) + ")";
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(r.x, r.y, r.r, 0, 6.2832);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  function drawPiece(p, chaos, t) {
+    // No highlight is drawn here any more. It was positioned at the gap's
+    // exact x, so a screenshot of the canvas handed over the answer. The gap
+    // is marked in the background image itself, which is what the solver
+    // aims at -- drawing a second, precisely-placed marker on top of it only
+    // made the answer easier to measure.
+    for (var k = 0; k < pieceCanvas.length; k++) {
+      ctx.save();
+      ctx.shadowColor = "rgba(8,12,24," + (0.48 - 0.28 * p) + ")";
+      ctx.shadowBlur = 11 - 8 * p;
+      ctx.shadowOffsetY = 5 - 4 * p;
+      ctx.drawImage(pieceCanvas[k], 0, 0, PW, PH,
+                    curs[k].x, curs[k].y, PW, PH);
+      ctx.restore();
+    }
+
+    // The frame does not change on success. A green ring the instant the
+    // piece is close enough is a precise pass/fail signal, readable by
+    // anything that can take a screenshot -- and the whole point of this
+    // page is that the answer cannot be found without looking at the
+    // picture. Success shows itself by the page moving on.
+    host.style.boxShadow = "inset 0 0 0 1px rgba(255,255,255,.10),"
+                         + " 0 6px 18px -8px rgba(16,23,40,.55)";
+  }
+
+  /* How many pieces are out of the tray right now.
+   *
+   * Used both for the reminder while dragging and for the check at submit
+   * time. "Out of the tray" uses the same TRAY_TOL the server's
+   * vigil_slider_in_tray() uses, so the two agree about what "placed" means.
+   */
+  function placedCount() {
+    var n = 0;
+    for (var k = 0; k < curs.length; k++) {
+      if (Math.abs(curs[k].x - tray[k].x) > TRAY_TOL
+          || Math.abs(curs[k].y - tray[k].y) > TRAY_TOL) {
+        n++;
+      }
+    }
+    return n;
+  }
+
+  /* Keep the tray outline for pieces that have been moved away, so "put it
+   * back where it was" is a place to aim at rather than a guess. Drawn under
+   * the pieces: it is a hint for a person, not a target marker. */
+  function drawTrayHints() {
+    var NEED = parseInt(host.dataset.need, 10) || 2;
+    if (placedCount() <= NEED) { return; }
+    ctx.save();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = "rgba(255,255,255,0.55)";
+    ctx.lineWidth = 1.2;
+    for (var k = 0; k < tray.length; k++) {
+      ctx.strokeRect(tray[k].x + 0.5, tray[k].y + 0.5, PW - 1, PH - 1);
+    }
+    ctx.restore();
+  }
+
+  function setPiece(slot, px, py) {
+    var c = curs[slot];
+    if (!c) { return; }
+    c.x = Math.max(0, Math.min(MAX, Math.round(px)));
+    if (py !== undefined && py !== null) {
+      c.y = Math.max(0, Math.min(MAXY, Math.round(py)));
+    }
+    target = progressFor(c.x);
+    // No proximity readout. "Very close" / "a bit closer" is a coarse oracle
+    // but an oracle all the same: an attacker who can read it can walk the
+    // slider towards the answer without interpreting the image at all. The
+    // gap highlight and the picture reassembling are the feedback; both
+    // require actually looking.
+    if (hint) { hint.textContent = ""; }
+  }
+
+  var raf = null, lastTs = 0;
+  function frame(ts) {
+    var t = ts || 0;
+    var dt = lastTs ? Math.min(48, t - lastTs) : 16;
+    lastTs = t;
+
+    var diff = target - shown;
+    if (Math.abs(diff) > 0.0015) { shown += diff * 0.16; } else { shown = target; }
+    // The picture is shown at rest -- bands undisplaced -- so that the gap
+    // sits exactly where the background image has it, and the piece lines up
+    // with it by direct correspondence.
+    //
+    // This used to be `1 - shown`, i.e. the bands knitted back together as
+    // the piece approached the *answer*. That settle was the guidance, and
+    // it required the page to know where the gap was -- which it worked out
+    // by differencing the marked background against an unmarked copy, the
+    // very thing that made the answer computable in the browser.
+    //
+    // There is no way to keep both: any feedback that tells the solver "you
+    // are close" also tells a bot. So the animation goes and the alignment
+    // becomes exact instead. What is left is the standard slide-to-fit
+    // puzzle, and the strength comes from the server-side drag checks.
+    var chaos = 0;
+    if (boost > 0) {
+      boost *= Math.exp(-dt / 420);
+      if (boost < 0.005) { boost = 0; }
+    }
+
+    compose(t, chaos);
+    present(t, shown, chaos);
+
+    // Ambient intensity: never zero, so the picture is alive even when it is
+    // whole, but noticeably calmer -- the scene settling is part of the
+    // reward for solving it.
+    var a = (0.42 + 0.58 * chaos) * (1 + boost * 0.9);
+    if (a > 1.7) { a = 1.7; }
+
+    if (ART) {
+      drawRays(t, a);
+      drawCloudShadow(t, a);
+      drawGrassSway(t, a);
+    } else {
+      drawSweep(t, a);
+    }
+    drawBirds(t, a, dt);
+    drawMotes(t, a, dt);
+    drawPetals(t, a, dt);
+    drawBugs(t, a, dt);
+
+    drawTrayHints();
+    drawPiece(shown, chaos, t);
+    // Over the pieces, deliberately: see the note where objCanvas is made.
+    ctx.drawImage(objCanvas, 0, 0);
+    drawRipples(dt);
+
+    raf = requestAnimationFrame(frame);
+  }
+
+  function cvt(clientX) {
+    var r = cv.getBoundingClientRect();
+    var scale = W / Math.max(1, r.width);
+    return (clientX - r.left) * scale;
+  }
+  function point(e) {
+    if (e.touches && e.touches.length) { return e.touches[0].clientX; }
+    if (e.changedTouches && e.changedTouches.length) {
+      return e.changedTouches[0].clientX;
+    }
+    return e.clientX;
+  }
+  function pointY(e) {
+    if (e.touches && e.touches.length) { return e.touches[0].clientY; }
+    if (e.changedTouches && e.changedTouches.length) {
+      return e.changedTouches[0].clientY;
+    }
+    return e.clientY;
+  }
+
+  // Free dragging on the canvas.
+  //
+  // There is no slider any more. A slider produces a single number, so the
+  // only thing that can be judged is *where* it ended up; the path is a
+  // one-dimensional ramp that a script synthesises trivially. Dragging the
+  // piece in two dimensions produces a path with curvature, hesitation,
+  // overshoot and micro-correction -- all of which are recorded and all of
+  // which a generator finds hard to fake convincingly. The position is also
+  // two-dimensional now, so the answer space is squared.
+  function localPoint(e) {
+    var r = cv.getBoundingClientRect();
+    var scaleX = W / Math.max(1, r.width);
+    var scaleY = H / Math.max(1, r.height);
+    return { x: (point(e) - r.left) * scaleX,
+             y: (pointY(e) - r.top) * scaleY };
+  }
+
+  // Which piece did the pointer grab? Topmost first, and generously: a
+  // person should not have to hit the exact pixels.
+  function pieceAt(pt) {
+    for (var k = curs.length - 1; k >= 0; k--) {
+      var c = curs[k];
+      if (pt.x >= c.x - 6 && pt.x <= c.x + PW + 6
+          && pt.y >= c.y - 6 && pt.y <= c.y + PH + 6) {
+        return k;
+      }
+    }
+    return -1;
+  }
+
+  function grab(e) {
+    var pt = localPoint(e);
+    var k = pieceAt(pt);
+    if (k < 0) { return; }
+    active = k;
+    dragging = true;
+    grabDX = pt.x - curs[k].x;
+    grabDY = pt.y - curs[k].y;
+    // The tray position is step zero of the path, so the recorded track
+    // always starts where the piece actually was.
+    trajs[k] = [[curs[k].x, curs[k].y, 0]];
+    t0 = Date.now();
+    boost = 1;
+    cv.style.cursor = "grabbing";
+    if (e.cancelable) { e.preventDefault(); }
+  }
+
+  function drag(e) {
+    if (!dragging) { return; }
+    var pt = localPoint(e);
+    setPiece(active, pt.x - grabDX, pt.y - grabDY);
+    boost = 1;
+    // A person who has just dragged a third piece needs to be told now, not
+    // when they press the button: the mistake was made with the hand.
+    var NEED = parseInt(host.dataset.need, 10) || 2;
+    var have = placedCount();
+    if (hint) {
+      if (have > NEED) {
+        hint.textContent = "只需要完成 " + NEED + " 块——把多拖的那 "
+                         + (have - NEED) + " 块拖回原处即可";
+        hint.style.color = "#d98a14";
+      } else if (hint.style.color === "rgb(217, 138, 20)") {
+        hint.textContent = "";
+        hint.style.color = "";
+      }
+    }
+    ripples.push({ x: curs[active].x + PW / 2, y: curs[active].y + PH / 2,
+                   r: 6, life: 1 });
+    if (ripples.length > 6) { ripples.shift(); }
+    var now = Date.now() - t0;
+    var tr = trajs[active];
+    var last = tr[tr.length - 1];
+    // ~60 samples a second is plenty for the analysis and keeps the field
+    // small; the server wants the shape of the movement, not a video.
+    if (!last || now - last[2] >= 12) {
+      tr.push([curs[active].x, curs[active].y, now]);
+    }
+    if (e.cancelable) { e.preventDefault(); }
+  }
+
+  function drop() {
+    if (!dragging) { return; }
+    dragging = false;
+    cv.style.cursor = "grab";
+    var tr = trajs[active];
+    tr.push([curs[active].x, curs[active].y, Date.now() - t0]);
+  }
+
+  cv.addEventListener("mousedown", grab, false);
+  cv.addEventListener("touchstart", grab, { passive: false });
+  document.addEventListener("mousemove", drag, false);
+  document.addEventListener("mouseup", drop, false);
+  document.addEventListener("touchmove", drag, { passive: false });
+  document.addEventListener("touchend", drop, false);
+
+  // Keyboard access: arrow keys nudge the piece nearest the gap the user is
+  // working on, so the puzzle is not mouse-only. The path is recorded the
+  // same way, which means a keyboard solve is judged on the same evidence.
+  cv.tabIndex = 0;
+  cv.addEventListener("keydown", function (e) {
+    var step = e.shiftKey ? 8 : 2;
+    var k = (active >= 0 && active < curs.length) ? active : 0;
+    var nx = curs[k].x, ny = curs[k].y;
+    if (e.key === "ArrowRight") { nx += step; }
+    else if (e.key === "ArrowLeft") { nx -= step; }
+    else if (e.key === "ArrowUp") { ny -= step; }
+    else if (e.key === "ArrowDown") { ny += step; }
+    else { return; }
+    if (!t0) { t0 = Date.now(); trajs[k] = []; }
+    setPiece(k, nx, ny);
+    trajs[k].push([curs[k].x, curs[k].y, Date.now() - t0]);
+    boost = 1;
+    e.preventDefault();
+  });
+
+  form.addEventListener("submit", function (e) {
+    // The page draws three pieces and asks for two, so "how many are out of
+    // the tray" is itself an answer. Every piece is submitted -- including
+    // the untouched one, at its tray position -- because the server decides
+    // what was placed from the geometry, not from anything this script says.
+    var NEED = parseInt(host.dataset.need, 10) || 2;
+    var drops = [];
+    var placed = 0;
+    for (var sm = 0; sm < curs.length; sm++) {
+      var moved = Math.abs(curs[sm].x - tray[sm].x) > TRAY_TOL
+               || Math.abs(curs[sm].y - tray[sm].y) > TRAY_TOL;
+      if (moved) {
+        placed++;
+        // A placed piece has to have been carried, not teleported.
+        if (trajs[sm].length < 5) {
+          e.preventDefault();
+          if (hint) {
+            hint.textContent = "请用拖动的方式把拼片移到位";
+            hint.style.color = "#d98a14";
+          }
+          return false;
+        }
+      }
+      drops.push({ x: curs[sm].x, y: curs[sm].y, track: trajs[sm] });
+    }
+    if (placed > NEED) {
+      e.preventDefault();
+      if (hint) {
+        hint.textContent = "只需要完成 " + NEED + " 块——请把多拖的那 "
+                         + (placed - NEED) + " 块拖回原处（它原来的位置有浅色轮廓）";
+        hint.style.color = "#d98a14";
+      }
+      return false;
+    }
+    if (placed < NEED) {
+      e.preventDefault();
+      if (hint) {
+        hint.textContent = "还需要再拖 " + (NEED - placed) + " 块到缺口（共 "
+                         + NEED + " 块）";
+        hint.style.color = "#d98a14";
+      }
+      return false;
+    }
+    if (fDrops) { fDrops.value = JSON.stringify(drops); }
+    // The answer is chosen, not computed here: this script forwards the
+    // selected option and knows nothing about which one is right.
+    var picked = document.querySelector('input[name="q_answer"]:checked');
+    if (!picked) {
+      e.preventDefault();
+      if (hint) {
+        hint.textContent = "请先回答上面的问题";
+        hint.style.color = "#d98a14";
+      }
+      return false;
+    }
+    var qa = document.getElementById("qa");
+    if (qa) { qa.value = picked.value; }
+    go.disabled = true;
+  }, false);
+
+  /* ---------------- images ----------------
+   *
+   * The requests went out at the very top of this script; all that is left is
+   * to say what to draw when each one lands. Nothing here is a barrier: there
+   * is deliberately no "how many are still outstanding" counter, because with
+   * one, a single callback that never fired left the whole page blank -- no
+   * picture, no error, nothing to look at. One picture failing costs that one
+   * picture; the rest still draw and the scene still starts.
+   */
+  var loadedAny = 0;
+  function maybeStart() {
+    loadedAny++;
+    if (raf === null) {
+      for (var sj = 0; sj < curs.length; sj++) {
+        setPiece(sj, tray[sj].x, tray[sj].y);
+      }
+      raf = requestAnimationFrame(frame);
+    }
+  }
+  function settle(im, draw) {
+    function done() {
+      if (im && im.naturalWidth) { draw(im); }
+      maybeStart();
+    }
+    if (!im) { maybeStart(); return; }
+    // Already in hand -- preloaded above, or served from cache on a revisit:
+    // draw now rather than wait for an event that has already fired.
+    if (im.complete) { done(); return; }
+    im.onload = done;
+    im.onerror = function () { maybeStart(); };
+  }
+  settle(pre[PRE_BG], function (im) { bgCtx.drawImage(im, 0, 0, W, H); });
+  settle(pre[PRE_OBJ], function (im) { objCtx.drawImage(im, 0, 0, W, H); });
+  for (var li = 0; li < pieces.length; li++) {
+    (function (slot) {
+      settle(pre[PRE_PIECE + slot], function (im) {
+        pieceCtx[slot].drawImage(im, 0, 0, PW, PH);
+      });
+    })(li);
+  }
+  // Eight seconds and not one picture: the network is the problem, not the
+  // puzzle. Say so anyway -- silence is the one answer nobody can act on.
+  setTimeout(function () {
+    if (loadedAny === 0) { escapeToText("images did not load"); }
+  }, 8000);
+})();
+</script>
+<noscript>
+  <div class="err" style="margin-top:16px">
+    <?= $e($t('浏览器未启用 JavaScript，请改用文字验证码。',
+              'JavaScript is disabled; please use the text challenge.')) ?>
+    <a href="<?= $e($entryPath) ?>?fallback=text&amp;next=<?= $e(rawurlencode($next)) ?>">
+      <?= $e($t('切换', 'Switch')) ?>
+    </a>
+  </div>
+</noscript>
+<?php endif; ?>
+</body>
+</html>

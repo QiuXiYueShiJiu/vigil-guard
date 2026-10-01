@@ -1,0 +1,106 @@
+<?php
+/**
+ * CAPTCHA asset endpoint.
+ *
+ * Serves two kinds of thing, both one-time and both bound to the client:
+ *
+ *   ?cid=<id>&part=slider-bg       background with both gaps marked
+ *   ?cid=<id>&part=slider-pieceN   the Nth piece to drag (N is parsed,
+ *                                  not enumerated -- see the note below)
+ *   ?cid=<id>&part=slider-objects  the question shapes, drawn over the pieces
+ *   ?cid=<id>                     the text challenge (fallback, and used
+ *                                 when the browser has no JavaScript)
+ *
+ * The correct slider offset is never sent here, and neither is an unmarked
+ * copy of the background: serving both would let the page recover the gap by
+ * differencing the two images, which is the same as sending the answer.
+ */
+declare(strict_types=1);
+
+$cfg = require '__CONFIG_PATH__';
+vigil_state_dirs($cfg['state_dir']);
+$policy = vigil_policy($cfg['policy']);
+$state = rtrim($cfg['state_dir'], '/');
+
+$cid = (string)($_GET['cid'] ?? '');
+$part = (string)($_GET['part'] ?? '');
+if (!preg_match('/^[0-9a-f]{32}$/', $cid)) {
+    http_response_code(400);
+    exit;
+}
+
+// --- slider assets --------------------------------------------------------
+//
+// The piece count is *not* enumerated here.
+//
+// It used to list `slider-piece1` and `slider-piece2` by hand. When the
+// puzzle grew a third piece, the page asked for `slider-piece3`, this file
+// answered 404, and the login page simply did not render -- the front end and
+// the back end had come apart, and nothing in the suite noticed because the
+// two were written against different assumptions. An enumeration that must be
+// kept in step by hand is a bug waiting for the next change, so the name is
+// resolved by the same helper the page uses.
+$suffix = vigil_slider_suffix($part);
+if ($suffix !== '') {
+    $file = vigil_slider_asset($state, $cid, $part);
+    $meta = $state . '/captcha/' . $cid . '.json';
+    // The challenge must still exist and still be a slider, so the images
+    // cannot be enumerated after consumption.
+    if ($file === null || !is_file($meta)) {
+        http_response_code(404);
+        exit;
+    }
+    $d = json_decode((string)@file_get_contents($meta), true);
+    if (!is_array($d) || ($d['mode'] ?? '') !== 'slider'
+            || (int)($d['exp'] ?? 0) < time()) {
+        http_response_code(410);
+        exit;
+    }
+    vigil_send_security_headers();
+    header('Content-Type: image/png');
+    header('Cache-Control: no-store, no-cache, must-revalidate, private');
+    readfile($file);
+    exit;
+}
+
+// --- text challenge -------------------------------------------------------
+$file = $state . '/captcha/' . $cid . '.json';
+if (!is_file($file)) {
+    http_response_code(404);
+    exit;
+}
+$data = json_decode((string)@file_get_contents($file), true);
+if (!is_array($data) || (int)($data['exp'] ?? 0) < time()) {
+    @unlink($file);
+    http_response_code(410);
+    exit;
+}
+if (($data['mode'] ?? 'text') !== 'text') {
+    // A slider challenge has no text image; do not fall through and render
+    // an empty one.
+    http_response_code(404);
+    exit;
+}
+
+$code = (string)($data['code'] ?? '');
+$len = strlen($code);
+if ($len < 4) {
+    http_response_code(410);
+    exit;
+}
+
+vigil_send_security_headers();
+header('Content-Type: image/png');
+
+// One drawing implementation, shared with the page that inlines this picture
+// as a `data:` URI. It used to be inlined here, which meant the only way to
+// see a text challenge was to fetch this endpoint -- and a fetch that never
+// happened left a blank box with nothing in the server's log to explain it.
+$png = vigil_captcha_png($code, (int)($data['weight'] ?? 0));
+if ($png === '') {
+    http_response_code(500);
+    exit;
+}
+header('Content-Length: ' . strlen($png));
+echo $png;
+

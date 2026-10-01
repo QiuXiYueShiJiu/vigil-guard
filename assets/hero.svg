@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 380" width="1200" height="380" role="img" aria-label="vigil-guard">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1220"/><stop offset="55%" stop-color="#101a2e"/><stop offset="100%" stop-color="#0d1424"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#4f9dff"/><stop offset="100%" stop-color="#7d6bff"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4f9dff" stop-opacity="0.30"/><stop offset="100%" stop-color="#4f9dff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="380" fill="url(#bg)"/>
+  <circle cx="1010" cy="86" r="210" fill="url(#glow)"/>
+  <circle cx="150" cy="330" r="160" fill="url(#glow)"/>
+  <g stroke="#1e2a44" stroke-width="1">
+    <path d="M0 300 H1200"/><path d="M0 250 H1200" opacity="0.55"/><path d="M0 200 H1200" opacity="0.3"/>
+  </g>
+  <g transform="translate(78,86)">
+    <path d="M34 6 L66 18 V44 C66 66 52 82 34 90 C16 82 2 66 2 44 V18 Z"
+          fill="none" stroke="url(#accent)" stroke-width="3.5" stroke-linejoin="round"/>
+    <path d="M20 46 L30 57 L49 34" fill="none" stroke="#7fe3a8" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="180" y="150" font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" font-size="62" font-weight="700" fill="#eef3fb">vigil-guard</text>
+  <text x="182" y="196" font-family="'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" fill="#93a2bb">Linux 服务器防御 · 检测 · 处置 · 告警</text>
+  <g transform="translate(182,232)">
+    <rect x="0" y="0" rx="15" ry="15" width="452" height="31" fill="#2a1c12" stroke="#7a4a1c"/>
+    <text x="16" y="21" font-family="'Segoe UI','PingFang SC',sans-serif" font-size="15" fill="#ffbe6b">小玩具 · 不能代替专业安全工具 · 仅供辅助</text>
+  </g>
+  <text x="182" y="300" font-family="'Segoe UI',sans-serif" font-size="15" fill="#64748b">MIT License · Python 3.8+ · 无第三方依赖</text>
+  <g transform="translate(900,300)" opacity="0.9">
+    <rect x="0" y="0" width="8" height="8" rx="4" fill="#4f9dff"/>
+    <rect x="22" y="0" width="8" height="8" rx="4" fill="#7d6bff" opacity="0.75"/>
+    <rect x="44" y="0" width="8" height="8" rx="4" fill="#7fe3a8" opacity="0.75"/>
+  </g>
+</svg>

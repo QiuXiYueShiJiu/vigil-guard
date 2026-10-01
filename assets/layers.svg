@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 560" width="1200" height="560" role="img" aria-label="defence layers">
+  <rect width="1200" height="560" fill="#0b1220"/>
+  <text x="60" y="58" font-family="'Segoe UI','PingFang SC',sans-serif" font-size="30" font-weight="700" fill="#eef3fb">防护分层</text>
+  <text x="60" y="88" font-family="'Segoe UI','PingFang SC',sans-serif" font-size="16" fill="#8496b3">每一层都能单独关掉，也能单独看懂在做什么</text>
+  <g font-family="'Segoe UI','PingFang SC',sans-serif">
+    <!-- layer rows -->
+    <g transform="translate(60,120)">
+      <rect width="1080" height="68" rx="12" fill="#111c30" stroke="#22314e"/>
+      <rect x="0" y="0" width="6" height="68" rx="3" fill="#4f9dff"/>
+      <text x="30" y="29" font-size="19" font-weight="600" fill="#e6eefb">边缘</text>
+      <text x="30" y="52" font-size="14" fill="#8fa2bf">请求行与 Host 长度上限 · 超大请求拒绝 · 方法白名单</text>
+      <text x="700" y="41" font-size="14" fill="#5f7characters" opacity="0">.</text>
+      <text x="700" y="41" font-size="14" fill="#6b7f9e">nginx · 解析阶段就拒绝</text>
+    </g>
+    <g transform="translate(60,202)">
+      <rect width="1080" height="68" rx="12" fill="#111c30" stroke="#22314e"/>
+      <rect x="0" y="0" width="6" height="68" rx="3" fill="#6d8bff"/>
+      <text x="30" y="29" font-size="19" font-weight="600" fill="#e6eefb">闸门</text>
+      <text x="30" y="52" font-size="14" fill="#8fa2bf">人机验证 · 一次性挑战 · 客户端绑定 · 渐进封禁</text>
+      <text x="700" y="41" font-size="14" fill="#6b7f9e">面板 / 登录入口前置</text>
+    </g>
+    <g transform="translate(60,284)">
+      <rect width="1080" height="68" rx="12" fill="#111c30" stroke="#22314e"/>
+      <rect x="0" y="0" width="6" height="68" rx="3" fill="#7d6bff"/>
+      <text x="30" y="29" font-size="19" font-weight="600" fill="#e6eefb">检测</text>
+      <text x="30" y="52" font-size="14" fill="#8fa2bf">日志特征匹配 · 诱饵端点 · 速率与连接异常 · 攻击演练</text>
+      <text x="700" y="41" font-size="14" fill="#6b7f9e">多来源取证后再下判断</text>
+    </g>
+    <g transform="translate(60,366)">
+      <rect width="1080" height="68" rx="12" fill="#111c30" stroke="#22314e"/>
+      <rect x="0" y="0" width="6" height="68" rx="3" fill="#a86bff"/>
+      <text x="30" y="29" font-size="19" font-weight="600" fill="#e6eefb">处置</text>
+      <text x="30" y="52" font-size="14" fill="#8fa2bf">自动封禁 · 网段升级 · 负载卸载 · 全过程可回滚</text>
+      <text x="700" y="41" font-size="14" fill="#6b7f9e">白名单优先，绝不动管理地址</text>
+    </g>
+    <g transform="translate(60,448)">
+      <rect width="1080" height="68" rx="12" fill="#111c30" stroke="#22314e"/>
+      <rect x="0" y="0" width="6" height="68" rx="3" fill="#7fe3a8"/>
+      <text x="30" y="29" font-size="19" font-weight="600" fill="#e6eefb">审计与告警</text>
+      <text x="30" y="52" font-size="14" fill="#8fa2bf">内核审计归因 · 敏感文件暴露扫描 · 邮件告警与积压可查</text>
+      <text x="700" y="41" font-size="14" fill="#6b7f9e">每条动作都留痕</text>
+    </g>
+  </g>
+</svg>

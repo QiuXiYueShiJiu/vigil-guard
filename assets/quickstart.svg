@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="quick start">
+  <rect width="1200" height="300" fill="#0b1220"/>
+  <text x="60" y="56" font-family="'Segoe UI','PingFang SC',sans-serif" font-size="28" font-weight="700" fill="#eef3fb">三步上手</text>
+  <g font-family="'Segoe UI','PingFang SC',sans-serif">
+    <g transform="translate(60,96)">
+      <rect width="330" height="150" rx="14" fill="#111c30" stroke="#22314e"/>
+      <circle cx="42" cy="44" r="19" fill="#4f9dff" opacity="0.18"/>
+      <text x="42" y="51" font-size="19" font-weight="700" fill="#7fb6ff" text-anchor="middle">1</text>
+      <text x="76" y="51" font-size="19" font-weight="600" fill="#e6eefb">安装</text>
+      <text x="28" y="92" font-size="13.5" fill="#8fa2bf">一条命令，自动判断发行版并</text>
+      <text x="28" y="113" font-size="13.5" fill="#8fa2bf">补齐缺失的系统依赖</text>
+      <rect x="28" y="122" width="274" height="1" fill="#1e2a44"/>
+      <text x="28" y="142" font-size="12.5" font-family="ui-monospace,Consolas,monospace" fill="#7fe3a8">curl -fsSL .../install.sh | bash</text>
+    </g>
+    <g transform="translate(435,96)">
+      <rect width="330" height="150" rx="14" fill="#111c30" stroke="#22314e"/>
+      <circle cx="42" cy="44" r="19" fill="#7d6bff" opacity="0.18"/>
+      <text x="42" y="51" font-size="19" font-weight="700" fill="#b3a6ff" text-anchor="middle">2</text>
+      <text x="76" y="51" font-size="19" font-weight="600" fill="#e6eefb">自检</text>
+      <text x="28" y="92" font-size="13.5" fill="#8fa2bf">确认装好的东西真的在工作，</text>
+      <text x="28" y="113" font-size="13.5" fill="#8fa2bf">而不是只写进了配置文件</text>
+      <rect x="28" y="122" width="274" height="1" fill="#1e2a44"/>
+      <text x="28" y="142" font-size="12.5" font-family="ui-monospace,Consolas,monospace" fill="#b3a6ff">vigil selftest &amp;&amp; vigil status</text>
+    </g>
+    <g transform="translate(810,96)">
+      <rect width="330" height="150" rx="14" fill="#111c30" stroke="#22314e"/>
+      <circle cx="42" cy="44" r="19" fill="#7fe3a8" opacity="0.18"/>
+      <text x="42" y="51" font-size="19" font-weight="700" fill="#8ff0bd" text-anchor="middle">3</text>
+      <text x="76" y="51" font-size="19" font-weight="600" fill="#e6eefb">告警通道</text>
+      <text x="28" y="92" font-size="13.5" fill="#8fa2bf">配好邮箱并实测送达，否则</text>
+      <text x="28" y="113" font-size="13.5" fill="#8fa2bf">出事时没人会知道</text>
+      <rect x="28" y="122" width="274" height="1" fill="#1e2a44"/>
+      <text x="28" y="142" font-size="12.5" font-family="ui-monospace,Consolas,monospace" fill="#8ff0bd">vigil mail test</text>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,32 @@
+<?php
+/**
+ * Logout.
+ *
+ * Clears the ticket *server-side* as well as the cookie. Deleting only the
+ * cookie leaves a valid ticket file on disk, so anyone who captured it
+ * could keep using it — a logout that does not log out.
+ */
+declare(strict_types=1);
+
+$cfg = require '__CONFIG_PATH__';
+
+$cookies = array_merge([(string)$cfg['cookie']],
+                       array_filter((array)($cfg['extra_cookies'] ?? [])));
+if (!empty($cfg['nav_cookie'])) {
+    $cookies[] = (string)$cfg['nav_cookie'];
+}
+
+foreach ($cookies as $name) {
+    $tok = (string)($_COOKIE[$name] ?? '');
+    if (preg_match('/^[0-9a-f]{64}$/', $tok)) {
+        @unlink(rtrim($cfg['state_dir'], '/') . '/sessions/' . $tok);
+    }
+    setcookie($name, '', [
+        'expires' => time() - 3600, 'path' => '/',
+        'secure' => true, 'httponly' => true, 'samesite' => 'Lax',
+    ]);
+}
+
+vigil_audit((string)$cfg['state_dir'], 'LOGOUT');
+header('Cache-Control: no-store');
+header('Location: ' . (string)$cfg['entry_path'], true, 302);
