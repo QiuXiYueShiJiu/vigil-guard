@@ -22,6 +22,7 @@ from __future__ import annotations
 import email
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1246,6 +1247,171 @@ class TestEveryPairOfPiecesIsAccepted(unittest.TestCase):
         self.assertIn("<= 10", files["gate-lib.php"])
         self.assertIn("var TRAY_TOL = 10;", files["verify.php"],
                       "页面的托盘判定与服务端不一致")
+
+
+class TestDragMustLookLikeAPerson(unittest.TestCase):
+    """The two checks added to widen the gap between a hand and a script.
+
+    Relaxing the step-variation thresholds (CV 0.12→0.09, distinct steps 3→2)
+    is what makes a short drag on a phone stop being rejected; that relaxation
+    is only safe because two harder-to-fake properties were added. This drives
+    the **real** checker with crafted tracks, because the adversarial script
+    could not reach them -- its bots were already stopped earlier in the chain,
+    so "it works" would otherwise be an untested claim.
+    """
+
+    def _php(self):
+        for cand in ("/www/server/php/82/bin/php", "php", "php8.2", "php8"):
+            exe = cand if "/" in cand else shutil.which(cand)
+            if exe and Path(exe).is_file():
+                return exe
+        return None
+
+    def _run(self, track_builder):
+        php = self._php()
+        if not php:
+            self.skipTest("没有 php")
+        from vigil.gates import installer
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        spec = gspec.GateSpec.for_kind(KIND_LOGIN)
+        spec.state_dir = str(tmp / "state"); spec.webroot = str(tmp / "web")
+        spec.username = "t"; spec.pass_hash = "$2y$10$" + "x" * 53
+        spec.upstream_token_file = str(tmp / "state" / "tok")
+        spec.upstream_mint_url = "http://127.0.0.1:3080/"
+        lib = None
+        for pth, (content, _m) in installer.render_files(spec).items():
+            if pth.name == "gate-lib.php":
+                lib = tmp / "gate-lib.php"
+                lib.write_text(content, encoding="utf-8")
+        (tmp / "state" / "captcha").mkdir(parents=True, exist_ok=True)
+        (tmp / "state" / "slider").mkdir(parents=True, exist_ok=True)
+
+        slots = [{"x": 100 + i * 60, "y": 60 + i * 60, "shape": "right"}
+                 for i in range(3)]
+        tray = [(53, 216), (213, 211), (373, 206)]
+        drops = []
+        for i in range(3):
+            if i < 2:
+                x, y = slots[i]["x"], slots[i]["y"]
+                drops.append({"x": x, "y": y,
+                              "track": track_builder(x, y, i)})
+            else:
+                drops.append({"x": tray[i][0], "y": tray[i][1], "track": []})
+
+        cid = "a" * 32
+        meta = {"mode": "slider", "exp": int(time.time()) + 600,
+                "born": int(time.time()) - 5,
+                "bind": "ignored-for-this-test", "slots": slots,
+                "q_ans": 1, "q_opts": ["a", "b", "c"], "q_text": "q",
+                "weight": 0}
+        (tmp / "state" / "captcha" / (cid + ".json")).write_text(
+            json.dumps(meta), encoding="utf-8")
+        driver = tmp / "d.php"
+        driver.write_text(
+            "<?php\nrequire %s;\n"
+            "$_SERVER['REMOTE_ADDR'] = '203.0.113.9';\n"
+            "$_SERVER['HTTP_USER_AGENT'] = 'test';\n"
+            "$meta = json_decode(file_get_contents(%s), true);\n"
+            "$meta['bind'] = vigil_client_binding();\n"
+            "file_put_contents(%s, json_encode($meta));\n"
+            "$pol = ['captcha_ttl'=>600,'captcha_min_seconds'=>0,"
+            "'captcha_length'=>5,'captcha_per_minute'=>999,'lock_max'=>99,"
+            "'lock_secs'=>900,'slider_pieces'=>3];\n"
+            "$r = vigil_check_slider(%s, $pol, %s, %s, false, '1');\n"
+            "echo json_encode($r);"
+            % (_php_quote(str(lib)),
+               _php_quote(str(tmp / "state" / "captcha" / (cid + ".json"))),
+               _php_quote(str(tmp / "state" / "captcha" / (cid + ".json"))),
+               _php_quote(str(tmp / "state")), _php_quote(cid),
+               _php_quote(json.dumps(drops))), encoding="utf-8")
+        proc = subprocess.run([php, str(driver)], capture_output=True,
+                              text=True, timeout=90)
+        out = (proc.stdout or "").strip().splitlines()
+        self.assertTrue(out, "php 无输出：%s" % (proc.stderr or "")[-300:])
+        return json.loads(out[-1])
+
+    @staticmethod
+    def _hand(x, y, i):
+        """A hand-like path: easing, wander, overshoot, correction."""
+        pts, t = [[30, 240, 0]], 0
+        n = 14
+        for k in range(n + 1):
+            f = k / n
+            e = f * f * (3 - 2 * f)
+            t += 12 + (k * 7) % 23
+            pts.append([round(30 + (x - 30) * e + math.sin(f * 9.1) * 6 * (1 - f), 1),
+                        round(240 + (y - 240) * e + math.cos(f * 7.3) * 5 * (1 - f), 1),
+                        t])
+        pts.append([x + 4, y + 3, t + 21])
+        pts.append([x, y, t + 47])
+        return pts
+
+    def test_a_hand_like_path_is_accepted(self):
+        """The control: if this fails, the puzzle rejects real people."""
+        r = self._run(self._hand)
+        self.assertTrue(r["ok"], "人手轨迹被拒了：%s" % r["reason"])
+
+    def test_a_perfectly_straight_path_is_rejected(self):
+        """A generator draws a line; a hand almost never does.
+
+        The steps deliberately vary (so the variation checks pass) -- the only
+        thing wrong with it is that it never turns back on itself.
+        """
+        def straight(x, y, i):
+            pts, t = [[30, 240, 0]], 0
+            x0, y0 = 30, 240
+            for frac, size in zip((0.16, 0.3, 0.42, 0.55, 0.66, 0.76, 0.85,
+                                   0.92, 0.97, 1.0),
+                                  (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)):
+                t += 25
+                pts.append([round(x0 + (x - x0) * frac, 1),
+                            round(y0 + (y - y0) * frac, 1), t])
+            pts.append([x, y, t + 30])
+            return pts
+        r = self._run(straight)
+        self.assertFalse(r["ok"], "直线轨迹竟然通过了")
+        self.assertEqual("STRAIGHT_LINE", r["reason"], r)
+
+    def test_scripted_jitter_is_rejected(self):
+        """What the path check is actually for.
+
+        The first version of this test compressed a normal drag to 100ms and
+        asserted rejection -- and it failed, correctly: 250px in 100ms is about
+        2500 px/s, which is an ordinary flick on a touchscreen. Tightening the
+        cap until that failed would have started rejecting real people, which
+        is the opposite of the goal.
+
+        What a hand cannot do is *accumulate* travel: it may hesitate and
+        correct, but it heads for the gap, so path length stays within about
+        2.5x the straight-line distance. A track that oscillates back and forth
+        covers thousands of pixels while going nowhere -- the ratio is what
+        catches it, and unlike a speed cap that ratio does not punish somebody
+        who simply drags fast or drags far.
+        """
+        def jitter(x, y, i):
+            pts, t = [[30, 240, 0]], 0
+            for k in range(26):                     # 来回抖，位置不动
+                t += 14 + (k % 5) * 3
+                dx = 60 if k % 2 == 0 else -60
+                pts.append([pts[-1][0] + dx + (k % 3), 240 + (k % 4), t])
+            pts.append([x, y, t + 60])              # 最后一刻才到位
+            return pts
+        r = self._run(jitter)
+        self.assertFalse(r["ok"], "脚本式抖动竟然通过了")
+        self.assertEqual("PATH_INEFFICIENT", r["reason"], r)
+
+    def test_a_sub_100ms_drag_is_rejected(self):
+        """The floor that catches a literal teleport (0-30ms)."""
+        def blink(x, y, i):
+            pts = self._hand(x, y, i)
+            span = max(1, pts[-1][2])
+            for p in pts:
+                p[2] = int(p[2] * 30.0 / span)
+            return pts
+        r = self._run(blink)
+        self.assertFalse(r["ok"], "瞬移轨迹竟然通过了")
+        self.assertIn(r["reason"], ("BAD_DURATION", "IMPOSSIBLE_SPEED"), r)
 
 
 class TestExposureWiringIsSelfHealing(unittest.TestCase):

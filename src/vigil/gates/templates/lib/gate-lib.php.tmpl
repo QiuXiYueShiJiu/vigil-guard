@@ -3315,8 +3315,14 @@ function vigil_new_slider(string $stateDir, array $policy,
     imagealphablending($layer, true);
 
     // 半透明：约六成不透明。再淡人就要眯眼，再浓就成了贴纸。
-    $bodyAlpha = random_int(38, 58);
-    $edgeAlpha = max(12, $bodyAlpha - 26);
+    // 半透明，但边界一定看得见。
+    //
+    // 之前只有一层淡边（比主体淡 26 级），压在花花绿绿的画面上时，人会漏数
+    // 一个 —— 数错了就被判失败，这是「准确度」上最大的漏洞：题目本身没有歧义，
+    // 是图形不够清楚。现在主体保持半透明（防机器照旧），但描边加深、加粗、
+    // 再套一圈更暗的轮廓：人一眼能数清，机器仍要在一块低对比度的叠加层上做分割。
+    $bodyAlpha = random_int(34, 52);
+    $edgeAlpha = max(4, $bodyAlpha - 52);
 
     // 顶点表，可按随机角度旋转
     $shapePoints = static function ($kind, $cx, $cy, $r, $rot) {
@@ -3380,16 +3386,21 @@ function vigil_new_slider(string $stateDir, array $policy,
         $body = imagecolorallocatealpha($layer, $rgb[0], $rgb[1], $rgb[2],
                                         $bodyAlpha);
         $edge = imagecolorallocatealpha($layer,
-                                        (int)($rgb[0] * 0.35),
-                                        (int)($rgb[1] * 0.35),
-                                        (int)($rgb[2] * 0.35), $edgeAlpha);
+                                        (int)($rgb[0] * 0.30),
+                                        (int)($rgb[1] * 0.30),
+                                        (int)($rgb[2] * 0.30), $edgeAlpha);
+        // 最外层一圈几乎不透明：无论压在什么背景上，图形的边界都在。
+        $ring = imagecolorallocatealpha($layer, 255, 255, 255, 40);
         if ($shape === '圆形') {
+            imagefilledellipse($layer, $cx, $cy, $r * 2 + 6, $r * 2 + 6, $ring);
             imagefilledellipse($layer, $cx, $cy, $r * 2 + 3, $r * 2 + 3, $edge);
             imagefilledellipse($layer, $cx, $cy, $r * 2, $r * 2, $body);
             continue;
         }
         $pts = $shapePoints($shape, $cx, $cy, $r, $rot);
-        $outPts = $shapePoints($shape, $cx, $cy, $r + 2, $rot);
+        $outPts = $shapePoints($shape, $cx, $cy, $r + 3, $rot);
+        $ringPts = $shapePoints($shape, $cx, $cy, $r + 6, $rot);
+        imagefilledpolygon($layer, $ringPts, $ring);
         imagefilledpolygon($layer, $outPts, $edge);
         imagefilledpolygon($layer, $pts, $body);
     }
@@ -3631,7 +3642,7 @@ function vigil_check_slider(string $stateDir, array $policy, string $cid,
         $ts[] = $pts[$i][2];
     }
     $travelled = array_sum($steps);
-    if ($travelled < 24) {
+    if ($travelled < 16) {
         return ['ok' => false, 'reason' => 'NO_MOVEMENT'];
     }
     $mean = array_sum($steps) / max(1, count($steps));
@@ -3642,12 +3653,15 @@ function vigil_check_slider(string $stateDir, array $policy, string $cid,
     foreach ($steps as $sv) { $var += ($sv - $mean) * ($sv - $mean); }
     $var /= max(1, count($steps));
     $cv = sqrt($var) / max(0.001, abs($mean));
-    if ($cv < 0.12) {
+    // 0.12 → 0.09：这一条是「人被判成机器人」最常见的来源。手机上短距离
+    // 拖一下，采样点本来就少，步长自然接近均匀。放宽它，用下面两条更难伪造的
+    // 检查补回来 —— 净效果是「人更容易过、生成器更难装」。
+    if ($cv < 0.09) {
         return ['ok' => false, 'reason' => 'ROBOTIC_SPEED'];
     }
     $distinct = [];
     foreach ($steps as $sv) { $distinct[(string)round($sv)] = true; }
-    if (count($distinct) < 3) {
+    if (count($distinct) < 2) {
         return ['ok' => false, 'reason' => 'UNIFORM_STEPS'];
     }
     // Timing: literally every interval identical is the signature of a
@@ -3663,6 +3677,52 @@ function vigil_check_slider(string $stateDir, array $policy, string $cid,
     $duration = (int)($ts[count($ts) - 1] ?? 0);
     if ($duration < 100 || $duration > 20000) {
         return ['ok' => false, 'reason' => 'BAD_DURATION'];
+    }
+
+    // --- 速度是否有物理可能 -------------------------------------------
+    //
+    // 人手拖动有上限：常见峰值在 2000–3000 px/s，极快的一挥也很难稳定超过
+    // 4500 px/s。而「把坐标直接设过去再补一条轨迹」的脚本，往往在几十毫秒里
+    // 跨过整个画面 —— 那不是拖动，是瞬移。这一条对人是免费通过的（正常拖动
+    // 远低于上限），对生成器却很难：想绕开就必须主动把轨迹放慢并拉长，
+    // 那正是我们希望它付出的成本。
+    $speed = $travelled / max(1, $duration);          // px/ms
+    if ($speed > 4.5) {
+        return ['ok' => false, 'reason' => 'IMPOSSIBLE_SPEED'];
+    }
+
+    // --- 路径效率：手是往目标去的 ---------------------------------------
+    //
+    // 这条比速度上限有用得多，而且对人是安全的。人手拖动也许有犹豫、会回修，
+    // 但整体是朝目标走的：路径长度通常在直线距离的 1.0–2.5 倍之间。而脚本生成
+    // 的「来回抖」轨迹为了让各项统计量看起来正常，会累积出远超位移的长度 ——
+    // 在上限内原地抖动几千像素，人手做不到。
+    //
+    // 用比值而不是绝对值，所以「拖得远」和「拖得快」都不会被误伤：只要你是
+    // 朝着缺口去的，比值就在人的范围内。
+    $last = $pts[count($pts) - 1];
+    $first = $pts[0];
+    $straight = sqrt(($last[0] - $first[0]) ** 2 + ($last[1] - $first[1]) ** 2);
+    if ($straight > 8.0 && $travelled / $straight > 3.2) {
+        return ['ok' => false, 'reason' => 'PATH_INEFFICIENT'];
+    }
+
+    // --- 路径上有没有「人的犹豫」 ---------------------------------------
+    //
+    // 直线轨迹有一个签名：在每一段上方向都不变号。人手几乎不会这样 ——
+    // 起手会偏、对准时会回修，至少有一个轴会出现反向的一小步。
+    // 这一条与上面的速度上限互补：一个要求"别太快"，一个要求"别太直"。
+    $flipX = $flipY = 0;
+    for ($i = 2; $i < count($pts); $i++) {
+        $dx1 = $pts[$i - 1][0] - $pts[$i - 2][0];
+        $dx2 = $pts[$i][0] - $pts[$i - 1][0];
+        $dy1 = $pts[$i - 1][1] - $pts[$i - 2][1];
+        $dy2 = $pts[$i][1] - $pts[$i - 1][1];
+        if ($dx1 * $dx2 < -0.5) { $flipX++; }
+        if ($dy1 * $dy2 < -0.5) { $flipY++; }
+    }
+    if ($flipX === 0 && $flipY === 0) {
+        return ['ok' => false, 'reason' => 'STRAIGHT_LINE'];
     }
 
     // --- every piece, in its own gap -------------------------------------
