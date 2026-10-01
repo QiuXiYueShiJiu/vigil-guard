@@ -1,0 +1,31 @@
+# 敏感文件规则接线校验器（只读 HTTP 接口）
+#
+#   sudo cp vigil-exposure-check.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now vigil-exposure-check
+#
+# 默认只监听本机，并以低权限运行。若要对外提供，请改 --bind 并加 --token，
+# 同时放在带 TLS 的反向代理后面。
+[Unit]
+Description=vigil exposure wiring check (read-only HTTP API)
+Documentation=https://github.com/QiuXiYueShiJiu/vigil-guard
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+# 只读地看一眼 nginx 配置，不需要任何写权限
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+# 需要读 nginx 配置目录；按你的发行版调整
+ReadOnlyPaths=/etc/nginx /www/server/panel/vhost/nginx /usr/local/lib/vigil
+Environment=PYTHONPATH=/usr/local/lib/vigil
+ExecStart=/usr/bin/python3 /opt/vigil-tools/exposure-check/exposure_check.py --serve --bind 127.0.0.1 --port 8791
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

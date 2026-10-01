@@ -7,6 +7,7 @@
 | [MAIL.md](MAIL.md) | 告警通道：8 类渠道、21 个 SMTP 预设、自建域名、额度与降级 |
 | [GATE.md](GATE.md) | 登录界面防护：宝塔面板与独立登录页，含「接入已有配置」 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 代码结构、进程模型、为什么零依赖 |
+| [../tools/exposure-check/README.md](../tools/exposure-check/README.md) | 独立校验器：检查 `^~` 前缀里规则还在不在，可当网页后端调用 |
 | [FAQ.md](FAQ.md) | 常见问题：误封了怎么办、怎么只装一部分、怎么回滚 |
 
 想快速上手直接看仓库根的 `README.md`；这里放的是分主题的细节。

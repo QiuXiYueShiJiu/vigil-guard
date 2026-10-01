@@ -4,6 +4,41 @@
 
 ---
 
+## v1.0.2 — 2026-10-01
+
+把「敏感文件规则接线」的校验**单独抠出来**，放在 `tools/exposure-check/`，
+方便挂到自己的面板/仪表盘页面上点一下就看。
+
+### 新增
+
+- `tools/exposure-check/exposure_check.py` —— **只读**校验器，两种用法：
+  - 命令行：`./exposure_check.py [--json] [--root DIR]`
+  - 网页后端：`./exposure_check.py --serve --port 8791 [--token 密钥]`
+- `tools/exposure-check/view.html` —— 可直接放到已有仪表盘上的页面（`fetch` 相对路径，
+  同源部署无需改动）。
+- `tools/exposure-check/README.md` —— 用法、HTTP 接口说明、接子路径的 nginx 片段、
+  systemd 常驻方式、以及**安全须知**（默认只监听本机；对外必须带 token + TLS）。
+- `tools/exposure-check/vigil-exposure-check.service` —— 低权限常驻单元示例
+  （`ProtectSystem=strict`、只读挂载、`NoNewPrivileges`）。
+
+### 设计取舍
+
+校验逻辑**不复制**一份进来，而是调用 `vigil.guards.exposure`：两份实现一定会漂移，
+而「扫描说干净、服务器却在往外发」正是这个项目反复踩过的坑。找不到 vigil 时它明确报错
+并告知安装方式，而不是自己猜一套。
+
+### 接口
+
+| 路径 | 说明 |
+|---|---|
+| `GET /` | 自带页面 |
+| `GET /api/check` | 校验结果（JSON） |
+| `GET /healthz` | 存活探测 |
+
+`ok:false` 时 `holes` 会指出是哪个配置文件的哪个前缀未覆盖。
+
+---
+
 ## v1.0.1 — 2026-10-01
 
 修复一个**会让防护静默失效**的漏洞。

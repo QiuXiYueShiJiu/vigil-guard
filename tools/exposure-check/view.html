@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>敏感文件规则接线校验</title>
+<!--
+  独立页面：把它放到你已有的仪表盘上，改下面的 API 地址即可。
+  如果页面与接口不同源，启动服务时要加 --allow-origin <本页来源>。
+
+    ./exposure_check.py --serve --port 8791 --allow-origin https://你的面板域名
+-->
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; padding:24px; font:15px/1.6 -apple-system,BlinkMacSystemFont,
+         "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:#0e1420; color:#e6eefb; }
+  h1 { margin:0 0 4px; font-size:18px; }
+  p.sub { margin:0 0 16px; color:#8fa2bf; font-size:13px; }
+  button { padding:9px 16px; font-size:14px; font-weight:600; color:#fff; border:0;
+           border-radius:9px; cursor:pointer;
+           background:linear-gradient(135deg,#4f9dff,#7d6bff); }
+  button:disabled { background:#33405a; cursor:progress; }
+  .ok { color:#7fe3a8; } .bad { color:#ff8f9a; }
+  table { width:100%; border-collapse:collapse; margin-top:16px; font-size:14px; }
+  th,td { text-align:left; padding:9px 10px; border-bottom:1px solid #1e2a44; }
+  th { color:#8fa2bf; font-weight:600; font-size:12.5px; }
+  code { font-family:ui-monospace,Consolas,monospace; color:#b3a6ff; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:20px; font-size:12px; }
+  .b-ok { background:#12301f; color:#7fe3a8; }
+  .b-bad { background:#3a1620; color:#ff8f9a; }
+</style>
+</head>
+<body>
+<h1>敏感文件规则接线校验</h1>
+<p class="sub">检查每个会读磁盘的 <code>^~</code> 前缀里，敏感文件拒绝规则是否还挂着。只读。</p>
+<button id="go">开始校验</button>
+<span id="state" class="sub"></span>
+<div id="out"></div>
+
+<script>
+// 同源部署时保持相对路径即可；跨源时改成完整地址。
+var API = 'api/check';
+var TOKEN = '';   // 若服务端设了 --token，在这里填，或用下面的输入框
+
+async function run() {
+  var go = document.getElementById('go'),
+      st = document.getElementById('state'),
+      out = document.getElementById('out');
+  go.disabled = true; st.textContent = '校验中…'; out.textContent = '';
+  try {
+    var headers = { 'Accept': 'application/json' };
+    if (TOKEN) { headers['X-Vigil-Token'] = TOKEN; }
+    var r = await fetch(API, { headers: headers });
+    if (r.status === 401) { throw new Error('未授权：服务端启用了 token'); }
+    var d = await r.json();
+    st.innerHTML = d.ok
+      ? '<span class="ok">✔ ' + d.summary + '</span>'
+      : '<span class="bad">✘ ' + d.summary + '</span>';
+    var h = '<table><tr><th>站点配置</th><th>规则文件</th><th>^~ 前缀</th><th>状态</th></tr>';
+    (d.sites || []).forEach(function (s) {
+      if (s.error) {
+        h += '<tr><td>' + s.conf + '</td><td colspan="3" class="bad">' + s.error + '</td></tr>';
+        return;
+      }
+      var prefixes = (s.file_serving_prefixes || []).map(function (p) {
+        return '<code>' + p + '</code>'; }).join(' ') || '—';
+      h += '<tr><td>' + s.conf + '</td>'
+         + '<td>' + (s.rules_file ? '在' : '<span class="bad">缺</span>') + '</td>'
+         + '<td>' + prefixes + '</td>'
+         + '<td>' + (s.ok ? '<span class="badge b-ok">已挂规则</span>'
+                          : '<span class="badge b-bad">未覆盖</span>') + '</td></tr>';
+    });
+    h += '</table>';
+    if (!d.ok && d.fix) { h += '<p class="sub">修复：<code>' + d.fix + '</code></p>'; }
+    out.innerHTML = h;
+  } catch (e) {
+    st.innerHTML = '<span class="bad">请求失败：' + e.message + '</span>';
+  } finally {
+    go.disabled = false;
+  }
+}
+document.getElementById('go').onclick = run;
+run();
+</script>
+</body>
+</html>

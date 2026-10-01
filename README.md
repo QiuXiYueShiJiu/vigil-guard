@@ -228,6 +228,7 @@ vigil-guard/
 ├── docs/                 # 安装、配置、架构、网关、告警、常见问题
 ├── examples/             # 配置示例
 ├── scripts/              # 开发检查、打包、画面预览
+├── tools/                # 独立小工具（含可被网页直接调用的校验接口）
 ├── assets/               # 介绍图
 ├── .github/              # CI、Issue / PR 模板
 ├── CHANGELOG.md          # 更新记录
