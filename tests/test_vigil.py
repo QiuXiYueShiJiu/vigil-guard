@@ -1248,6 +1248,134 @@ class TestEveryPairOfPiecesIsAccepted(unittest.TestCase):
                       "页面的托盘判定与服务端不一致")
 
 
+class TestExposureWiringIsSelfHealing(unittest.TestCase):
+    """The include can be removed by a third party; the program must notice.
+
+    Measured on the development host: the `^~ /function/` include vanished
+    from a panel-owned vhost file (rewritten by something other than this
+    program), and the subtree went back to serving a real 3 KB `.gitignore`.
+    The rules file was present the whole time, so any check that only looked
+    at the file reported OK while the hole was open. Hence two halves: a
+    repair that `vigil update` runs, and a health check that says so.
+    """
+
+    CONF = """server {
+    location ~* "\\.(bak|old)$" { return 404; }
+    location ^~ /app/ {
+        try_files $uri $uri/ /app/index.html;
+    }
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:9100/;
+    }
+    location ^~ /old/ { return 404; }
+    location = /exact { root /srv/www; }
+}
+"""
+
+    def test_it_adds_the_include_to_a_file_serving_prefix(self):
+        from vigil.guards import exposure
+        new, added = exposure.repair_prefixes(self.CONF, "/etc/nginx/x.conf")
+        self.assertEqual(["/app/"], added)
+        self.assertIn("include /etc/nginx/zz-exposure-deny.conf;", new)
+        # It went inside the block, not after it.
+        block = new.split("location ^~ /app/ {", 1)[1].split("}", 1)[0]
+        self.assertIn("zz-exposure-deny", block)
+
+    def test_it_leaves_proxy_and_return_prefixes_alone(self):
+        """A proxy hands the request to a backend; a `return` serves nothing."""
+        from vigil.guards import exposure
+        _new, added = exposure.repair_prefixes(self.CONF, "/etc/nginx/x.conf")
+        self.assertNotIn("/api/", added)
+        self.assertNotIn("/old/", added)
+        self.assertNotIn("/exact", added)
+
+    def test_it_is_idempotent(self):
+        """Running it twice must not add a second include."""
+        from vigil.guards import exposure
+        once, added1 = exposure.repair_prefixes(self.CONF, "/etc/nginx/x.conf")
+        twice, added2 = exposure.repair_prefixes(once, "/etc/nginx/x.conf")
+        self.assertEqual(once, twice)
+        self.assertEqual([], added2)
+        self.assertEqual(1, twice.count("zz-exposure-deny"))
+
+    def test_it_only_touches_sites_it_installed_rules_into(self):
+        """No rules file in that directory means this was never our site."""
+        import tempfile
+        from vigil.guards import exposure
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        conf = tmp / "site.conf"
+        conf.write_text(self.CONF, encoding="utf-8")
+        res = exposure.repair_sites(root=str(tmp))
+        self.assertEqual([], res["written"], "没有规则文件却动了配置")
+        self.assertEqual(self.CONF, conf.read_text(encoding="utf-8"))
+
+    def test_a_deleted_rules_file_is_rebuilt(self):
+        """The sibling gap: the rules file itself can disappear.
+
+        A panel wiping "unrecognised" files in its extension directory would
+        remove the rules *and* leave the include pointing at nothing -- which
+        makes nginx refuse to load, i.e. the site goes down. So a managed
+        directory (one this program already writes into) gets the files back.
+        """
+        import tempfile
+        from vigil.guards import exposure
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        # Managed, but the exposure rules are gone.
+        (tmp / "vigil-deny.conf").write_text("x", encoding="utf-8")
+        conf = tmp / "site.conf"
+        conf.write_text(self.CONF, encoding="utf-8")
+
+        res = exposure.repair_sites(root=str(tmp))
+        self.assertEqual(2, len(res["restored"]), res)
+        self.assertTrue((tmp / "zz-exposure-deny.conf").is_file())
+        self.assertIn("location ~*", (tmp / "zz-exposure-deny.conf").read_text(
+            encoding="utf-8"))
+        self.assertIn("zz-exposure-deny", conf.read_text(encoding="utf-8"))
+
+    def test_an_unmanaged_directory_is_left_alone(self):
+        """No trace of this program in the directory means hands off."""
+        import tempfile
+        from vigil.guards import exposure
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        conf = tmp / "site.conf"
+        conf.write_text(self.CONF, encoding="utf-8")
+        res = exposure.repair_sites(root=str(tmp))
+        self.assertEqual([], res["restored"])
+        self.assertEqual([], res["written"])
+        self.assertEqual(self.CONF, conf.read_text(encoding="utf-8"))
+
+    def test_the_health_check_reports_the_hole_and_its_absence(self):
+        """CRIT while the subtree is unprotected, OK once it is wired in."""
+        import tempfile
+        from vigil.guards import exposure
+        from vigil.guards.checks import base as cbase
+        cbase.load_all()
+        check = cbase.get("exposure_prefix_rules")
+        self.assertIsNotNone(check, "健康检查项没有注册")
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        (tmp / "zz-exposure-deny.conf").write_text("x", encoding="utf-8")
+        conf = tmp / "site.conf"
+        conf.write_text(self.CONF, encoding="utf-8")
+
+        real = exposure.site_confs
+        exposure.site_confs = lambda root=None: [conf]
+        try:
+            res = check().run(None)
+            self.assertEqual("CRIT", res.status, res.detail)
+            self.assertIn("/app/", res.detail)
+            # Now let the repair run, and it must come back clean.
+            exposure.repair_sites(root=str(tmp))
+            res2 = check().run(None)
+            self.assertEqual("OK", res2.status, res2.detail)
+        finally:
+            exposure.site_confs = real
+
+
 class TestPieceCountWording(unittest.TestCase):
     """The page said "两块拼片" while showing three pieces."""
 

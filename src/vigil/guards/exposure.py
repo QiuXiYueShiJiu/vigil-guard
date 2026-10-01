@@ -332,6 +332,127 @@ def prefix_bypasses(conf_text: str, include_marks=("zz-exposure-deny",)) -> list
     return out
 
 
+def include_line(conf_path: str) -> str:
+    """The `include` statement that re-applies the rules inside a `^~` prefix."""
+    ext = Path(conf_path).parent
+    return "include %s/zz-exposure-deny.conf;" % ext
+
+
+def repair_prefixes(text: str, conf_path: str) -> tuple:
+    """Put the ruleset back inside every file-serving `^~` prefix.
+
+    Returns ``(new_text, added_prefixes)``.
+
+    Why this exists: the include has to live *inside* the site's own
+    configuration, and on a panel-managed host that file belongs to the panel.
+    Measured on the development host, the include silently disappeared from
+    `zz-function.conf` -- the file was rewritten by something other than this
+    program -- which re-opened a hole where a real 3 KB `.gitignore` and any
+    future `.env` under that prefix became publicly downloadable. A guard that
+    can be removed by a third party without anyone noticing is not a guard, so
+    the repair is automatic and the health check reports when it was needed.
+    """
+    if "zz-exposure-deny" in text:
+        return text, []
+    line = include_line(conf_path)
+    added = []
+    out, pos = [], 0
+    for m in re.finditer(r"^[ \t]*location\s+\^~\s*(\S+?)\s*\{", text, re.M):
+        prefix = m.group(1)
+        # Only file-serving prefixes: a `return 404` block cannot hand out a
+        # file, and adding an include to it would be noise.
+        close = text.find("}", m.end())
+        body = text[m.end():close]
+        if "return 404" in body and "try_files" not in body \
+                and "proxy_pass" not in body:
+            continue
+        if "proxy_pass" in body:
+            continue
+        out.append(text[pos:m.end()])
+        out.append("\n        # 由 vigil 补回：`^~` 会跳过同级正则规则。\n"
+                   "        " + line + "\n")
+        pos = m.end()
+        added.append(prefix)
+    out.append(text[pos:])
+    return "".join(out), added
+
+
+def site_confs(root=None) -> list:
+    """Per-site nginx config files that may carry a `^~` prefix."""
+    roots = [Path(root)] if root else [
+        Path("/www/server/panel/vhost/nginx/extension"),
+        Path("/etc/nginx/conf.d"),
+        Path("/etc/nginx/sites-enabled"),
+    ]
+    out = []
+    for base in roots:
+        if not base.exists():
+            continue
+        for entry in sorted(base.iterdir()):
+            if entry.is_file() and entry.suffix == ".conf":
+                out.append(entry)
+            elif entry.is_dir():
+                out.extend(sorted(entry.glob("*.conf")))
+    return out
+
+
+def repair_sites(root=None) -> dict:
+    """Re-apply the include everywhere it is missing, then prove nginx loads.
+
+    Only touches a directory that already contains `zz-exposure-deny.conf`:
+    if the file is not there, this installation never put rules in that site,
+    and adding an include would break a config that does not have the target.
+    """
+    from ..gates import shield as _shield
+
+    #: Files this program writes into a site's extension directory. If any of
+    #: them is present, the directory is one we manage -- which is what makes
+    #: it safe to also (re)create the rules files there. A directory with none
+    #: of them has never been ours, and writing an include into its config
+    #: would point at a file that does not exist, breaking nginx.
+    managed_marks = ("zz-exposure-deny.conf", "vigil-deny.conf",
+                     "vigil-hygiene.conf", "vigil-lure.conf", "vigil-decoy.conf")
+
+    touched, added, problems, restored = [], [], [], []
+    for conf in site_confs(root):
+        ext = conf.parent
+        if not (ext / "zz-exposure-deny.conf").is_file():
+            if not any((ext / m).is_file() for m in managed_marks):
+                continue
+            # The rules file itself is gone -- a wiped extension directory, or
+            # a panel that cleaned up files it did not recognise. Recreate it,
+            # otherwise the include below would reference nothing and nginx
+            # would refuse to load at all.
+            for name, content in (("zz-exposure-deny.conf",
+                                   render_deny_snippet()),
+                                  ("zz-exposure-deny-dirs.conf",
+                                   render_directory_snippet())):
+                (ext / name).write_text(content, encoding="utf-8")
+                restored.append(str(ext / name))
+        try:
+            text = conf.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            problems.append("%s：%s" % (conf, exc))
+            continue
+        if "location ^~" not in text:
+            continue
+        new, added_here = repair_prefixes(text, str(conf))
+        if not added_here:
+            continue
+        conf.write_text(new, encoding="utf-8")
+        touched.append(str(conf))
+        added.extend(added_here)
+    if not touched and not restored:
+        return {"ok": True, "written": [], "prefixes": [], "restored": [],
+                "problems": problems, "reloaded": ""}
+    ok, how = _shield._reload_verified()
+    if not ok:
+        problems.append("nginx 拒绝新配置：%s" % how)
+    return {"ok": ok, "written": touched, "prefixes": added,
+            "restored": restored, "problems": problems,
+            "reloaded": how if ok else ""}
+
+
 def audit_conf(conf_text: str) -> dict:
     """Everything worth reporting about one vhost's exposure posture."""
     bypasses = prefix_bypasses(conf_text)

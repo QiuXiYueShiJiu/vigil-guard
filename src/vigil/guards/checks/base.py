@@ -248,7 +248,7 @@ def load_all() -> None:
     until the worst possible moment and makes the check set depend on
     filesystem ordering.
     """
-    from . import (integrity, malware, network, ops, process,  # noqa: F401
-                   resource, security, selfcheck)
-    _ = (integrity, malware, network, ops, process, resource, security,
-         selfcheck)
+    from . import (exposure, integrity, malware, network, ops,  # noqa: F401
+                   process, resource, security, selfcheck)
+    _ = (exposure, integrity, malware, network, ops, process, resource,
+         security, selfcheck)

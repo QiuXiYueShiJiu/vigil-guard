@@ -94,6 +94,7 @@ def cmd_update(args) -> int:
     _refresh_shield(args.dry_run)
     _refresh_hygiene(args.dry_run)
     _refresh_lure(args.dry_run)
+    _refresh_exposure(args.dry_run)
 
     # -- 5b. captcha playground -------------------------------------------
     try:
@@ -275,6 +276,37 @@ def _refresh_gates(cfg, dry_run: bool) -> list:
     if refreshed and not dry_run:
         ui.success("已用新模板重新生成 %d 个登录网关" % len(refreshed))
     return refreshed
+
+
+
+def _refresh_exposure(dry_run: bool) -> None:
+    """Put the sensitive-file rules back inside every `^~` prefix.
+
+    The ruleset itself is generated into each site's extension directory, but
+    the statement that *applies* it inside a `^~` prefix has to live in the
+    site's own config -- and on a panel-managed host that file belongs to the
+    panel. Measured on the development host, the include silently disappeared
+    and the subtree went back to serving files it should refuse (a real 3 KB
+    `.gitignore` became downloadable again). An upgrade is the one moment this
+    program is already rewriting generated files, so it re-asserts the wiring
+    here too, and `vigil health` reports whenever it had to.
+    """
+    from ..guards import exposure
+    if dry_run:
+        ui.note("预演：将补回 `^~` 前缀里的敏感文件拒绝规则")
+        return
+    try:
+        res = exposure.repair_sites()
+    except Exception as exc:                           # noqa: BLE001
+        ui.warning("敏感文件规则接线检查失败：%s" % exc)
+        return
+    for path in res.get("restored", []):
+        ui.bullet("已重建被删掉的拒绝规则文件：%s" % path)
+    for path in res["written"]:
+        ui.bullet("已补回拒绝规则：%s（前缀 %s）"
+                  % (path, "、".join(res["prefixes"])))
+    for problem in res["problems"]:
+        ui.warning(problem)
 
 
 def _refresh_shield(dry_run: bool) -> None:
