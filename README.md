@@ -4,6 +4,12 @@
 
 # vigil-guard
 
+[![CI](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776ab.svg)](https://www.python.org/)
+[![No dependencies](https://img.shields.io/badge/dependencies-none-success.svg)](#技术栈与参考文献)
+[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-333.svg)](#环境要求)
+
 > ## ⚠️ 声明
 >
 > **这是由 dsh 生成的用于 Linux 服务器防御的项目，只是一个小玩具，不能代替专业安全工具，
@@ -21,10 +27,27 @@
 - 所有改动写入前先验证（`nginx -t` 等），失败自动回滚
 - 面向小机器：单核 1 GB 内存也能跑
 
+### 它适合谁
+
+- 只有一台小 VPS，想给自己加一道**兜底**的人
+- 想给面板/登录页加一道人机验证，又不想上重型方案
+- 想知道「我这台机器上有没有能被公网直接下载的敏感文件」的人
+- 想手上有套**能自己验证有没有在工作**的巡检
+
+### 它不适合谁
+
+- 需要合规审计、日志留存、集中管控的生产环境 —— 请用成熟方案
+- 想用它替代 WAF / EDR / SIEM —— 它不打算做那些
+- 不愿意配白名单、也不看告警的人 —— 那样它只会给你添麻烦
+
+> 它不与你已有的安全措施冲突。已经有 fail2ban / CrowdSec / 云安全组的，完全可以只取本项目的
+> 闸门与暴露扫描，其余关掉。
+
 ---
 
 ## 目录
 
+- [它适合谁](#它适合谁)
 - [它能做什么](#它能做什么)
 - [环境要求](#环境要求)
 - [安装](#安装)
@@ -59,6 +82,26 @@
 
 > 登录闸门的人机验证是**拼图 + 读图问答**的组合，答案只在服务端；图片默认内联进页面，
 > 不依赖任何后续请求，因此不会出现「资源被拦导致整页空白」。
+
+### 重点能力多讲两句
+
+**敏感文件暴露扫描（`vigil exposure`）** —— 这个能力来自一个真实教训：手写的后缀黑名单
+（`bak|old|orig|…`）看起来周全，却挡不住 `config.php.bak-20260930-215427` 这类**带时间戳**的备份，
+也挡不住 `index.htmlold` 这种**粘在一起的双扩展名**。所以它改成按**形状**匹配：轮转编号、
+时间戳尾巴、编辑器残留、点文件。并且**扫描器与 nginx 规则共用同一份定义** ——
+否则会出现「扫描说干净、服务器却在往外发」这种最糟的情况。
+
+**登录闸门（`vigil gate`）** —— 挑战一次性、与客户端绑定、渐进封禁，且**两个失败预算分开**：
+拼图失败与密码输错不共用额度（打错密码不该把人锁在验证码外面）。失败文案不区分是位置错还是
+题答错，避免让人把两个因素拆开猜。
+
+**请求卫生（`vigil hygiene`）** —— 在 nginx 解析阶段就拒掉超长请求行与 Host、非白名单方法与
+畸形请求，检查挂在**原始** `$request_uri` 上：nginx 在匹配 location 之前就已经解码并归一化，
+写在 `$uri` 上判不出探测。
+
+**发布前自检（`vigil audit-source`）** —— 见 [CONTRIBUTING.md](CONTRIBUTING.md#️-最重要的一条规矩不要提交任何真实主机信息)。
+它扫描**所有会被打包发布的文件**（源码、测试、文档、示例），因为一份只看 `src/` 的守卫
+等于没在守。测试套件跑的是同一份代码。
 
 ---
 
@@ -97,6 +140,8 @@ sudo vigil doctor      # 环境自检：这台机器支持哪些能力
 sudo vigil selftest    # 安装自检：装好的东西真的在工作吗
 sudo vigil status      # 一眼看完当前状态
 ```
+
+<img src="assets/terminal.svg" alt="示例输出" width="100%">
 
 ---
 
@@ -179,11 +224,15 @@ vigil-guard/
 │   ├── guards/           # 各防御能力（threat / hygiene / exposure / decoy …）
 │   ├── gates/            # 登录闸门与 nginx 片段生成
 │   └── mail/             # 告警通道（provider 可插拔）
-├── tests/                # 测试套件（含源码纯净度守卫）
-├── docs/                 # 安装、配置、架构、网关、告警文档
+├── tests/                # 测试套件（394 项，含源码纯净度守卫）
+├── docs/                 # 安装、配置、架构、网关、告警、常见问题
 ├── examples/             # 配置示例
 ├── scripts/              # 开发检查、打包、画面预览
-└── assets/               # 介绍图
+├── assets/               # 介绍图
+├── .github/              # CI、Issue / PR 模板
+├── CHANGELOG.md          # 更新记录
+├── CONTRIBUTING.md       # 贡献指南（含「不得提交真实主机信息」的规矩）
+└── SECURITY.md           # 安全策略与已知取舍
 ```
 
 ---
@@ -221,6 +270,9 @@ vigil-guard/
 - **许可证**：[MIT](LICENSE)
 - **贡献者**：[@QiuXiYueShiJiu](https://github.com/QiuXiYueShiJiu)
 - **更新记录**：[CHANGELOG.md](CHANGELOG.md)
+- **常见问题**：[docs/FAQ.md](docs/FAQ.md)
+- **贡献指南**：[CONTRIBUTING.md](CONTRIBUTING.md)
+- **安全策略**：[SECURITY.md](SECURITY.md)
 - **免责声明**：[DISCLAIMER.md](DISCLAIMER.md)
 
 欢迎提 Issue 与 PR。因为这是一个辅助性质的小工具，**请优先报告「误封」与「加固后服务不可用」

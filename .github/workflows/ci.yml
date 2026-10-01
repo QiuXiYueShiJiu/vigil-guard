@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: 测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.8", "3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 字节码编译检查
+        run: python -m compileall -q src/vigil
+
+      - name: 安装脚本语法检查
+        run: bash -n install.sh
+
+      - name: 安装脚本依赖探测（不修改系统）
+        run: bash install.sh --check
+
+      - name: 测试套件
+        run: python -m unittest tests.test_vigil 2>&1 | tail -30
+
+      - name: 发布前自检（随包文件不得含某一台机器的信息）
+        run: PYTHONPATH=src python -m vigil.cli audit-source

@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1180 696" width="1180" height="696" role="img" aria-label="vigil 终端演示">
+  <defs>
+    <linearGradient id="tb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#161d2c"/><stop offset="100%" stop-color="#0e1420"/>
+    </linearGradient>
+  </defs>
+  <rect width="1180" height="696" rx="14" fill="url(#tb)" stroke="#243147"/>
+  <rect width="1180" height="44" rx="14" fill="#141b29"/>
+  <rect y="30" width="1180" height="14" fill="#141b29"/>
+  <circle cx="26" cy="22" r="7" fill="#ff5f57"/>
+  <circle cx="50" cy="22" r="7" fill="#febc2e"/>
+  <circle cx="74" cy="22" r="7" fill="#28c840"/>
+  <text x="100" y="28" font-family="ui-monospace,Consolas,monospace" font-size="13" fill="#6b7f9e">vigil — 示例输出（地址与域名均为文档示例）</text>
+  <g font-family="ui-monospace,SFMono-Regular,Consolas,'PingFang SC','Microsoft YaHei',monospace" font-size="14.5">
+    <text x="34" y="96" fill="#7fe3a8" font-weight="700">$ vigil status</text>
+    <text x="34" y="124" fill="#c9d4e6"></text>
+    <text x="34" y="152" fill="#e6eefb" font-weight="700">vigil 1.0.0   单机防御守护程序</text>
+    <text x="34" y="180" fill="#c9d4e6"></text>
+    <text x="34" y="208" fill="#8fa2bf" font-weight="700">▌ 防护能力</text>
+    <text x="34" y="236" fill="#c9d4e6">  请求卫生        已生效（请求行上限 4096 字节）</text>
+    <text x="34" y="264" fill="#c9d4e6">  Web 层防护      已生效（拦截 41 类扫描器 UA）</text>
+    <text x="34" y="292" fill="#c9d4e6">  登录闸门        已生效（面板入口 / 独立登录页）</text>
+    <text x="34" y="320" fill="#c9d4e6">  实时风控        运行中（当前封禁 12，白名单 3）</text>
+    <text x="34" y="348" fill="#c9d4e6">  内核审计        已加载 14 条规则</text>
+    <text x="34" y="376" fill="#c9d4e6"></text>
+    <text x="34" y="404" fill="#8fa2bf" font-weight="700">▌ 本次巡检</text>
+    <text x="34" y="432" fill="#7fe3a8">  ✔ 39 项检查全部正常</text>
+    <text x="34" y="460" fill="#7fe3a8">  ✔ 凭据文件权限 0600</text>
+    <text x="34" y="488" fill="#7fe3a8">  ✔ 程序自身与生成物均未改动</text>
+    <text x="34" y="516" fill="#c9d4e6"></text>
+    <text x="34" y="544" fill="#7fe3a8" font-weight="700">$ vigil audit-source</text>
+    <text x="34" y="572" fill="#c9d4e6"></text>
+    <text x="34" y="600" fill="#e6eefb">发布前自检 · 随包文件里有没有属于本机的信息</text>
+    <text x="34" y="628" fill="#c9d4e6">  检查文件数    124</text>
+    <text x="34" y="656" fill="#7fe3a8">  ✔ 没有发现宿主机信息，可以发布</text>
+  </g>
+</svg>
