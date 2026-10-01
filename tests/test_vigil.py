@@ -1685,7 +1685,18 @@ class TestSensitiveFileExposure(unittest.TestCase):
                              "有 location 没有 return")
 
     def test_the_live_config_is_not_left_with_a_hole(self):
-        """If this host has the site, its `^~` prefix must include the rules."""
+        """Operator-only: is *this* machine's `^~` prefix protected?
+
+        Skipped unless VIGIL_LIVE_AUDIT=1. It inspects whatever nginx is
+        installed on the machine running the tests, so in a shipped suite it
+        would either skip or -- on a host that legitimately has a `^~` prefix
+        without our rules -- fail for a reason that is not a bug in the code.
+        The product check for this is `vigil exposure status`, which is what
+        an operator should actually run; this is here for the development host.
+        """
+        import os
+        if os.environ.get("VIGIL_LIVE_AUDIT") != "1":
+            self.skipTest("operator-only check; set VIGIL_LIVE_AUDIT=1 to run")
         from vigil.guards import exposure
         # Discovered, not hardcoded: naming this operator's own vhost
         # directory leaked the address and made the test meaningless anywhere
