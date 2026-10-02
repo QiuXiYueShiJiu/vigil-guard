@@ -3302,7 +3302,7 @@ function vigil_new_slider(string $stateDir, array $policy,
 
     $shapeIdx = random_int(0, count($shapeNames) - 1);
     $colorIdx = random_int(0, count($colorNames) - 1);
-    $wantCount = random_int(1, 3);
+    $wantCount = random_int(1, 4);
     $shape = $shapeNames[$shapeIdx];
     $colour = $colorNames[$colorIdx];
     $rgb = $paletteRgb[$colour];
@@ -3372,6 +3372,13 @@ function vigil_new_slider(string $stateDir, array $policy,
     // cluster far more often than intuition suggests. Columns guarantee the
     // spread the request asked for ("散落") while the height stays random, so
     // the layout still differs every time.
+    // 每个图形一种颜色，相邻尽量不同。
+    //
+    // 原先所有图形共用挑战级的一种颜色：机器只要分割出"一种颜色的块"就够，
+    // 而"最左边那个是什么颜色"这类问题根本没意义。现在每个图形各自一色，
+    // 机器必须逐个分割并识别颜色与位置，人还是看一眼就答。
+    $colourKeys = array_keys($paletteRgb);
+    $shapeColours = [];
     $colW = (int)($w / max(1, $wantCount));
     for ($i = 0; $i < $wantCount; $i++) {
         $r = $baseR + random_int(-3, 5);
@@ -3383,12 +3390,22 @@ function vigil_new_slider(string $stateDir, array $policy,
         $cy = random_int($r + 6, max($r + 6, $h - $r - 6));
         $placed[] = [$cx, $cy, $r, $r];
         $rot = random_int(0, 628) / 100.0;
-        $body = imagecolorallocatealpha($layer, $rgb[0], $rgb[1], $rgb[2],
+        // 尽量和上一个不同色；只有一种颜色可选时保持原样
+        $pick = $colourKeys[random_int(0, count($colourKeys) - 1)];
+        if ($i > 0 && count($colourKeys) > 1) {
+            $guard = 0;
+            while ($pick === $shapeColours[$i - 1] && $guard++ < 8) {
+                $pick = $colourKeys[random_int(0, count($colourKeys) - 1)];
+            }
+        }
+        $shapeColours[] = $pick;
+        $sRgb = $paletteRgb[$pick];
+        $body = imagecolorallocatealpha($layer, $sRgb[0], $sRgb[1], $sRgb[2],
                                         $bodyAlpha);
         $edge = imagecolorallocatealpha($layer,
-                                        (int)($rgb[0] * 0.30),
-                                        (int)($rgb[1] * 0.30),
-                                        (int)($rgb[2] * 0.30), $edgeAlpha);
+                                        (int)($sRgb[0] * 0.30),
+                                        (int)($sRgb[1] * 0.30),
+                                        (int)($sRgb[2] * 0.30), $edgeAlpha);
         // 最外层一圈几乎不透明：无论压在什么背景上，图形的边界都在。
         $ring = imagecolorallocatealpha($layer, 255, 255, 255, 40);
         if ($shape === '圆形') {
@@ -3405,32 +3422,80 @@ function vigil_new_slider(string $stateDir, array $policy,
         imagefilledpolygon($layer, $pts, $body);
     }
 
-    // 出题：三种问法随机选一种，全部只需要"看图"就能回答。
-    $askKind = random_int(0, 2);
+    // 出题：五种问法随机选一种。四个选项，猜中率从 1/3 降到 1/4。
+    //
+    // 选型的标准只有一条：**人一眼就能答，机器必须真去分割图形**。
+    //   · 数数量        —— 要数清有几个（图形已保证互不重叠）
+    //   · 数某个颜色     —— 要按颜色挑出来再数
+    //   · 最左/最上是什么颜色 —— 要定位 + 识别颜色，两步推理
+    //   · 图形本身是什么形状 / 什么颜色
+    //
+    // 这些都不依赖"你怎么拖"，所以对真人是零成本；而它们才是真正挡住脚本的地方 ——
+    // 脚本必须真的读懂画面，而不是把轨迹装成人的样子（后者成本几乎为零）。
+    $usedColours = array_values(array_unique($shapeColours));
+    $askColour = in_array($colour, $usedColours, true)
+        ? $colour : $shapeColours[random_int(0, count($shapeColours) - 1)];
+    if ($wantCount === 1) {
+        $askKind = random_int(0, 1) === 0 ? 2 : 3;   // 只有一个图形时不做位置题
+    } else {
+        $askKind = random_int(0, 4);
+    }
+    $distract = static function (array $pool, $right, int $want) {
+        $pool = array_values(array_diff($pool, [$right]));
+        shuffle($pool);
+        return array_slice($pool, 0, $want);
+    };
+    $countOpts = static function ($right) {
+        $opts = ['1 个', '2 个', '3 个', '4 个'];
+        return [$opts, $opts[$right - 1]];
+    };
     if ($askKind === 0) {
         $qText = sprintf('图中有几个%s？', $shape);
-        $qOpts = ['1 个', '2 个', '3 个'];
-        $qAns = $wantCount - 1;
+        list($qOpts, $right) = $countOpts($wantCount);
+        $qAns = array_search($right, $qOpts, true);
     } elseif ($askKind === 1) {
-        $qText = sprintf('%s是什么颜色？', $shape);
-        $wrong = [];
-        foreach ($colorNames as $cn) {
-            if ($cn !== $colour) { $wrong[] = $cn; }
-        }
-        shuffle($wrong);
-        $qOpts = [$colour, $wrong[0], $wrong[1]];
+        $same = 0;
+        foreach ($shapeColours as $c) { if ($c === $askColour) { $same++; } }
+        $qText = sprintf('图中有几个%s的图形？', $askColour);
+        list($qOpts, $right) = $countOpts($same);
+        $qAns = array_search($right, $qOpts, true);
+    } elseif ($askKind === 2) {
+        // 最下面那个是什么颜色。
+        //
+        // 这里原本是「<形状>是什么颜色？」—— 在"所有图形同色"的年代是对的，
+        // 但颜色改成逐个独立之后就变成了**有歧义**：四个五角星四种颜色，
+        // 那句话有四个都成立的答案，真人是永远答不对的。所以改成位置限定。
+        // （这个错是我自己引入的，而且第一版机械核对没查出来 —— 它只验了
+        //  "答案是不是画里出现过的颜色"，没验"答案是否唯一"。核对条件已加严。）
+        $idx = 0;
+        foreach ($placed as $k => $pl) { if ($pl[1] > $placed[$idx][1]) { $idx = $k; } }
+        $want = $shapeColours[$idx];
+        $qText = sprintf('最下面那个%s是什么颜色？', $shape);
+        $qOpts = array_merge([$want], $distract($colorNames, $want, 3));
         shuffle($qOpts);
-        $qAns = array_search($colour, $qOpts, true);
-    } else {
+        $qAns = array_search($want, $qOpts, true);
+    } elseif ($askKind === 3) {
         $qText = '图中画的是什么形状？';
-        $wrong = [];
-        foreach ($shapeNames as $sn) {
-            if ($sn !== $shape) { $wrong[] = $sn; }
-        }
-        shuffle($wrong);
-        $qOpts = [$shape, $wrong[0], $wrong[1]];
+        $pool = $shapeNames;
+        $qOpts = array_merge([$shape], $distract($pool, $shape, 3));
         shuffle($qOpts);
         $qAns = array_search($shape, $qOpts, true);
+    } elseif ($askKind === 4) {
+        $idx = 0;
+        foreach ($placed as $k => $pl) { if ($pl[0] < $placed[$idx][0]) { $idx = $k; } }
+        $qText = sprintf('最左边那个%s是什么颜色？', $shape);
+        $want = $shapeColours[$idx];
+        $qOpts = array_merge([$want], $distract($colorNames, $want, 3));
+        shuffle($qOpts);
+        $qAns = array_search($want, $qOpts, true);
+    } else {
+        $idx = 0;
+        foreach ($placed as $k => $pl) { if ($pl[1] < $placed[$idx][1]) { $idx = $k; } }
+        $qText = sprintf('最上面那个%s是什么颜色？', $shape);
+        $want = $shapeColours[$idx];
+        $qOpts = array_merge([$want], $distract($colorNames, $want, 3));
+        shuffle($qOpts);
+        $qAns = array_search($want, $qOpts, true);
     }
     $qAns = (int)$qAns;
 
@@ -3497,6 +3562,13 @@ function vigil_new_slider(string $stateDir, array $policy,
         // to know whether "spread out" is even a meaningful expectation --
         // one shape cannot span the frame.
         'q_n'    => $wantCount,
+        // 服务端自检用：每个图形的位置与颜色。这是**答案材料**，只存在服务端
+        // 挑战文件里（页面拿到的只有题干与选项），加它是为了让自检能把
+        // 「题目」和「实际画出来的东西」对一遍 —— 出题索引写错的话，
+        // 真人是永远答不对的，而这种错误靠人是发现不了的。
+        'shapes' => [],
+        'colours' => $shapeColours,
+        'shape_name' => $shape,     // 同上：服务端自检用，页面永远拿不到
     ], JSON_UNESCAPED_SLASHES);
     // Fill the slot list in before writing. Built from the same $xs/$ys the
     // images were cut from, so the answers cannot drift apart from them.
