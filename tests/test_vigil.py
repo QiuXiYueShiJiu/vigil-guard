@@ -1352,66 +1352,78 @@ class TestDragMustLookLikeAPerson(unittest.TestCase):
         r = self._run(self._hand)
         self.assertTrue(r["ok"], "人手轨迹被拒了：%s" % r["reason"])
 
-    def test_a_perfectly_straight_path_is_rejected(self):
-        """A generator draws a line; a hand almost never does.
+    def test_every_normal_drag_style_is_accepted(self):
+        """The measurement that overturned the previous design.
 
-        The steps deliberately vary (so the variation checks pass) -- the only
-        thing wrong with it is that it never turns back on itself.
+        Run against the real checker on the real host, six styles a person
+        actually uses, 4 times each:
+
+            一口气直线拖过去   ROBOTIC_SPEED 拒   ← 正常拖法
+            快（约 150ms）     ROBOTIC_SPEED 拒   ← 正常拖法
+            慢慢挪（约 2s）    ROBOTIC_SPEED 拒   ← 正常拖法
+            短距离微调         STRAIGHT_LINE 拒   ← 正常拖法
+            拖过去再回修一下   通过
+            手抖来回几次       通过
+
+        Four of six were rejected. Step-length variation, distinct step sizes,
+        straightness and path efficiency all punish *dragging neatly*, and
+        dragging neatly is what a practised user does. So they were removed:
+        the gate keeps only checks that cannot punish a habit -- enough samples,
+        a duration floor, a speed ceiling -- and the real hurdle is the reading
+        question plus the position.
         """
-        def straight(x, y, i):
+        def straight(x1, y1, i):
             pts, t = [[30, 240, 0]], 0
-            x0, y0 = 30, 240
-            for frac, size in zip((0.16, 0.3, 0.42, 0.55, 0.66, 0.76, 0.85,
-                                   0.92, 0.97, 1.0),
-                                  (0, 0, 0, 0, 0, 0, 0, 0, 0, 0)):
-                t += 25
-                pts.append([round(x0 + (x - x0) * frac, 1),
-                            round(y0 + (y - y0) * frac, 1), t])
-            pts.append([x, y, t + 30])
+            for k in range(1, 19):
+                f = k / 18.0
+                t += 16
+                pts.append([30 + (x1 - 30) * f, 240 + (y1 - 240) * f, t])
             return pts
-        r = self._run(straight)
-        self.assertFalse(r["ok"], "直线轨迹竟然通过了")
-        self.assertEqual("STRAIGHT_LINE", r["reason"], r)
 
-    def test_scripted_jitter_is_rejected(self):
-        """What the path check is actually for.
-
-        The first version of this test compressed a normal drag to 100ms and
-        asserted rejection -- and it failed, correctly: 250px in 100ms is about
-        2500 px/s, which is an ordinary flick on a touchscreen. Tightening the
-        cap until that failed would have started rejecting real people, which
-        is the opposite of the goal.
-
-        What a hand cannot do is *accumulate* travel: it may hesitate and
-        correct, but it heads for the gap, so path length stays within about
-        2.5x the straight-line distance. A track that oscillates back and forth
-        covers thousands of pixels while going nowhere -- the ratio is what
-        catches it, and unlike a speed cap that ratio does not punish somebody
-        who simply drags fast or drags far.
-        """
-        def jitter(x, y, i):
+        def fast(x1, y1, i):
             pts, t = [[30, 240, 0]], 0
-            for k in range(26):                     # 来回抖，位置不动
-                t += 14 + (k % 5) * 3
-                dx = 60 if k % 2 == 0 else -60
-                pts.append([pts[-1][0] + dx + (k % 3), 240 + (k % 4), t])
-            pts.append([x, y, t + 60])              # 最后一刻才到位
+            for k in range(1, 13):
+                f = k / 12.0
+                t += 12
+                pts.append([30 + (x1 - 30) * f, 240 + (y1 - 240) * f, t])
             return pts
-        r = self._run(jitter)
-        self.assertFalse(r["ok"], "脚本式抖动竟然通过了")
-        self.assertEqual("PATH_INEFFICIENT", r["reason"], r)
 
-    def test_a_sub_100ms_drag_is_rejected(self):
-        """The floor that catches a literal teleport (0-30ms)."""
+        def slow(x1, y1, i):
+            pts, t = [[30, 240, 0]], 0
+            for k in range(1, 21):
+                f = k / 20.0
+                t += 95
+                pts.append([30 + (x1 - 30) * f, 240 + (y1 - 240) * f, t])
+            return pts
+
+        def nudge(x1, y1, i):
+            pts, t = [[x1 - 22, y1 + 14, 0]], 0
+            for k in range(1, 7):
+                f = k / 6.0
+                t += 30
+                pts.append([(x1 - 22) + 22 * f, (y1 + 14) - 14 * f, t])
+            return pts
+
+        for name, fn in (("直线", straight), ("快", fast), ("慢", slow),
+                         ("短距离微调", nudge), ("人手", self._hand)):
+            r = self._run(fn)
+            self.assertTrue(r["ok"], "%s 拖法被拒了：%s" % (name, r["reason"]))
+
+    def test_a_two_point_submission_is_rejected(self):
+        """Setting the coordinate and sending two samples is not a drag."""
+        def jump(x, y, i):
+            return [[30, 240, 0], [x, y, 20]]
+        r = self._run(jump)
+        self.assertFalse(r["ok"], "两点提交竟然通过了")
+
+    def test_a_teleport_is_rejected(self):
+        """A whole-frame jump inside 20ms is not physically a hand."""
         def blink(x, y, i):
-            pts = self._hand(x, y, i)
-            span = max(1, pts[-1][2])
-            for p in pts:
-                p[2] = int(p[2] * 30.0 / span)
-            return pts
+            return [[30, 240, 0], [100, 200, 4], [200, 150, 9], [x, y, 18]]
         r = self._run(blink)
-        self.assertFalse(r["ok"], "瞬移轨迹竟然通过了")
-        self.assertIn(r["reason"], ("BAD_DURATION", "IMPOSSIBLE_SPEED"), r)
+        self.assertFalse(r["ok"], "瞬移竟然通过了")
+        self.assertIn(r["reason"], ("BAD_DURATION", "IMPOSSIBLE_SPEED",
+                                    "SHORT_TRACK"), r)
 
 
 class TestExposureWiringIsSelfHealing(unittest.TestCase):

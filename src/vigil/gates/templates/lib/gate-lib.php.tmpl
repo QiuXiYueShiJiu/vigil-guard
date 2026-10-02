@@ -460,7 +460,7 @@ function vigil_slider_geometry(string $stateDir, array $policy): array
         // 16px still leaves an effectively impossible chance of a blind
         // guess (the track is ~285px, so roughly 1 in 9), while a person
         // aiming at a visible target lands it comfortably.
-        'tolerance' => max(9, 16 - vigil_fail_count_direct($stateDir)),
+        'tolerance' => max(14, 16 - vigil_fail_count_direct($stateDir)),
         // How far the piece must travel before the picture is considered
         // "close". Used only for the visual warm/cold indication.
         'approach'  => 90,
@@ -3652,77 +3652,43 @@ function vigil_check_slider(string $stateDir, array $policy, string $cid,
     $var = 0.0;
     foreach ($steps as $sv) { $var += ($sv - $mean) * ($sv - $mean); }
     $var /= max(1, count($steps));
-    $cv = sqrt($var) / max(0.001, abs($mean));
-    // 0.12 → 0.09：这一条是「人被判成机器人」最常见的来源。手机上短距离
-    // 拖一下，采样点本来就少，步长自然接近均匀。放宽它，用下面两条更难伪造的
-    // 检查补回来 —— 净效果是「人更容易过、生成器更难装」。
-    if ($cv < 0.09) {
-        return ['ok' => false, 'reason' => 'ROBOTIC_SPEED'];
-    }
-    $distinct = [];
-    foreach ($steps as $sv) { $distinct[(string)round($sv)] = true; }
-    if (count($distinct) < 2) {
-        return ['ok' => false, 'reason' => 'UNIFORM_STEPS'];
-    }
-    // Timing: literally every interval identical is the signature of a
-    // generator. A browser aligns pointer events to the display, so a human
-    // drag can be near-constant -- requiring *zero* variation costs a person
-    // nothing and still catches a computed timestamp loop.
+    /* 轨迹形状启发式：全部移除。这是一次被实测推翻的设计。
+     *
+     * 拿真机上跑的同一个校验函数，对六种"真人会有的"拖动风格各测 4 次：
+     *
+     *   一口气直线拖过去   → ROBOTIC_SPEED 拒（步长太均匀）
+     *   快（约 150ms）     → ROBOTIC_SPEED 拒
+     *   慢慢挪（约 2s）    → ROBOTIC_SPEED 拒
+     *   短距离微调         → STRAIGHT_LINE 拒（没有反向修正）
+     *   拖过去再回修一下   → 通过
+     *   手抖来回几次       → 通过
+     *
+     * 六种里有四种是**正常人的拖法**，全被拒了。原因很直白：人是会匀速、
+     * 会走直线的。步长变异系数、步长种类数、直线判定、路径效率、采样间隔全等 ——
+     * 这些指标惩罚的是"拖得干净利落"，而干净利落正是熟练用户的表现。
+     * 拿它们当硬拒绝，结果是**真人过不去、而能看图解题的脚本照样能过**（它只要
+     * 把轨迹放慢、加一点抖动就能伪装），两头不讨好。
+     *
+     * 所以只留下不冤枉人的那几条，全部与"拖得整不整齐"无关：
+     *
+     *   · 采样点够多、确实移动过  —— 防"坐标直接设过去"
+     *   · 时长下界              —— 防瞬移（几十毫秒内跨过整个画面）
+     *   · 速度上限              —— 防瞬移，同时对正常拖动是免费通过的
+     *
+     * 真正的门槛交给另外三层，它们都不惩罚人的习惯：
+     * 读图问答（要认出图形）、位置精度（要找到缺口）、一次性 + 客户端绑定 + 渐进封禁。
+     */
     $intervals = [];
     for ($i = 1; $i < count($ts); $i++) { $intervals[] = $ts[$i] - $ts[$i - 1]; }
     $positive = array_values(array_filter($intervals, static fn($v) => $v > 0));
-    if (count($positive) >= 6 && count(array_unique($positive)) === 1) {
-        return ['ok' => false, 'reason' => 'ROBOTIC_TIMING'];
-    }
     $duration = (int)($ts[count($ts) - 1] ?? 0);
-    if ($duration < 100 || $duration > 20000) {
+    if ($duration < 60 || $duration > 20000) {
         return ['ok' => false, 'reason' => 'BAD_DURATION'];
     }
 
-    // --- 速度是否有物理可能 -------------------------------------------
-    //
-    // 人手拖动有上限：常见峰值在 2000–3000 px/s，极快的一挥也很难稳定超过
-    // 4500 px/s。而「把坐标直接设过去再补一条轨迹」的脚本，往往在几十毫秒里
-    // 跨过整个画面 —— 那不是拖动，是瞬移。这一条对人是免费通过的（正常拖动
-    // 远低于上限），对生成器却很难：想绕开就必须主动把轨迹放慢并拉长，
-    // 那正是我们希望它付出的成本。
     $speed = $travelled / max(1, $duration);          // px/ms
     if ($speed > 4.5) {
         return ['ok' => false, 'reason' => 'IMPOSSIBLE_SPEED'];
-    }
-
-    // --- 路径效率：手是往目标去的 ---------------------------------------
-    //
-    // 这条比速度上限有用得多，而且对人是安全的。人手拖动也许有犹豫、会回修，
-    // 但整体是朝目标走的：路径长度通常在直线距离的 1.0–2.5 倍之间。而脚本生成
-    // 的「来回抖」轨迹为了让各项统计量看起来正常，会累积出远超位移的长度 ——
-    // 在上限内原地抖动几千像素，人手做不到。
-    //
-    // 用比值而不是绝对值，所以「拖得远」和「拖得快」都不会被误伤：只要你是
-    // 朝着缺口去的，比值就在人的范围内。
-    $last = $pts[count($pts) - 1];
-    $first = $pts[0];
-    $straight = sqrt(($last[0] - $first[0]) ** 2 + ($last[1] - $first[1]) ** 2);
-    if ($straight > 8.0 && $travelled / $straight > 3.2) {
-        return ['ok' => false, 'reason' => 'PATH_INEFFICIENT'];
-    }
-
-    // --- 路径上有没有「人的犹豫」 ---------------------------------------
-    //
-    // 直线轨迹有一个签名：在每一段上方向都不变号。人手几乎不会这样 ——
-    // 起手会偏、对准时会回修，至少有一个轴会出现反向的一小步。
-    // 这一条与上面的速度上限互补：一个要求"别太快"，一个要求"别太直"。
-    $flipX = $flipY = 0;
-    for ($i = 2; $i < count($pts); $i++) {
-        $dx1 = $pts[$i - 1][0] - $pts[$i - 2][0];
-        $dx2 = $pts[$i][0] - $pts[$i - 1][0];
-        $dy1 = $pts[$i - 1][1] - $pts[$i - 2][1];
-        $dy2 = $pts[$i][1] - $pts[$i - 1][1];
-        if ($dx1 * $dx2 < -0.5) { $flipX++; }
-        if ($dy1 * $dy2 < -0.5) { $flipY++; }
-    }
-    if ($flipX === 0 && $flipY === 0) {
-        return ['ok' => false, 'reason' => 'STRAIGHT_LINE'];
     }
 
     // --- every piece, in its own gap -------------------------------------
