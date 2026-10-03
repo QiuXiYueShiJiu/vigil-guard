@@ -13,11 +13,11 @@
 两条真实告警（`#001031` / `#001039`）：
 
 ```
-[放行] whitelisted address matched a rule, allowing: 27.221.187.226
+[放行] whitelisted address matched a rule, allowing: （白名单内的某个来源）
        (目录扫描/异常请求（100 次 4xx/60s）)
 ```
 
-来源是 DSH 前端的轮询端点 `/dsh-whale/last-turn.json`：令牌过期时服务端返回
+来源是本站一个前端的轮询端点 `/dsh-whale/last-turn.json`：令牌过期时服务端返回
 **401**，前端继续轮询，短时间内攒够 100 个 4xx，被判成「目录扫描」。
 
 ### 根因：所有 `>=400` 一视同仁

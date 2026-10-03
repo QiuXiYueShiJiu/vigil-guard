@@ -4676,6 +4676,22 @@ class TestEvolveSelfImprovement(unittest.TestCase):
         def restore():
             evolve.ADOPTED, ledger.LEDGER, ledger.BACKUP_DIR = self._saved
         self.addCleanup(restore)
+        # 资源闸门要按真实主机状态读负载与内存；测试不能因此时好时坏。
+        # 这台机器负载本来就会波动（构建、巡检、压测），不隔离的话
+        # 「apply 成功」这类断言取决于跑测试的那一刻机器忙不忙。
+        self._patch_module(budget, free_mb=lambda: 4096.0,
+                           load1=lambda: 0.0, disk_free_mb=lambda: 99999.0)
+
+    def _patch_module(self, mod, **attrs):
+        """模块级打桩并自动还原（见 setUp 里为什么必须这样）。"""
+        saved = {k: getattr(mod, k) for k in attrs}
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+
+        def restore():
+            for k, v in saved.items():
+                setattr(mod, k, v)
+        self.addCleanup(restore)
 
     def _patch(self, mod, **attrs):
         """Set module attributes and put them back afterwards.
