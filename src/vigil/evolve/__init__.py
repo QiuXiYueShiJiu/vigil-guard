@@ -38,6 +38,7 @@ from . import budget as budget_mod
 from . import ledger
 from . import report as report_mod
 from . import score as score_mod
+from . import train as train_mod
 
 #: Adopted decoys: paths the loop has decided are worth enforcing. Separate from
 #: the curation in `decoy.py` (which is reviewed by a human and shipped) and
@@ -165,7 +166,9 @@ def evidence(cfg=None) -> dict:
 
 def proposals(cfg=None, ev=None) -> list:
     ev = ev or evidence(cfg)
-    out = []
+    # 结果回看：自己改过的东西有没有用。没用的先撤，再谈新的 —— 否则采纳表
+    # 只增不减，最后变成一堆好意，而不是一套判定。
+    out = list(train_mod.retire_proposals(cfg))
     for c in ev["candidates"]:
         # Two independent reasons to believe it is a probe: the name looks like
         # one, or the learned model -- which has seen this host's own traffic --
@@ -270,6 +273,17 @@ def apply(cfg=None, prop=None, dry_run: bool = False, log=None) -> dict:
     """Adopt one proposal. Mail first, then change, then verify, then record."""
     prop = prop or {}
     kind = prop.get("kind")
+    if kind == "retire_decoy":
+        # 撤销不需要证据门槛，也不写源码：它只是把自己加过的东西拿掉。
+        r = rollback(cfg, prop.get("id"))
+        if r.get("ok"):
+            ledger.record("retired", id=prop.get("id"), path=prop.get("path"))
+            report_mod.send_report(cfg, {"event": "evolve-retire",
+                                         "version": _version(),
+                                         "reason": "never_fired"})
+        return {"ok": bool(r.get("ok")), "id": prop.get("id"),
+                "path": prop.get("path"), "retired": True,
+                "err": r.get("err")}
     if kind != "adopt_decoy":
         return {"ok": False, "err": "未知的提案类型：%s" % kind}
 
@@ -420,6 +434,8 @@ def loop(cfg=None, log=None, max_rounds: int = 6, sleep: float = 20.0) -> dict:
         ledger.record("skipped", reason=reason, budget=b.describe())
         return {"ok": True, "skipped": reason, "applied": []}
 
+    # 先自己训练一轮：标签来自本机已经发生的处置结果，不需要人工标注。
+    trained = train_mod.train(cfg)
     ev = evidence(cfg)
     props = proposals(cfg, ev)
     max_per_run = int(_num(cfg, "evolve.max_per_run", 5))
@@ -435,6 +451,9 @@ def loop(cfg=None, log=None, max_rounds: int = 6, sleep: float = 20.0) -> dict:
 
     payload = {"event": "evolve-pass", "version": _version(),
                "budget": b.describe(), "observed": ev["observed"],
+               "trained": {k: trained.get(k) for k in
+                           ("ok", "trained", "positives", "negatives",
+                            "accuracy_holdout", "model_seen")},
                "candidates": len(ev["candidates"]), "applied": len(applied),
                "failed": len(failed),
                "changes": [{"id": a["id"], "tier": 1} for a in applied]}
@@ -443,7 +462,8 @@ def loop(cfg=None, log=None, max_rounds: int = 6, sleep: float = 20.0) -> dict:
                   observed=ev["observed"], candidates=len(ev["candidates"]),
                   reported=bool(sent.get("ok")))
     return {"ok": True, "applied": applied, "failed": failed,
-            "evidence": ev, "budget": b.describe(), "report": sent}
+            "evidence": ev, "budget": b.describe(), "report": sent,
+            "trained": trained, "outcomes": train_mod.outcomes(cfg)}
 
 
 def _version() -> str:

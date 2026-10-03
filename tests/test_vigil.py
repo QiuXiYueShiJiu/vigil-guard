@@ -4884,6 +4884,106 @@ class TestEvolveSelfImprovement(unittest.TestCase):
         self.assertEqual("", self.report.DEFAULT_URL)
 
 
+class TestEvolveSelfTraining(unittest.TestCase):
+    """The agent half: labels it produces itself, and feedback it acts on."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil import evolve
+        from vigil.evolve import train, score, ledger
+        self.ev, self.train, self.score, self.ledger = evolve, train, score, ledger
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        from vigil.core import paths as vpaths
+        self._saved = (train.MODEL, train.OUTCOMES, evolve.ADOPTED,
+                       ledger.LEDGER, vpaths.STATE_STATE)
+        train.MODEL = self.root / "m.json"
+        train.OUTCOMES = self.root / "o.json"
+        evolve.ADOPTED = self.root / "a.json"
+        ledger.LEDGER = self.root / "l.jsonl"
+        ledger.BACKUP_DIR = self.root / "b"
+        vpaths.STATE_STATE = self.root
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        from vigil.core import paths as vpaths
+        (self.train.MODEL, self.train.OUTCOMES, self.ev.ADOPTED,
+         self.ledger.LEDGER, vpaths.STATE_STATE) = self._saved
+
+    def _write(self, name, rows):
+        import json
+        (self.root / name).write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows), encoding="utf-8")
+
+    def test_labels_come_from_consequences_not_from_a_human(self):
+        """A decoy hit is already a decision the program made; reading it back
+        as a training label is free supervision."""
+        self._write("decoy-hits.jsonl", [{"uri": "/.git/config", "ip": "203.0.113.9"}] * 5)
+        self._write("observations.jsonl", [
+            {"path": "/theme.css", "status": 200, "ua": "Mozilla/5.0", "ip": "198.51.100.5"},
+            {"path": "/index.html", "status": 200, "ua": "Mozilla/5.0", "ip": "198.51.100.6"},
+        ])
+        rows = self.train.label_samples()
+        lab = {(r["path"], r["label"]) for r in rows}
+        self.assertIn(("/.git/config", 1), lab)
+        self.assertIn(("/theme.css", 0), lab)
+        self.assertTrue(all(r["why"] != "guessed" for r in rows))
+
+    def test_an_unexplained_404_is_not_treated_as_an_attack(self):
+        """Training on every 404 would just relearn the program's own blocking
+        and inflate the score of anything the ban list already caught."""
+        self._write("decoy-hits.jsonl", [])
+        self._write("observations.jsonl", [
+            {"path": "/maybe-broken-link", "status": 404, "ua": "Mozilla/5.0",
+             "ip": "198.51.100.7"}])
+        self.assertEqual([], self.train.label_samples())
+
+    def test_training_saves_a_model_and_reports_a_held_out_score(self):
+        # 路径必须各不相同：样本按键 (path,status,ua) 去重，同一路径刷 20 次只有 1 条
+        self._write("decoy-hits.jsonl",
+                    [{"uri": "/probe-%d" % i, "ip": "203.0.113.%d" % (i % 8)}
+                     for i in range(20)])
+        self._write("observations.jsonl",
+                    [{"path": "/page-%d.css" % i, "status": 200, "ua": "Mozilla/5.0",
+                      "ip": "198.51.100.%d" % (i % 8)} for i in range(20)])
+        res = self.train.train()
+        self.assertTrue(res["ok"], res)
+        self.assertGreater(res["held_out"], 0, "没有留出集就等于自己给自己打分")
+        self.assertTrue(self.train.MODEL.is_file())
+        self.assertGreater(self.score.Scorer.load(self.train.MODEL).seen, 0)
+
+    def test_a_decoy_that_never_fires_is_proposed_for_retirement(self):
+        """The feedback half: without it the adopted list only ever grows."""
+        import json, time
+        self.ev.ADOPTED.write_text(json.dumps([{
+            "path": "/never-fired", "id": "adopt:/never-fired",
+            "adoptedAt": time.time() - 48 * 3600, "why": "t"}]), encoding="utf-8")
+        self._write("decoy-hits.jsonl", [])
+        props = self.train.retire_proposals()
+        self.assertEqual(["/never-fired"], [x["path"] for x in props])
+        self.assertEqual("retire_decoy", props[0]["kind"])
+
+    def test_a_decoy_inside_the_grace_period_is_not_judged(self):
+        import json, time
+        self.ev.ADOPTED.write_text(json.dumps([{
+            "path": "/just-added", "id": "adopt:/just-added",
+            "adoptedAt": time.time() - 3600, "why": "t"}]), encoding="utf-8")
+        self._write("decoy-hits.jsonl", [])
+        self.assertEqual([], self.train.retire_proposals())
+        self.assertEqual("too-new", [x for x in self.train.outcomes()["per"]][0]["verdict"])
+
+    def test_a_decoy_that_fired_is_kept(self):
+        import json, time
+        self.ev.ADOPTED.write_text(json.dumps([{
+            "path": "/fired", "id": "adopt:/fired",
+            "adoptedAt": time.time() - 48 * 3600, "why": "t"}]), encoding="utf-8")
+        self._write("decoy-hits.jsonl", [{"uri": "/fired", "ip": "203.0.113.1"}])
+        self.assertEqual([], self.train.retire_proposals())
+        self.assertEqual(1, self.train.outcomes()["keep"])
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

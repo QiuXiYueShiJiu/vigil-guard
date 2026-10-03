@@ -11,6 +11,7 @@ from ..core.config import load as load_config
 from ..evolve import (adopted, apply as evolve_apply, format_status,
                       format_watchdog, ledger, loop, plan, rollback, scan,
                       status, watchdog)
+from ..evolve import train as train_mod
 
 
 def cmd_status(args) -> int:
@@ -126,6 +127,33 @@ def cmd_loop(args) -> int:
     return 0
 
 
+def cmd_train(args) -> int:
+    cfg = load_config(args.config or None)
+    ui.header("自修正：自我训练", "标签来自本机已经发生的处置结果，不需要人工标注")
+    res = train_mod.train(cfg, epochs=args.epochs)
+    if not res.get("ok"):
+        ui.warning(res.get("err", "训练未完成"))
+        ui.kv("正样本", res.get("positives", 0))
+        ui.kv("负样本", res.get("negatives", 0))
+        return 1
+    ui.kv("训练样本", "%d 条（保留 %d 条做检验）" % (res["trained"], res["held_out"]))
+    ui.kv("标签来源", "正 %d（命中诱饵 / 随后被封禁）｜负 %d（被正常服务）"
+           % (res["positives"], res["negatives"]))
+    ui.kv("训练集准确率", "%.1f%%" % res["accuracy_fit"])
+    ui.kv("留出集准确率", "%.1f%%" % res["accuracy_holdout"])
+    ui.kv("模型累计学习", "%d 次观测" % res["model_seen"])
+    ui.out()
+    ui.note("留出集是抽出来没参与训练的样本：只报训练集准确率等于自己给自己打分。")
+    return 0
+
+
+def cmd_outcomes(args) -> int:
+    cfg = load_config(args.config or None)
+    ui.header("自修正：回看自己改过的东西", "没用的就撤掉，别让采纳表只增不减")
+    ui.out(train_mod.format_outcomes(train_mod.outcomes(cfg)))
+    return 0
+
+
 def cmd_watchdog(args) -> int:
     cfg = load_config(args.config or None)
     res = watchdog(cfg)
@@ -171,6 +199,15 @@ def register(sub) -> None:
     sp.add_argument("--force", action="store_true", help="即使未启用电也跑（仅调试）")
     sp.add_argument("--config")
     sp.set_defaults(func=cmd_loop)
+
+    sp = ps.add_parser("train", help="用本机处置结果自我训练（自监督，无需标注）")
+    sp.add_argument("--epochs", type=int, default=15)
+    sp.add_argument("--config")
+    sp.set_defaults(func=cmd_train)
+
+    sp = ps.add_parser("outcomes", help="回看自己采纳的改动有没有用")
+    sp.add_argument("--config")
+    sp.set_defaults(func=cmd_outcomes)
 
     sp = ps.add_parser("watchdog", help="检查自修正循环是否异常")
     sp.add_argument("--config")
