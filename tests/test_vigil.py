@@ -5107,6 +5107,76 @@ class TestEvolveGeneralisation(unittest.TestCase):
                          (root / "src/vigil/guards/threat.py").read_text(encoding="utf-8"))
 
 
+class TestHttpBurstIsAboutMissingPaths(unittest.TestCase):
+    """The directory-scan detector must mean what its name says.
+
+    This detector had no tests at all, which is how it came to count *every*
+    status >= 400 as evidence of scanning. The false positive that surfaced was
+    not exotic: a token-authenticated polling endpoint answers 401 while its
+    token is expired, and a client that polls it often enough accumulated a
+    hundred of them and was reported as "directory scanning" without having
+    requested a single path that did not exist. The victim of that mistake is
+    the heaviest legitimate user, which is the worst possible target for a
+    false positive.
+    """
+
+    def setUp(self):
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+
+    def _feed(self, status, path, times):
+        for _ in range(times):
+            self.d.handle_http('203.0.113.77 - - [x] "GET %s HTTP/1.1" %d 0 "-" "c"'
+                               % (path, status))
+
+    def _banned(self):
+        return "203.0.113.77" in self.d.state.bans
+
+    def test_a_polling_client_getting_401s_is_never_banned(self):
+        """The exact false positive: 401 means "your token expired", not
+        "this path does not exist"."""
+        self._feed(401, "/dsh-whale/last-turn.json", 300)
+        self.assertFalse(self._banned(),
+                         "轮询客户端因令牌过期收到 401，被当成了目录扫描")
+        stats = getattr(self.d.state, "stats", {}) or {}
+        self.assertIn("http_routine_4xx", stats,
+                      "常规 4xx 应当单独记账，而不是计入扫描证据")
+
+    def test_server_errors_do_not_get_the_visitor_banned(self):
+        """A 500 is our bug. Banning the client for it is blaming the victim."""
+        self._feed(500, "/api/thing", 300)
+        self.assertFalse(self._banned())
+
+    def test_a_403_burst_is_not_called_scanning(self):
+        """Permission denied is a routine answer (WAF, directory listing off)."""
+        self._feed(403, "/admin/", 300)
+        self.assertFalse(self._banned())
+
+    def test_real_directory_scanning_still_bans(self):
+        """The detector must keep working on the thing it is named after."""
+        self._feed(404, "/nope-%d" % 1, 400)
+        self.assertTrue(self._banned(), "真正的目录扫描没有被封禁")
+
+    def test_alternating_not_founds_still_accumulate(self):
+        """An attacker mixing 404/410/444 must not slip between the counters."""
+        for st in (404, 410, 444, 404, 410, 444):
+            self._feed(st, "/gone", 40)
+        self.assertTrue(self._banned())
+
+    def test_volume_is_still_capped_by_the_flood_detector(self):
+        """Excluding routine statuses from *scanning* must not create a hole:
+        request volume is counted for every status, so a client that only ever
+        produces 403s still trips the flood threshold."""
+        self._feed(403, "/admin/", 2000)
+        self.assertTrue(self._banned(), "只刷 403 的客户端再也封不掉了")
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

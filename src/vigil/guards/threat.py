@@ -1805,6 +1805,27 @@ def send_alert(alert: Alert, cfg=None, log=None) -> bool:
 # --------------------------------------------------------------------------
 # Event reporting (batched, never blocks a tail thread)
 # --------------------------------------------------------------------------
+#: 只有「这个路径不存在」才构成目录扫描的证据。
+#:
+#: 原来所有 >=400 的状态码一视同仁地计数，于是 401 也算「扫描」。后果是
+#: **任何带令牌的轮询客户端都不可能在长期运行中幸免**：令牌一过期就拿到 401，
+#: 短时间攒够阈值就触发「目录扫描」。实测就发生过 —— 一个正常的轮询端点
+#: （令牌过期时返回 401）把白名单里的来源送上了告警，而它一次目录扫描都没做。
+#: 误伤对象恰好是**最活跃的合法使用者**，这是最糟的一种误报。
+SCAN_STATUS = frozenset({404, 410, 444})
+
+#: 看起来像错误、其实是给规矩客户端的常规答复，绝不能算作扫描证据：
+#:
+#:   401 / 407  —— 令牌过期或需要认证；轮询客户端**本来就该**收到这个
+#:   403        —— 权限不足、WAF 拦截、目录列表关闭
+#:   405/406/415—— 方法或内容协商
+#:   429        —— 是我们自己限的流
+#:   5xx        —— 我们的 bug，不该让访问者背
+#:
+#: 这些仍然计入 http_flood（按**全部**请求计数），所以只刷 403 的攻击者
+#: 依旧会因请求量触发洪泛封禁 —— 少的是「把它当扫描」这层错误归因。
+ROUTINE_STATUS = frozenset({401, 403, 405, 406, 407, 415, 416, 429})
+
 _CRIT_KINDS = frozenset({"BREACH", "DIST", "BAN_FAIL"})
 _KIND_ORDER = ("BREACH", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE", "BAN",
                "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
@@ -2699,24 +2720,27 @@ class ThreatDaemon:
                             return
                         break
 
-        if status >= 400:
+        if status in SCAN_STATUS:
             # Defect #13: report the real class (5xx must not print as 4xx).
             cls = "%dxx" % (status // 100)
             threshold = self.thr(self.settings.http_burst_threshold)
             # Bump the class-specific counter (accurate reporting) and a
-            # combined one (an attacker alternating 403/500 must still trip it,
-            # which is what the original's single counter did).
+            # combined one, so that alternating 404/410/444 still trips it.
             over_cls, count_cls = self.windows.bump(
                 ip, "http_%s" % cls, self.settings.http_burst_window, threshold)
             over_all, count_all = self.windows.bump(
                 ip, "http_err", self.settings.http_burst_window, threshold)
             if over_cls or over_all:
-                self.ban(ip, "目录扫描/异常请求（%d 次 %s/%ds）"
+                self.ban(ip, "目录扫描（%d 次 %s/%ds）"
                          % (max(count_cls, count_all), cls,
                             self.settings.http_burst_window),
                          detector="http_burst")
                 self.windows.forget(ip)
                 return
+        elif status >= 400:
+            # 常规错误答复：记账供观察，但不作为封禁证据。见 SCAN_STATUS 与
+            # ROUTINE_STATUS 上方关于这次误报的说明。
+            self.bump_stat("http_routine_%dxx" % (status // 100))
         over, count = self.windows.bump(
             ip, "http_flood", self.settings.http_flood_window,
             self.thr(self.settings.http_flood_threshold))
