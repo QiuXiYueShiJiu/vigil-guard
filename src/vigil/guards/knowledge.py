@@ -420,6 +420,15 @@ ATTACK_PATTERNS: list = [
      "这类文件里常含数据库密码与密钥。"),
     (r"\.aws/credentials|\.ssh/id_|\.bash_history|credentials\.txt",
      "云凭据与私钥探测：目标是拿到可以横向移动到其它服务器的密钥。"),
+    (r"pearcmd|config-create|\+config-create",
+     "PHP pearcmd 远程代码执行：利用 PHP 自带的 pear 组件把 WebShell 写进网站目录。"
+     "这是 2024 年之后最常见的通用 RCE 手法之一，成功即等于服务器沦陷。"),
+    (r"/mcp\b|/api/mcp|/sse\b|validate-sso|model.?context.?protocol",
+     "AI 代理接口探测：在枚举 MCP / SSE 接口。这类接口暴露后可直接调用后端的"
+     "模型与工具链，影响面比传统 Web 漏洞更大，属于新的攻击面。"),
+    (r"static\.\.|assets\.\.|media\.\.|\.\./\.",
+     "路径归一化绕过：在敏感路径前拼 `..` 试图绕过按前缀写的拒绝规则"
+     "（例如 /static../.git/config）。命中即说明对方在定向尝试绕过防护。"),
     (r"docker-compose|Dockerfile|/actuator|/metrics",
      "基础设施信息探测：在枚举容器与运维接口，为下一步攻击做准备。"),
     (r"ssh.*爆破|密码爆破|Failed password",

@@ -4512,6 +4512,140 @@ class TestLureSurfaces(unittest.TestCase):
         self.addCleanup(restore)
 
 
+class TestHardeningFromRealProbes(unittest.TestCase):
+    """The gaps a real access log exposed, pinned so they cannot reopen.
+
+    Everything asserted here comes from an actual 506k-line nginx access log on
+    a live host: probe paths that were being requested but scored nothing at
+    all, and a whitelist that silently swallowed a scanner. Both are the same
+    kind of failure -- the program was working exactly as written, and what it
+    was written to notice was incomplete.
+    """
+
+    def setUp(self):
+        from vigil.guards import decoy as decoy_mod
+        from vigil.guards import knowledge, learning
+        from vigil.guards import threat as threat_mod
+        self.decoy, self.knowledge = decoy_mod, knowledge
+        self.learning, self.t = learning, threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    # -- coverage: paths that were probed but scored nothing ---------------
+
+    def test_the_ai_agent_surface_is_covered(self):
+        """Five different sources probed MCP/SSE endpoints. Not one of them was
+        a decoy, so none of it counted -- a new attack surface with no tripwire."""
+        paths = {p for p, _t, _w in self.decoy.DECOYS}
+        for want in ("/mcp", "/mcp/", "/api/mcp", "/sse",
+                     "/api/auth/validate-sso", "/.well-known/ai-plugin.json"):
+            self.assertIn(want, paths, "AI 代理接口 %s 没有诱饵，探了也不记分" % want)
+
+    def test_linux_home_directory_probes_are_covered(self):
+        paths = {p for p, _t, _w in self.decoy.DECOYS}
+        for want in ("/.config/pulse/", "/.cache/motd.legal-displayed",
+                     "/.config/", "/.wget-hsts"):
+            self.assertIn(want, paths, "家目录踩点路径 %s 没有诱饵" % want)
+
+    def test_the_new_decoys_still_look_like_something_real(self):
+        """The realism rule applies to additions too, or the lure degrades."""
+        for p, _t, _w in self.decoy.DECOYS:
+            self.assertFalse(any(w in p.lower() for w in
+                                 ("honeypot", "fake", "trap", "decoy")),
+                             "诱饵名字一眼就能看穿：%s" % p)
+
+    # -- signatures: exploits that were attempted and never matched --------
+
+    def _matched(self, probe):
+        return [why for pat, why in self.knowledge.ATTACK_PATTERNS
+                if re.search(pat, probe, re.I)]
+
+    def test_the_pearcmd_rce_is_recognised(self):
+        """A real attempt from 120.53.241.11 that no rule matched."""
+        probe = ("/index.php?lang=../../../../../../../../usr/local/lib/php/"
+                 "pearcmd&+config-create+/&/<?echo(md5(\"hi\"));?>+/tmp/index1.php")
+        self.assertTrue(self._matched(probe), "pearcmd RCE 尝试没有被识别")
+
+    def test_the_path_normalisation_bypass_is_recognised(self):
+        """`/static../.git/config` walks past a prefix-written deny rule."""
+        for probe in ("/static../.git/config", "/assets../.git/config",
+                      "/media../.git/config"):
+            self.assertTrue(self._matched(probe),
+                            "%s 这类归一化绕过没有被识别" % probe)
+
+    def test_the_mcp_probe_is_recognised(self):
+        for probe in ("/mcp", "/api/mcp", "/sse",
+                      "/api/auth/validate-sso"):
+            self.assertTrue(self._matched(probe),
+                            "MCP/SSE 探测 %s 没有被识别" % probe)
+
+    # -- learning: a load test must not be able to train the lure ----------
+
+    def test_benchmark_and_local_traffic_never_teaches_the_lure(self):
+        """A 300k-request ApacheBench run was 60% of one host's log. If that
+        trains the decoy list, the list stops describing attackers."""
+        for host in ("127.0.0.1", "::1", "10.0.0.5", "192.168.1.9", "172.20.3.4"):
+            self.assertTrue(self.learning._is_noise(host, ""), host)
+        self.assertTrue(self.learning._is_noise("203.0.113.7", "ApacheBench/2.3"))
+        self.assertTrue(self.learning._is_noise("203.0.113.7", "gobuster/3.6"))
+        self.assertFalse(self.learning._is_noise("203.0.113.7", "curl/7.81.0"))
+        self.assertFalse(self.learning._is_noise("203.0.113.7", ""))
+
+    def test_noise_suppression_covers_learning_only(self):
+        """It must not become a silent exemption from enforcement."""
+        import inspect
+        src = inspect.getsource(self.learning)
+        # 判定/封禁路径不在 learning 模块里，学习降噪不该被它们引用
+        from vigil.guards import threat as threat_mod
+        self.assertNotIn("_is_noise", inspect.getsource(threat_mod))
+
+    # -- whitelist: "never banned" must not also mean "never seen" ---------
+
+    def test_a_whitelisted_scanner_is_reported_rather_than_swallowed(self):
+        """The live case: a whitelisted IP probing /api/user/ismustmobile and
+        /join_room. Whitelisted means it is never banned -- which used to mean
+        nobody ever found out."""
+        self.cfg.set("threat.whitelist", ["203.0.113.9"])
+        daemon = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        queued = []
+        daemon.reporter.queue = lambda e: queued.append(e)
+        banned = daemon.ban("203.0.113.9", "蜜罐诱饵命中：/wp-login.php", "decoy")
+        self.assertFalse(banned, "白名单地址不应被封禁")
+        kinds = [e.get("kind") for e in queued]
+        self.assertIn("WHITELIST", kinds,
+                      "白名单地址命中规则却没有产生任何告警，等于无声放行")
+        event = [e for e in queued if e.get("kind") == "WHITELIST"][0]
+        self.assertIn("203.0.113.9", str(event))
+
+    def test_the_whitelist_alert_does_not_repeat_every_hit(self):
+        """A scanner hits hundreds of times; the alert must not become the flood."""
+        self.cfg.set("threat.whitelist", ["203.0.113.10"])
+        daemon = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        queued = []
+        daemon.reporter.queue = lambda e: queued.append(e)
+        for _ in range(25):
+            daemon.ban("203.0.113.10", "蜜罐诱饵命中：/.env", "decoy")
+        self.assertEqual(1, len(queued),
+                         "同一地址 6 小时内应当只提醒一次，实际 %d 条" % len(queued))
+
+    def test_the_whitelist_alert_is_wired_into_the_mail_renderer(self):
+        """A kind that is queued but has no title/section renders as noise."""
+        src = inspect_module_src(self.t)
+        for needle in ('"WHITELIST": "白名单 IP 命中了封禁规则',
+                       'groups.get("WHITELIST")',
+                       'if kind == "WHITELIST"'):
+            self.assertIn(needle, src, "WHITELIST 告警链路缺了一段：%s" % needle)
+
+
+def inspect_module_src(module):
+    import inspect
+    return inspect.getsource(module)
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

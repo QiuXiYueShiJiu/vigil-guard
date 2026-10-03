@@ -67,6 +67,29 @@ DECOYS: tuple = (
     ("/.ssh/id_rsa", "id_rsa", "SSH 私钥"),
     ("/.svn/entries", "svn/entries", "旧版源码管理元数据"),
     ("/.bash_history", "bash_history", "命令历史"),
+    # -- AI 代理 / MCP 接口（2026 年起成批出现的新扫描面）----------------
+    # 日志实证：/mcp、/mcp/、/api/mcp、/sse、/api/auth/validate-sso 被 5 个
+    # 不同来源成组探测。这类接口一旦暴露，可以直接调用后端的模型与工具链，
+    # 比传统 Web 漏洞的影响面更大，而它们此前一条都不在诱饵库里 —— 探了也
+    # 不记分、不封禁。
+    ("/mcp", "mcp", "MCP（模型上下文协议）接口，暴露后可被用来调用后端工具链"),
+    ("/mcp/", "mcp/", "MCP 接口根路径"),
+    ("/api/mcp", "api/mcp", "MCP 接口的常见挂载点"),
+    ("/sse", "sse", "Server-Sent Events 接口，常与 MCP 配套，暴露后可持续读取服务端事件"),
+    ("/api/auth/validate-sso", "validate-sso", "SSO 校验接口，被用来枚举认证实现"),
+    ("/.well-known/ai-plugin.json", "ai-plugin", "AI 插件清单，暴露后泄露接口定义"),
+    # -- Linux 家目录探测 --------------------------------------------------
+    # 这类路径只在「想确认这是一台真实 Linux 主机、并被真人登录过」时才会被
+    # 请求。正常访客与爬虫都不会碰，是典型的踩点信号。
+    ("/.config/pulse/", "config/pulse", "桌面环境残留，扫描器用它判断是否为真实 Linux 主机"),
+    ("/.cache/motd.legal-displayed", "motd", "登录横幅缓存，用于确认主机被真人登录过"),
+    ("/.config/", "config/", "用户配置目录，可能含云平台与 Git 凭据"),
+    ("/.local/share/", "local/share", "用户数据目录，可能含应用凭据"),
+    ("/.wget-hsts", "wget-hsts", "wget 历史，说明主机被用于对外下载"),
+    # -- 其它实证高频探测 --------------------------------------------------
+    ("/login", "login", "通用登录入口，被用来枚举认证实现"),
+    ("/index.php", "index.php", "PHP 入口，本站不是 PHP 应用"),
+    ("/admin/config.php", "admin/config.php", "后台配置文件"),
     ("/wp-login.php", "wp-login.php", "WordPress 后台（本站不是 WordPress）"),
     ("/xmlrpc.php", "xmlrpc.php", "WordPress 接口，被用于爆破与反射"),
     ("/adminer.php", "adminer.php", "数据库管理工具"),

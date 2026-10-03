@@ -75,6 +75,28 @@ def suggestions_path() -> Path:
     return paths.STATE_STATE / "learned-suggestions.json"
 
 
+#: 压测/基准工具与「不是人也不是爬虫」的 User-Agent 特征。
+#: 它们产出的路径不是情报，学进去只会让诱饵库变脏。
+_NOISE_UA = ("apachebench", "ab/", "wrk", "siege", "jmeter", "locust",
+             "hey/", "vegeta", "httperf", "gobuster", "nuclei", "nikto")
+
+
+def _is_noise(ip: str, ua: str) -> bool:
+    """本机 / 内网 / 压测工具的请求，不作为学习样本。
+
+    只影响**学习**，不影响判定与封禁：来自这些地址的真实越界请求照样会被
+    记录与处置，只是不拿来训练「哪些路径值得当诱饵」。
+    """
+    host = str(ip or "").strip()
+    if host in ("127.0.0.1", "::1", "localhost"):
+        return True
+    if host.startswith(("10.", "192.168.", "172.16.", "172.17.", "172.18.",
+                        "172.19.", "172.2", "172.30.", "172.31.")):
+        return True
+    low = str(ua or "").lower()
+    return any(tok in low for tok in _NOISE_UA)
+
+
 def observe(ip: str, path: str, status: int, ua: str = "",
             when: float = None) -> None:
     """Record one request. Never raises: this is best-effort evidence.
@@ -84,6 +106,11 @@ def observe(ip: str, path: str, status: int, ua: str = "",
     """
     text = str(path or "").split("?")[0].split("#")[0]
     if not text or not text.startswith("/"):
+        return
+    # 压测与本机流量不是「有人在探测」的证据，却是最容易被误学成诱饵的东西：
+    # 一台机器跑一轮 ApacheBench 就能刷出三十万条 `GET /`，把学习结果淹没。
+    # 实测本机曾有一波 29.9 万行压测日志（UA ApacheBench/2.3），占全部日志 60%。
+    if _is_noise(ip, ua):
         return
     low = text.lower()
     if re.search(r"\.(png|jpe?g|gif|webp|svg|ico|css|js|mjs|map|woff2?|ttf|eot"

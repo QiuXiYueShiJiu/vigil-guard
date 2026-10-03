@@ -1807,7 +1807,7 @@ def send_alert(alert: Alert, cfg=None, log=None) -> bool:
 # --------------------------------------------------------------------------
 _CRIT_KINDS = frozenset({"BREACH", "DIST", "BAN_FAIL"})
 _KIND_ORDER = ("BREACH", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE", "BAN",
-               "SSH", "OFFWHITELIST", "BREAKER", "INFO")
+               "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
 
 
 class EventReporter:
@@ -1884,7 +1884,7 @@ class EventReporter:
             if kind == "BAN" and int(event.get("severity", 1)) >= 2:
                 return SEV_CRIT
             if kind in ("BAN", "SSH", "OFFWHITELIST", "BREAKER", "POSTURE",
-                        "NETBLOCK"):
+                        "NETBLOCK", "WHITELIST"):
                 severity = SEV_WARN if severity == SEV_INFO else severity
         return severity
 
@@ -1904,6 +1904,7 @@ class EventReporter:
             "SSH": "SSH 登录事件 %d 条" % len(groups.get("SSH", [])),
             "OFFWHITELIST": "非白名单 IP 成功登录",
             "BREAKER": "风控熔断触发",
+            "WHITELIST": "白名单 IP 命中了封禁规则（已放行，请核实）",
             "POSTURE": "自动进入高压防护",
             "NETBLOCK": "自动升级为网段封禁",
             "INFO": "自动化处置事件 %d 条" % len(items),
@@ -1979,6 +1980,17 @@ class EventReporter:
                                event.get("user", "?"),
                                event.get("method", "?"),
                                "是" if event.get("whitelisted") else "**否（请核实）**"))
+        if groups.get("WHITELIST"):
+            section = alert.add_section("白名单 IP 触发了封禁规则")
+            for event in groups["WHITELIST"]:
+                section.add("%s 命中了规则，本应封禁，因在白名单内已放行。"
+                            % self.d.geo_text(event.get("ip")))
+                section.add("  规则: %s" % oneline(event.get("reason", ""), 120))
+                section.add("  检测器: %s" % event.get("detector", "?"))
+                section.add("")
+            section.add("怎么处理：确认这些地址是不是你本人。不是就"
+                        "`vigil threat whitelist remove <IP>`，是的话可以忽略本条；"
+                        "同一地址反复触发会每 6 小时提醒一次。")
         if groups.get("BREAKER"):
             section = alert.add_section("风控熔断")
             for event in groups["BREAKER"]:
@@ -2012,6 +2024,11 @@ class EventReporter:
             return "已按分级策略封禁攻击源，详见下方逐条说明。"
         if kind == "BREAKER":
             return "封禁频率异常，已熔断以保护正常用户。"
+        if kind == "WHITELIST":
+            return ("白名单地址命中了本该封禁的规则。白名单的语义是"
+                    "「永不放行也不封禁」，所以它不会被拦 —— 但也因此完全无声，"
+                    "除非主动告诉你。常见情况是：换了动态 IP 后旧地址被别人"
+                    "复用、或白名单里混进了扫描器。")
         if kind == "SSH":
             return "有 SSH 登录成功事件，请核对是否为本人操作。"
         if kind == "NETBLOCK":
@@ -2282,6 +2299,19 @@ class ThreatDaemon:
             return False
         if self.whitelist.allowed(ip):
             self.audit("[放行] %s" % _t("ban_skip_whitelist", ip, reason))
+            self.bump_stat("whitelist_hits")
+            # 白名单的语义是「永不封禁」，代价是它在做什么没人会知道。实测过
+            # 一个白名单 IP 在探 /api/user/ismustmobile、/join_room、
+            # /assets/layui/...（典型 CMS 扫描特征），因为豁免而完全无声。
+            # 这里把它变成一条可见的告警：同地址 6 小时内只提醒一次。
+            if self.cooldowns.allow("whitelist_hit:%s" % ip):
+                self.reporter.queue({
+                    "kind": "WHITELIST",
+                    "immediate": True,
+                    "ip": ip,
+                    "reason": reason,
+                    "detector": detector,
+                })
             return False
 
         tripped, recent = self.breaker.tripped()
