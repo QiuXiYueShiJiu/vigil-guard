@@ -202,8 +202,8 @@ def _strip_quote(text: str) -> str:
 # Loop prevention
 #
 # This channel reads a mailbox and writes to it. That combination is a closed
-# loop waiting to happen, and on 2026-09-27 it happened: the fnchess game
-# mailed a registration code from the monitored account to itself, the
+# loop waiting to happen, and on 2026-09-27 it happened: an application on the
+# machine mailed a registration code from the monitored account to itself, the
 # listener answered "没有识别这条命令", and the answer landed back in the
 # inbox as the next command. Twenty minutes and 26 messages later
 # (#000422..#000447) the operator had a mailbox full of junk and no idea why.

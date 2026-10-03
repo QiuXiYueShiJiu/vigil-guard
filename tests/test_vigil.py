@@ -2139,7 +2139,7 @@ class TestCaptchaAssetsStayInStep(unittest.TestCase):
             "$out = [];\n"
             "foreach (['../../etc/passwd', 'short', '', "
             "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', "
-            "'../../../../www/wwwroot/aboutxy/account/api.php'] as $c) {\n"
+            "'../../../../www/wwwroot/example-site/account/api.php'] as $c) {\n"
             "    $out[$c] = vigil_slider_asset('/tmp', $c, 'slider-bg');\n"
             "}\n"
             "echo json_encode($out);")
