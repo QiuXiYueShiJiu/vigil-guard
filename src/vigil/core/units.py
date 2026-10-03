@@ -314,6 +314,40 @@ def render_all(cfg, features) -> dict:
             interval="%dh" % int(cfg.get("malware.scan_interval_hours", 24) or 24),
             on_boot="10min", accuracy="5min")
 
+    # -- 自修正进程：占系统资源的一个固定小比例 ---------------------------
+    # 资源上限全部按「可用量的百分比」的思路给：CPU 配额 5%（即最多半个核），
+    # 内存上限按宿主机可用内存的一小部分，IO 权重最低，nice 19。它做的是
+    # 可选工作，任何时候都不该和真正对外服务的进程抢资源。
+    if "evolve" in features:
+        units["evolve.service"] = service(
+            "vigil-evolve.service",
+            "Self-improvement loop (bounded, evidence-gated, reversible)",
+            ["%s -m vigil.cli evolve loop" % python_bin()],
+            stype="oneshot",
+            restart="no",
+            nice=19, cpu_quota="5%", io_weight="10", memory_max="256M",
+            # 明确不属于告警链路：出问题时它应该是第一个被压缩的，
+            # 也是最该被 OOM 杀掉的，绝不能因为它而让通知发不出去。
+            alerting=False, oom_score=800,
+            unit_extra="CPUWeight=10\nIOAccounting=yes\nMemoryAccounting=yes")
+        units["evolve.timer"] = timer(
+            "vigil-evolve.timer", "Periodic self-improvement pass",
+            "vigil-evolve.service",
+            interval="%dh" % int(cfg.get("evolve.interval_hours", 6) or 6),
+            on_boot="20min", accuracy="10min")
+
+    # -- 监控进程：守着自修正循环本身 --------------------------------------
+    # 一个能改自己行为的组件，必须有人看着它。这个进程只做一件事：
+    # 确认自修正循环还活着、没跑飞、台账没异常增长、资源没超限。
+    if "watchdog" in features:
+        units["watchdog.service"] = service(
+            "vigil-watchdog.service",
+            "Watchdog for the self-improvement loop",
+            ["%s -m vigil.cli evolve watchdog" % python_bin()],
+            stype="simple", restart="always", restart_sec=30,
+            nice=10, cpu_quota="3%", io_weight="10", memory_max="128M",
+            alerting=True, oom_score=100)
+
     return units
 
 

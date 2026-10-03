@@ -55,6 +55,7 @@ COMMAND_GROUPS = [
         ("hygiene", "请求卫生：限制请求行与 Host 头的大小"),
         ("drill", "攻击演练：多来源多层次，仅对本机"),
         ("lure", "诱导面：让诱饵被找到，并衡量是否有效"),
+        ("evolve", "自修正：有边界地改进自己，并监控它"),
         ("audit", "内核审计规则（文件改动归因）"),
     ]),
     ("运维", [
@@ -102,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
                            hygiene as cmd_hygiene,
                            drill as cmd_drill,
                            lure as cmd_lure,
+                           evolve as cmd_evolve,
                            selftest as cmd_selftest,
                            update as cmd_update,
                            wizard as cmd_wizard)
@@ -128,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_hygiene.register(sub)
     cmd_drill.register(sub)
     cmd_lure.register(sub)
+    cmd_evolve.register(sub)
     return p
 
 

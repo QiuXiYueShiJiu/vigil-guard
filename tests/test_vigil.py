@@ -4646,6 +4646,244 @@ def inspect_module_src(module):
     return inspect.getsource(module)
 
 
+class TestEvolveSelfImprovement(unittest.TestCase):
+    """The bounded self-improvement loop, and the reasons it is allowed to run.
+
+    A component that edits its own behaviour needs its limits tested harder than
+    its features: the features failing is an inconvenience, a limit failing is a
+    security incident. So most of what follows asserts what the loop *refuses*
+    to do, and each refusal is paired with the accident it prevents.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil import evolve
+        from vigil.evolve import budget, ledger, report, score
+        from vigil.core import paths as vpaths
+        self.ev, self.budget = evolve, budget
+        self.ledger, self.report, self.score = ledger, report, score
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        # Redirect every state file the loop owns, so a test run cannot touch
+        # the real adopted list or ledger of the host running it.
+        self._saved = (evolve.ADOPTED, ledger.LEDGER, ledger.BACKUP_DIR)
+        evolve.ADOPTED = self.root / "adopted.json"
+        ledger.LEDGER = self.root / "ledger.jsonl"
+        ledger.BACKUP_DIR = self.root / "backup"
+
+        def restore():
+            evolve.ADOPTED, ledger.LEDGER, ledger.BACKUP_DIR = self._saved
+        self.addCleanup(restore)
+
+    def _patch(self, mod, **attrs):
+        """Set module attributes and put them back afterwards.
+
+        Without the restore these leak into every later test: an earlier case
+        stubbed `free_mb` down to 100 MB to prove the budget refuses to start,
+        and the next test then failed for that reason rather than its own.
+        """
+        saved = {k: getattr(mod, k) for k in attrs}
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+
+        def restore():
+            for k, v in saved.items():
+                setattr(mod, k, v)
+        self.addCleanup(restore)
+
+    # -- the resource governor --------------------------------------------
+
+    def test_the_budget_is_a_share_of_what_is_free(self):
+        """A fixed "use up to 200 MB" is wrong on a 1 GB box and on a 64 GB one."""
+        b = self.budget.Budget()
+        b.memory_pct = 5.0
+        self._patch(self.budget, free_mb=lambda: 1000.0)
+        self.assertAlmostEqual(50.0, b.slice_mb(), places=1)
+
+    def test_it_refuses_to_start_when_the_host_is_busy(self):
+        b = self.budget.Budget()
+        b.memory_floor = 400.0
+        self._patch(self.budget, free_mb=lambda: 100.0)
+        ok, why = b.may_start()
+        self.assertFalse(ok, "可用内存只有 100 MB 却允许开工")
+        self.assertIn("内存", why)
+
+    def test_it_refuses_to_start_under_load(self):
+        b = self.budget.Budget()
+        b.load_ratio = 0.5
+        self._patch(self.budget, free_mb=lambda: 8000.0, load1=lambda: 99.0)
+        ok, why = b.may_start()
+        self.assertFalse(ok)
+        self.assertIn("负载", why)
+
+    # -- the online scorer -------------------------------------------------
+
+    def test_the_scorer_learns_from_evidence_and_can_explain_itself(self):
+        s = self.score.Scorer()
+        before = s.score("/.git/config")
+        for _ in range(40):
+            s.observe("/.git/config", 404, "curl/7.81.0", label=1)
+        for _ in range(40):
+            s.observe("/theme.css", 200, "Mozilla/5.0", label=0)
+        self.assertGreater(s.score("/.git/config"), before)
+        self.assertLess(s.score("/theme.css"), 0.5)
+        names = [e["feature"] for e in s.explain("/.git/config")]
+        self.assertTrue(any("git" in n for n in names),
+                        "解释里应当指名道姓，而不是给出一个下标")
+
+    def test_the_model_round_trips_through_json(self):
+        s = self.score.Scorer()
+        for _ in range(10):
+            s.observe("/.env", 404, "", label=1)
+        path = self.root / "m.json"
+        self.assertTrue(s.save(path))
+        again = self.score.Scorer.load(path)
+        self.assertAlmostEqual(s.score("/.env"), again.score("/.env"), places=4)
+
+    # -- what may become a decoy ------------------------------------------
+
+    def test_a_path_must_survive_nginx_to_be_adopted(self):
+        """A quote or a brace in a path is not a bad decoy, it is config injection."""
+        for bad in ('/a"b', "/a b", "/a;b", "/a{b}", "/a\nb", "", "relative"):
+            self.assertFalse(self.ev._SAFE_PATH.match(bad), bad)
+        for good in ("/.env", "/wp-admin/install.php", "/api/mcp", "/.config/"):
+            self.assertTrue(self.ev._SAFE_PATH.match(good), good)
+
+    def test_adoption_needs_several_independent_sources(self):
+        """One noisy client asking repeatedly is not evidence of a scanner."""
+        obs = [{"ts": 1, "ip": "203.0.113.9", "path": "/noisy", "status": 404, "ua": ""}] * 50
+        self._write_observations(obs)
+        ev = self.ev.evidence()
+        self.assertEqual([], [c["path"] for c in ev["candidates"]],
+                         "单一来源刷 50 次被当成了证据")
+
+    def test_adoption_needs_repeat_hits_as_well(self):
+        # 3 个独立来源、各请求一次：来源数够了，命中数不够 —— 门槛是两条都要过
+        obs = [{"ts": 1, "ip": "203.0.113.%d" % i, "path": "/once", "status": 404, "ua": ""}
+               for i in range(1, 4)]
+        self._write_observations(obs)
+        ev = self.ev.evidence()
+        self.assertEqual([], [c["path"] for c in ev["candidates"]],
+                         "每个来源只请求一次也被当成了证据")
+
+    def _write_observations(self, rows):
+        import json
+        from vigil.guards import learning
+        path = self.root / "observations.jsonl"
+        path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        self._patch(learning, observations_path=lambda: path)
+
+    def test_the_adopted_store_is_reread_defensively(self):
+        """The store is a file on disk, so anything that can write it can try to
+        inject config. `decoy` re-checks the grammar instead of trusting it."""
+        import json
+        from vigil.guards import decoy
+        from vigil.core import paths as vpaths
+        old = vpaths.STATE_STATE
+        vpaths.STATE_STATE = self.root
+        self.addCleanup(lambda: setattr(vpaths, "STATE_STATE", old))
+        # 必须在重定向之后才算路径：先算再改的写法会把测试数据写进真实状态目录
+        p = vpaths.STATE_STATE / "evolve-adopted.json"
+        p.write_text(json.dumps([
+            {"path": "/ok", "why": "fine"},
+            {"path": '/bad"x', "why": "injection attempt"},
+            {"path": "/bad;x", "why": "injection attempt"},
+            {"path": "relative", "why": "not a path"},
+        ]), encoding="utf-8")
+        got = [e[0] for e in decoy.evolve_adopted()]
+        self.assertEqual(["/ok"], got)
+
+    # -- the code edit -----------------------------------------------------
+
+    def test_the_edit_lands_after_the_anchor_and_is_valid_python(self):
+        import ast
+        from vigil.guards import decoy
+        src = (self.root / "decoy.py")
+        src.write_text(decoy.__file__ and open(decoy.__file__, encoding="utf-8").read(),
+                       encoding="utf-8")
+        text = src.read_text(encoding="utf-8")
+        patched = self.ev._insert_decoys(text, self.ev._patch_entries([
+            {"path": "/probe-me", "why": "测试"}]) )
+        self.assertTrue(patched)
+        ast.parse(patched)
+        self.assertIn('("/probe-me"', patched)
+        # 必须在 DECOYS 元组里，而不是文件别的地方
+        self.assertLess(patched.index('("/probe-me"'), patched.index('("/.env"'))
+
+    def test_source_edits_are_off_unless_explicitly_enabled(self):
+        cfg = vconfig.Config(path=self.root / "c.json",
+                             secrets_path=self.root / "s.json")
+        self.assertFalse(bool(cfg.get("evolve.allow_code_edits", False)),
+                         "源码自改必须默认关闭")
+        self.assertFalse(bool(cfg.get("evolve.enabled", False)),
+                         "自修正循环必须默认关闭")
+        self.assertEqual("", str(cfg.get("evolve.source_root", "")))
+
+    def test_an_unsafe_path_is_refused_by_the_gate(self):
+        ok, why = self.ev._tier1_gates(None, {"path": '/x"y'})
+        self.assertFalse(ok)
+        self.assertIn("不安全", why)
+
+    def test_applying_mails_before_writing_anything(self):
+        """A program that edits itself without saying so first cannot be told
+        apart from one that has been taken over."""
+        order = []
+        self._patch(self.report, mail=lambda *a, **k: (order.append("mail"), True)[1])
+        prop = {"id": "adopt:/.probe-x", "kind": "adopt_decoy", "path": "/.probe-x",
+                "why": "测试", "evidence": {"hits": 9, "ips": 4}}
+        self._patch(self.budget, free_mb=lambda: 5000.0)
+        res = self.ev.apply(None, prop, dry_run=True)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(["mail"], order, "预演阶段就必须先发邮件")
+
+    def test_rollback_removes_an_adopted_decoy(self):
+        prop = {"id": "adopt:/.probe-y", "kind": "adopt_decoy", "path": "/.probe-y",
+                "why": "测试", "evidence": {"hits": 9, "ips": 4}}
+        self._patch(self.report, mail=lambda *a, **k: True,
+                    send_report=lambda *a, **k: {"ok": True})
+        self._patch(self.budget, free_mb=lambda: 5000.0)
+        self.assertTrue(self.ev.apply(None, prop)["ok"])
+        self.assertIn("/.probe-y", self.ev.adopted_paths())
+        self.assertTrue(self.ev.rollback(None, "adopt:/.probe-y")["ok"])
+        self.assertNotIn("/.probe-y", self.ev.adopted_paths())
+
+    # -- the watchdog ------------------------------------------------------
+
+    def test_the_watchdog_notices_a_runaway_loop(self):
+        """The thing that edits the program must itself be watched, and it must
+        not take the loop's own word for how it is doing."""
+        for i in range(self.ev.RUNAWAY_PER_HOUR + 5):
+            self.ledger.record("applied", id="adopt:/x%d" % i, path="/x%d" % i)
+        self._patch(self.report, mail=lambda *a, **k: True,
+                    send_report=lambda *a, **k: {"ok": True})
+        res = self.ev.watchdog(None)
+        self.assertFalse(res["ok"], "一小时内几十次改动却没有报警")
+        self.assertTrue(any("失控" in m for _l, m in res["findings"]))
+
+    # -- the report channel ------------------------------------------------
+
+    def test_reports_cannot_carry_host_identity(self):
+        out = self.report.scrub({"event": "x", "ip": "203.0.113.7",
+                                 "hostname": "h", "webroot": "/www/a",
+                                 "path": "/secret", "count": 3,
+                                 "nested": {"domain": "a.test", "n": 1}})
+        self.assertEqual({"event": "x", "count": 3, "nested": {"n": 1}}, out)
+
+    def test_a_unicode_collector_url_is_idna_encoded(self):
+        """`urllib` writes the request line as latin-1; an IDN host would raise
+        before the request was even attempted, silently losing the channel."""
+        # 用一个中性的 IDN 例子：拿真实站点域名写测试，会被本机禁词表（正确地）拦下
+        got = self.report.ascii_url("https://例え.テスト/evolve/report.php")
+        self.assertEqual("https://xn--r8jz45g.xn--zckzah/evolve/report.php", got)
+
+    def test_reporting_is_off_until_an_address_is_configured(self):
+        """A compiled-in collector URL would put one deployment's domain into a
+        shipped file -- which the privacy audit refuses, and it caught this."""
+        self.assertEqual("", self.report.DEFAULT_URL)
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

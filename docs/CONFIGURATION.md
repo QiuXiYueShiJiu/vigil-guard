@@ -81,6 +81,35 @@ sudo vigil config set threat.lure.sitemap never    # 从不发
 > 诱导面本身不靠 sitemap：`robots.txt` 里那一段（`Disallow:` 一串诱饵路径 + 金丝雀）
 > 是独立的，跟这个开关无关，而它才是自动化流量最先读的地方。
 
+## 自修正：它被允许做什么
+
+`vigil evolve` 默认**关闭**。开启后它会读本机真实流量、采纳新的诱饵路径，
+并把每次改动写进台账、改前发邮件、改后上报。
+
+```sh
+sudo vigil config set evolve.enabled true          # 打开循环
+sudo vigil config set evolve.allow_code_edits true # 允许改源码（默认关，需先设 source_root）
+sudo vigil config set evolve.source_root /path/to/vigil-guard
+sudo vigil config set evolve.report_url https://你的收集端/evolve/report.php
+```
+
+资源上限一律按**可用量的比例**给，不写死绝对值：
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `evolve.memory_pct` | 5.0 | 只取**可用**内存的这个百分比 |
+| `evolve.memory_floor_mb` | 96 | 可用内存低于此值就不开工 |
+| `evolve.load_ratio` | 0.7 | 负载超过 `核数 × 此值` 就不开工 |
+| `evolve.time_budget` | 120 | 单次运行的墙钟上限（秒） |
+| `evolve.min_hits` / `min_ips` | 8 / 3 | 证据门槛：命中次数 / 独立来源数 |
+| `evolve.max_per_run` / `max_adopted` | 5 / 200 | 单次与累计采纳上限 |
+| `evolve.max_code_edits_per_day` | 3 | 每日源码自改次数上限 |
+| `evolve.max_patch_lines` | 40 | 单次补丁行数上限 |
+| `evolve.report_enabled` / `report_url` | true / 空 | 上报开关与地址；留空则只写本地台账 |
+
+`vigil evolve status` 看现状，`scan` 只看证据，`plan` 看它打算做什么，
+`apply` 执行（`--dry-run` 预演），`rollback <id>` 撤销，`watchdog` 检查它有没有失控。
+
 ## 配置校验
 
 `vigil config validate` 会指出真正会让告警发不出去的问题：没有渠道、没有收件人、

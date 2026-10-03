@@ -61,6 +61,9 @@ _TEXT_EXT = (".html", ".htm", ".php", ".js", ".mjs", ".css", ".json", ".xml",
 #: that a link to it is caught even when it is spelled differently (absolute
 #: URL, relative, url-encoded, with a query string).
 DECOYS: tuple = (
+    # -- 由自修正循环于 2026-10-03 采纳：48 个独立来源共请求 104 次，且都不存在（名字像探测）
+    ("/wp-admin/install.php", "auto", "自动采纳的新探测路径"),
+
     ("/.env", "env", "环境变量文件，正常站点不会有人请求它"),
     ("/.git/config", "git/config", "源码仓库配置，泄露后可直接拉走全部代码"),
     ("/.aws/credentials", "aws/credentials", "云平台密钥文件"),
@@ -209,6 +212,39 @@ def learned_decoys() -> list:
             for t in bounded]
 
 
+def evolve_adopted() -> list:
+    """Decoys the self-improvement loop adopted from this host's own traffic.
+
+    Read straight from the state file instead of importing `evolve`: the
+    enforcement path must keep working even when the evolve package is absent,
+    disabled, or broken. A tripwire that stops being enforced because the thing
+    that added it crashed is worse than no tripwire, because nobody is looking
+    for it any more.
+    """
+    import json
+    from ..core import paths as _paths
+    path = _paths.STATE_STATE / "evolve-adopted.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out = []
+    for entry in (data if isinstance(data, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        p = str(entry.get("path") or "")
+        # Same grammar the writer enforces. Re-checked here because this file is
+        # on disk and therefore editable by anything that can write to it, and a
+        # path with a quote or a brace in it would become nginx config injection.
+        if not p.startswith("/") or len(p) > 130:
+            continue
+        if any(c in p for c in '"\'{}; \t\r\n'):
+            continue
+        out.append((p, "auto", "自修正循环采纳：%s"
+                    % (str(entry.get("why") or "")[:60])))
+    return out
+
+
 def candidate_decoys() -> list:
     """Curated decoys, the lure canary, and anything the learning pass adopted.
 
@@ -225,7 +261,7 @@ def candidate_decoys() -> list:
     # `nginx -t` guard rolling the install back rather than by a silent
     # breakage. Curated wins because its rationale is written down.
     out, seen = [], set()
-    for entry in list(DECOYS) + learned_decoys():
+    for entry in list(DECOYS) + learned_decoys() + evolve_adopted():
         if entry[0] in seen:
             continue
         seen.add(entry[0])

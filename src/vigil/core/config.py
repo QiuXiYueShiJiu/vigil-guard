@@ -149,6 +149,33 @@ DEFAULTS: dict = {
         "lure": {
             "sitemap": "auto",
         },
+        # -- 自修正循环 ------------------------------------------------------
+        # 默认关闭。开启后它会读本机真实流量、采纳新的诱饵路径，并把每次
+        # 改动写进台账、改前发邮件、改后上报。
+        #
+        # 它**不会**随意改源码：只有 `source_root` 指向一个真实的源码检出、
+        # 且 `allow_code_edits` 显式打开时，才允许改动唯一一个被许可的文件
+        # （诱饵表），并且仍有行数上限、每日次数上限、备份与「测试不过就还原」。
+        "evolve": {
+            "enabled": False,
+            "allow_code_edits": False,       # 源码自改总开关，默认关
+            "source_root": "",               # 真实源码检出路径；空则无法自改源码
+            "run_tests": True,               # 改源码后必须跑测试
+            "test_target": "",               # 空 = 全套 discover
+            "max_code_edits_per_day": 3,
+            "max_patch_lines": 40,
+            "max_adopted": 200,              # 运行期采纳的诱饵条数上限
+            "max_per_run": 5,                # 单次最多采纳几条
+            "min_hits": 8,                   # 证据门槛：至少被请求次数
+            "min_ips": 3,                    # 证据门槛：至少几个独立来源
+            "memory_pct": 5.0,               # 只取**可用**内存的这个百分比
+            "memory_floor_mb": 96,           # 可用内存低于此值就不开工
+            "load_ratio": 0.7,               # 负载超过 核数×此值 就不开工
+            "time_budget": 120,              # 单次运行的墙钟上限（秒）
+            "report_enabled": True,
+            # 留空 = 只写本地台账，不外发。指向你自己的收集端即可启用上报。
+            "report_url": "",
+        },
         # -- second enforcement point: the web server ----------------------
     # Renders the active ban list into an nginx snippet, so a ban is
     # enforced even on a host without ipset, and so what is blocked can be
