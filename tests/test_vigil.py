@@ -4984,6 +4984,70 @@ class TestEvolveSelfTraining(unittest.TestCase):
         self.assertEqual(1, self.train.outcomes()["keep"])
 
 
+class TestEvolveGeneralisation(unittest.TestCase):
+    """Does it actually generalise, or does the test just look like it does?
+
+    Both tests here exist because the first version of the novel-attack metric
+    reported a confident 100% for a model that had never been trained: an
+    untrained scorer returns exactly 0.5, and the threshold was `>= 0.5`. A
+    measurement that a blank model passes measures nothing.
+    """
+
+    def test_the_novel_attack_test_fails_on_a_blank_model(self):
+        from vigil.evolve import corpus, score
+        res = corpus.novel_attack_test(score.Scorer())
+        self.assertFalse(res["usable"], "空白模型竟然通过了泛化测试")
+        self.assertEqual(0, res["caught"])
+        self.assertLess(res["separation"], 0.3,
+                        "空白模型的区分度必须接近 0，否则这个指标在自欺")
+
+    def test_the_corpus_withholds_whole_families(self):
+        from vigil.evolve import corpus
+        trained = {row[0] for row in corpus.build(
+            skip_families=corpus.HELD_OUT) if row[3] == 1}
+        for fam in corpus.HELD_OUT:
+            for path in corpus.FAMILIES[fam]:
+                self.assertNotIn(path, trained,
+                                 "%s 族的 %s 泄漏进了训练集，泛化测试无效" % (fam, path))
+
+    def test_training_produces_real_separation_without_false_alarms(self):
+        """The number this feature exists for: attacks it has never seen score
+        high, ordinary paths score low, and the gap is wide."""
+        from vigil.evolve import corpus, score
+        model = score.Scorer()
+        for path, status, ua, label in corpus.build(skip_families=corpus.HELD_OUT):
+            for _ in range(8):
+                model.observe(path, status, ua, label=label)
+        res = corpus.novel_attack_test(model)
+        self.assertTrue(res["usable"], "训练后仍然不可用：%s" % res)
+        self.assertGreaterEqual(res["separation"], 0.3)
+        self.assertEqual([], res["false_alarms"],
+                         "把正常路径判成了攻击：%s" % res["false_alarms"])
+
+    def test_critical_files_are_refused_even_if_the_allowlist_widens(self):
+        """Two locks, because the first one is a list someone can edit. An agent
+        that can widen its own limits, or blind its own reporter, is not bounded."""
+        import tempfile
+        from pathlib import Path as _P
+        from vigil import evolve
+        self.assertIn("src/vigil/evolve/__init__.py", evolve.CRITICAL_FILES)
+        self.assertIn("src/vigil/guards/threat.py", evolve.CRITICAL_FILES)
+        self.assertTrue(any(c.startswith("src/vigil/mail") for c in evolve.CRITICAL_FILES))
+        root = _P(tempfile.mkdtemp())
+        (root / "src/vigil/guards").mkdir(parents=True)
+        (root / "src/vigil/guards/threat.py").write_text("x = 1\n", encoding="utf-8")
+        saved = evolve.SAFE_CODE_FILES
+        evolve.SAFE_CODE_FILES = ("src/vigil/guards/threat.py",)
+        try:
+            res = evolve._code_edit(None, str(root), [{"path": "/x", "why": "y"}])
+        finally:
+            evolve.SAFE_CODE_FILES = saved
+        self.assertFalse(res["ok"], "关键文件被改动了")
+        self.assertIn("关键文件", res["err"])
+        self.assertEqual("x = 1\n",
+                         (root / "src/vigil/guards/threat.py").read_text(encoding="utf-8"))
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

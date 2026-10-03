@@ -12,6 +12,7 @@ from ..evolve import (adopted, apply as evolve_apply, format_status,
                       format_watchdog, ledger, loop, plan, rollback, scan,
                       status, watchdog)
 from ..evolve import train as train_mod
+from ..evolve import corpus as corpus_mod
 
 
 def cmd_status(args) -> int:
@@ -130,6 +131,17 @@ def cmd_loop(args) -> int:
 def cmd_train(args) -> int:
     cfg = load_config(args.config or None)
     ui.header("自修正：自我训练", "标签来自本机已经发生的处置结果，不需要人工标注")
+    if args.bulk:
+        res = train_mod.train_bulk(cfg, epochs=args.epochs)
+        if not res.get("ok"):
+            ui.failure(res.get("err", "批量训练未完成"))
+            return 1
+        ui.kv("语料规模", "%d 条（正 %d / 负 %d，含本机真实样本 %d）"
+               % (res["corpus"], res["positives"], res["negatives"], res["host_samples"]))
+        ui.kv("语料内准确率", "%.1f%%" % res["corpus_accuracy"])
+        ui.out()
+        ui.out(corpus_mod.format_novel(res["novel"]))
+        return 0
     res = train_mod.train(cfg, epochs=args.epochs)
     if not res.get("ok"):
         ui.warning(res.get("err", "训练未完成"))
@@ -144,6 +156,20 @@ def cmd_train(args) -> int:
     ui.kv("模型累计学习", "%d 次观测" % res["model_seen"])
     ui.out()
     ui.note("留出集是抽出来没参与训练的样本：只报训练集准确率等于自己给自己打分。")
+    return 0
+
+
+def cmd_novel(args) -> int:
+    cfg = load_config(args.config or None)
+    from ..evolve import corpus as corpus_mod
+    from ..evolve import score as score_mod, train as train_mod
+    ui.header("自修正：全新族类攻击测试",
+              "这几个族类整族排除在训练之外，用它检验是泛化还是背诵")
+    model = score_mod.Scorer.load(train_mod.MODEL)
+    ui.out(corpus_mod.format_novel(corpus_mod.novel_attack_test(model)))
+    ui.out()
+    ui.note("注意对照组：只报「认出多少攻击」没有意义 —— 一个把所有请求都判成"
+            "攻击的模型同样能拿到 100%。这里同时给出正常路径的均分与误报数。")
     return 0
 
 
@@ -202,8 +228,14 @@ def register(sub) -> None:
 
     sp = ps.add_parser("train", help="用本机处置结果自我训练（自监督，无需标注）")
     sp.add_argument("--epochs", type=int, default=15)
+    sp.add_argument("--bulk", action="store_true",
+                    help="用内置大语料训练，并报告对「从未见过的族类」的识别能力")
     sp.add_argument("--config")
     sp.set_defaults(func=cmd_train)
+
+    sp = ps.add_parser("novel", help="用整族未见过的攻击测试泛化能力")
+    sp.add_argument("--config")
+    sp.set_defaults(func=cmd_novel)
 
     sp = ps.add_parser("outcomes", help="回看自己采纳的改动有没有用")
     sp.add_argument("--config")

@@ -32,6 +32,9 @@ from pathlib import Path
 
 from ..core import paths
 from . import ledger
+from . import corpus as corpus_mod
+
+corpus = corpus_mod   # 供命令层直接用，避免从 train 里再摸一层
 from . import score as score_mod
 
 MODEL = paths.STATE_STATE / "evolve-model.json"
@@ -233,3 +236,44 @@ def format_outcomes(res: dict) -> str:
         lines.append("  %s %-38s 命中 %-4d 已存在 %.0f 小时"
                      % (mark, x["path"], x["hits"], x["age_hours"]))
     return "\n".join(lines)
+
+
+def train_bulk(cfg=None, epochs: int = 12, include_host: bool = True) -> dict:
+    """Train on the built-in corpus, plus whatever this host has produced.
+
+    The held-out families are excluded from the fit *and* kept aside, so the
+    headline number is generalisation rather than memory. That is the whole
+    reason the corpus is organised by family instead of by path.
+    """
+    rows = corpus_mod.build(skip_families=corpus_mod.HELD_OUT)
+    host = label_samples(cfg) if include_host else []
+    for h in host:
+        rows.append((h["path"], h["status"], h["ua"], h["label"]))
+
+    seen, data = set(), []
+    for r in rows:
+        if r in seen:
+            continue
+        seen.add(r)
+        data.append(r)
+    pos = sum(1 for r in data if r[3] == 1)
+    if pos < 10 or len(data) - pos < 5:
+        return {"ok": False, "err": "语料不足", "trained": 0}
+
+    model = score_mod.Scorer.load(MODEL)
+    for _ in range(max(1, epochs)):
+        for path, status, ua, label in data:
+            model.observe(path, status, ua, label=label)
+    saved = model.save(MODEL)
+
+    novel = corpus_mod.novel_attack_test(model)
+    in_corpus = sum(1 for path, st, ua, lab in data
+                    if (model.score(path, st, ua) >= 0.5) == bool(lab))
+    res = {"ok": saved, "corpus": len(data), "positives": pos,
+           "negatives": len(data) - pos, "host_samples": len(host),
+           "corpus_accuracy": round(100.0 * in_corpus / max(1, len(data)), 1),
+           "novel": novel, "model_seen": model.seen, "model": str(MODEL)}
+    ledger.record("trained-bulk", corpus=len(data), positives=pos,
+                  host_samples=len(host), novel_rate=novel["rate"],
+                  corpus_accuracy=res["corpus_accuracy"])
+    return res

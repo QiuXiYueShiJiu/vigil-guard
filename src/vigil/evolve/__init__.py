@@ -49,6 +49,29 @@ ADOPTED = paths.STATE_STATE / "evolve-adopted.json"
 #: point -- a self-editing security tool gets exactly this much rope.
 SAFE_CODE_FILES = ("src/vigil/guards/decoy.py",)
 
+#: Files the loop must never write to, whatever configuration says. The
+#: allowlist above already restricts it to one file; this is the second lock,
+#: and it exists because the first one is a list someone can edit. Anything
+#: that decides what gets blocked, what gets alerted, who is trusted, or how
+#: this loop itself is bounded belongs here: an agent that can widen its own
+#: limits, or blind the thing that reports on it, is not a bounded agent.
+CRITICAL_FILES = (
+    "src/vigil/guards/threat.py",        # 封禁决策
+    "src/vigil/guards/bouncer.py",       # 封禁生效
+    "src/vigil/guards/learning.py",      # 观测入口
+    "src/vigil/guards/lure.py",          # 诱导面（含禁词表机制）
+    "src/vigil/evolve/__init__.py",      # 本循环自身的边界
+    "src/vigil/evolve/budget.py",        # 资源上限
+    "src/vigil/evolve/ledger.py",        # 审计链
+    "src/vigil/evolve/report.py",        # 上报与脱敏
+    "src/vigil/evolve/train.py",         # 训练标签来源
+    "src/vigil/core/config.py",          # 全部开关
+    "src/vigil/core/installer.py",       # 部署
+    "src/vigil/core/units.py",           # systemd 单元
+    "src/vigil/cli.py",                  # 命令入口
+    "src/vigil/mail/",                   # 告警通道
+)
+
 #: Insertion anchor: new entries go immediately after this line inside DECOYS.
 DECOYS_ANCHOR = "DECOYS: tuple = ("
 
@@ -366,6 +389,11 @@ def _code_edit(cfg, source_root, props) -> dict:
     """
     root = Path(source_root)
     target = root / SAFE_CODE_FILES[0]
+    # 第二道锁：即使许可表被改宽，这些文件也绝不落笔。
+    rel = SAFE_CODE_FILES[0]
+    for crit in CRITICAL_FILES:
+        if rel == crit or rel.startswith(crit):
+            return {"ok": False, "err": "拒绝改动关键文件：%s" % crit}
     try:
         original = target.read_text(encoding="utf-8")
     except OSError as e:

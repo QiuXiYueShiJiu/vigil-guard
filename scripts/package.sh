@@ -18,13 +18,6 @@ cp -a src tests docs tools scripts examples packaging install.sh \
 find "$L" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 tar -czf "$OUT/vigil-guard-${VERSION}-linux.tar.gz" -C "$STAGE" "vigil-guard-${VERSION}"
 
-echo "==> 打 Windows 便携包 vigil-guard-${VERSION}-windows-agent"
-W="$STAGE/windows"
-mkdir -p "$W"
-cp packaging/windows/vigil-agent.ps1 packaging/windows/README.md "$W/"
-cp LICENSE DISCLAIMER.md "$W/" 2>/dev/null || true
-( cd "$STAGE" && zip -qr "$OLDPWD/$OUT/vigil-guard-${VERSION}-windows-agent.zip" windows )
-
 echo "==> 校验和"
-( cd "$OUT" && sha256sum ./*.tar.gz ./*.zip > SHA256SUMS.txt )
+( cd "$OUT" && sha256sum ./*.tar.gz > SHA256SUMS.txt )
 ls -lh "$OUT"

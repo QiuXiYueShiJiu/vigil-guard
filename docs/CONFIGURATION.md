@@ -110,6 +110,12 @@ sudo vigil config set evolve.report_url https://你的收集端/evolve/report.ph
 `vigil evolve status` 看现状，`scan` 只看证据，`plan` 看它打算做什么，
 `apply` 执行（`--dry-run` 预演），`rollback <id>` 撤销，`watchdog` 检查它有没有失控。
 
+训练与验证：`vigil evolve train`（自监督，标签来自本机处置结果）、
+`vigil evolve train --bulk`（加大语料并报告对未见族类的识别能力）、
+`vigil evolve novel`（用整族未见过命名习惯考它）、
+`vigil evolve outcomes`（回看自己的改动有没有用）。
+完整设计见 [EVOLVE.md](EVOLVE.md)。
+
 ## 配置校验
 
 `vigil config validate` 会指出真正会让告警发不出去的问题：没有渠道、没有收件人、
