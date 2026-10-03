@@ -4563,7 +4563,7 @@ class TestHardeningFromRealProbes(unittest.TestCase):
                 if re.search(pat, probe, re.I)]
 
     def test_the_pearcmd_rce_is_recognised(self):
-        """A real attempt from 120.53.241.11 that no rule matched."""
+        """A real attempt seen in the access log that no rule matched."""
         probe = ("/index.php?lang=../../../../../../../../usr/local/lib/php/"
                  "pearcmd&+config-create+/&/<?echo(md5(\"hi\"));?>+/tmp/index1.php")
         self.assertTrue(self._matched(probe), "pearcmd RCE 尝试没有被识别")
