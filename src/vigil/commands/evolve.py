@@ -105,6 +105,7 @@ def cmd_rollback(args) -> int:
         ("已撤销 %s，剩余 %d 条" % (args.id, res.get("remaining", 0)))
         if res.get("ok") else res.get("err", "失败"))
     if res.get("ok"):
+        ui.out("      邮件：%s" % ("已发出" if res.get("mailed") else "未发出（检查邮件配置）"))
         ui.note("源码层的改动请用 git 复核：cd 源码树 && git diff")
     return 0 if res.get("ok") else 1
 

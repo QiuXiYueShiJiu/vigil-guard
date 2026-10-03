@@ -298,15 +298,18 @@ def apply(cfg=None, prop=None, dry_run: bool = False, log=None) -> dict:
     kind = prop.get("kind")
     if kind == "retire_decoy":
         # 撤销不需要证据门槛，也不写源码：它只是把自己加过的东西拿掉。
-        r = rollback(cfg, prop.get("id"))
+        # 邮件由 rollback 统一发（见那里的说明）—— 撤规则同样是自我修改，
+        # 同样必须先让人知道。
+        r = rollback(cfg, prop.get("id"), log=log)
         if r.get("ok"):
-            ledger.record("retired", id=prop.get("id"), path=prop.get("path"))
+            ledger.record("retired", id=prop.get("id"), path=prop.get("path"),
+                          mailed=r.get("mailed"))
             report_mod.send_report(cfg, {"event": "evolve-retire",
                                          "version": _version(),
                                          "reason": "never_fired"})
         return {"ok": bool(r.get("ok")), "id": prop.get("id"),
                 "path": prop.get("path"), "retired": True,
-                "err": r.get("err")}
+                "mailed": bool(r.get("mailed")), "err": r.get("err")}
     if kind != "adopt_decoy":
         return {"ok": False, "err": "未知的提案类型：%s" % kind}
 
@@ -432,18 +435,48 @@ def _code_edit(cfg, source_root, props) -> dict:
             "detail": "已改 %s（+%d 行，%s）" % (SAFE_CODE_FILES[0], added, detail)}
 
 
-def rollback(cfg=None, change_id=None, log=None) -> dict:
+def rollback(cfg=None, change_id=None, notify: bool = True, log=None) -> dict:
     """Undo one adopted decoy. Source edits are undone with git, deliberately:
     rewriting a tracked file from a backup copy would lose everything else
-    that changed since, and `git checkout` is the honest tool for that."""
+    that changed since, and `git checkout` is the honest tool for that.
+
+    **Every path that changes the rule set passes through here**, so this is
+    where the "tell the operator first" guarantee is enforced rather than
+    remembered. Adding a decoy mails before it writes; so does removing one --
+    a rule that disappears without a word is how a defence quietly stops
+    defending, and it is exactly the change nobody thinks to announce.
+    """
     items = adopted()
+    target = None
+    for e in items:
+        if e.get("id") == change_id:
+            target = e
+            break
     kept = [e for e in items if e.get("id") != change_id]
-    if len(kept) == len(items):
+    if target is None:
         return {"ok": False, "err": "找不到 %s" % change_id}
+
+    mailed = False
+    if notify:
+        mailed = report_mod.mail(
+            cfg, "vigil 将撤下诱饵：%s" % (target.get("path") or change_id),
+            ["会把「%s」这条诱饵规则从生效集合里移除。" % (target.get("path") or "?"),
+             "原因：%s" % (target.get("why") or "（未记录）"),
+             "依据：%s" % (target.get("evidence") or {}),
+             "影响：该路径此后不再被计入探测；已有的封禁不受影响。",
+             "想保留就设 evolve.enabled=false，或把这条路径加回采纳表。"],
+            severity="info", log=log)
+
     if not _save_adopted(kept):
+        ledger.record("failed", id=change_id, err="写入采纳表失败")
         return {"ok": False, "err": "写入失败"}
-    ledger.record("rolled-back", id=change_id, remaining=len(kept))
-    return {"ok": True, "id": change_id, "remaining": len(kept)}
+    ledger.record("rolled-back", id=change_id, path=target.get("path"),
+                  remaining=len(kept), mailed=mailed)
+    # 上报：规则的增与减都是「这个防御长什么样」的变更，开发者侧要能看到
+    report_mod.send_report(cfg, {"event": "evolve-rollback",
+                                 "version": _version(),
+                                 "tier": 1, "remaining": len(kept)})
+    return {"ok": True, "id": change_id, "remaining": len(kept), "mailed": mailed}
 
 
 # -- the loop --------------------------------------------------------------

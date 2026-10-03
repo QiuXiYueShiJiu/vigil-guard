@@ -4838,6 +4838,64 @@ class TestEvolveSelfImprovement(unittest.TestCase):
         self.assertTrue(res["ok"], res)
         self.assertEqual(["mail"], order, "预演阶段就必须先发邮件")
 
+    def test_every_self_modification_mails_before_it_writes(self):
+        """The one invariant that makes an autonomous agent acceptable: whatever
+        it decides to change, the operator hears about it *first*.
+
+        Adding a rule and removing a rule are both changes to what the defence
+        looks like. A rule that disappears without a word is how a defence
+        quietly stops defending, and it is the change nobody thinks to announce
+        -- so this walks every mutating kind rather than trusting the code path
+        that happened to be written most recently.
+        """
+        import json
+        order = []
+        self._patch(self.report, mail=lambda *a, **k: (order.append("mail"), True)[1],
+                    send_report=lambda *a, **k: {"ok": True})
+        self._patch(self.budget, free_mb=lambda: 5000.0)
+
+        # 1) 新增规则
+        self.assertTrue(self.ev.apply(None, {
+            "id": "adopt:/.mail-check", "kind": "adopt_decoy",
+            "path": "/.mail-check", "why": "测试",
+            "evidence": {"hits": 9, "ips": 4}})["ok"])
+        self.assertEqual(["mail"], order, "新增规则没有先发邮件")
+
+        # 2) 撤下规则
+        order.clear()
+        self.assertTrue(self.ev.apply(None, {
+            "id": "adopt:/.mail-check", "kind": "retire_decoy",
+            "path": "/.mail-check", "why": "从未命中",
+            "evidence": {"hits": 0, "age_hours": 48}})["ok"])
+        self.assertEqual(["mail"], order, "撤下规则没有先发邮件")
+
+        # 3) 运维直接调 rollback 也要有邮件
+        order.clear()
+        self.ev.rollback(None, "adopt:/.mail-check")
+        self.assertFalse(order, "已经不存在了，不应再发")
+        self.assertTrue(self.ev.apply(None, {
+            "id": "adopt:/.mail-check2", "kind": "adopt_decoy",
+            "path": "/.mail-check2", "why": "测试",
+            "evidence": {"hits": 9, "ips": 4}})["ok"])
+        order.clear()
+        self.assertTrue(self.ev.rollback(None, "adopt:/.mail-check2")["ok"])
+        self.assertEqual(["mail"], order, "手动撤销没有发邮件")
+
+    def test_a_mailed_rule_change_is_also_written_to_the_ledger(self):
+        self._patch(self.report, mail=lambda *a, **k: True,
+                    send_report=lambda *a, **k: {"ok": True})
+        self._patch(self.budget, free_mb=lambda: 5000.0)
+        self.ev.apply(None, {"id": "adopt:/.led", "kind": "adopt_decoy",
+                             "path": "/.led", "why": "测试",
+                             "evidence": {"hits": 9, "ips": 4}})
+        self.ev.rollback(None, "adopt:/.led")
+        kinds = [e.get("kind") for e in self.ledger.read(50)]
+        self.assertIn("proposed", kinds)
+        self.assertIn("applied", kinds)
+        self.assertIn("rolled-back", kinds)
+        rolled = [e for e in self.ledger.read(50) if e.get("kind") == "rolled-back"][-1]
+        self.assertTrue(rolled.get("mailed"), "台账没有记下邮件是否发出")
+
     def test_rollback_removes_an_adopted_decoy(self):
         prop = {"id": "adopt:/.probe-y", "kind": "adopt_decoy", "path": "/.probe-y",
                 "why": "测试", "evidence": {"hits": 9, "ips": 4}}
