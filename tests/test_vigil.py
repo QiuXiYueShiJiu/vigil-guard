@@ -5015,8 +5015,9 @@ class TestEvolveGeneralisation(unittest.TestCase):
         high, ordinary paths score low, and the gap is wide."""
         from vigil.evolve import corpus, score
         model = score.Scorer()
-        for path, status, ua, label in corpus.build(skip_families=corpus.HELD_OUT):
-            for _ in range(8):
+        # 12 轮：语料在修掉状态码/UA 两个作弊点后变难了，8 轮收敛不到位
+        for _ in range(12):
+            for path, status, ua, label in corpus.build(skip_families=corpus.HELD_OUT):
                 model.observe(path, status, ua, label=label)
         res = corpus.novel_attack_test(model)
         self.assertTrue(res["usable"], "训练后仍然不可用：%s" % res)

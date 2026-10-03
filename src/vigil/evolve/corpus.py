@@ -54,7 +54,7 @@ FAMILIES = {
 #: The families withheld when training the model that is then asked to catch
 #: them. Chosen because they are naming conventions, not single paths: if the
 #: model can only memorise, holding them out makes that visible immediately.
-HELD_OUT = ("ai", "infra", "shell")
+HELD_OUT = ("shell", "api", "cms")
 
 #: Ordinary paths a real site serves. The negative class has to be varied too,
 #: or the model just learns "has a file extension = fine".
@@ -79,27 +79,36 @@ UAS = ("", "-", "curl/7.81.0", "python-requests/2.31", "Go-http-client/1.1",
 def build(skip_families=(), with_negatives=True) -> list:
     """Samples as (path, status, ua, label). `skip_families` withholds whole
     naming conventions, which is how a genuine held-out test is constructed."""
+    # 状态码必须在两类里**都出现**。第一版把所有正例设成 404、负例设成 200，
+    # 结果模型只学会了「404 就是攻击」（权重 7.30，其余全是噪音），
+    # 于是「从未见过的族类」也 100% 命中 —— 那个结论是无效的：
+    # 它认的不是攻击的形状，是状态码。
     rows = []
     for fam, paths in FAMILIES.items():
         if fam in skip_families:
             continue
-        for path in paths:
-            rows.append((path, 404, "", 1))
+        for i, path in enumerate(paths):
+            # 攻击者在真实服务上也会碰到 200（文件存在）、403（有权限控制）、
+            # 302（重定向到登录页），所以正例不能只有 404。
+            # UA 同样不能是破绽：第一版正例 UA 为空、负例是 Mozilla，
+            # 模型立刻改学「UA 为空 = 攻击」（权重压过一切）。两类都要见过同样的 UA。
+            rows.append((path, (404, 403, 200, 302)[i % 4],
+                         ("Mozilla/5.0", "", "curl/7.81.0")[i % 3], 1))
             # The same probe spelled a few other ways: a scanner that tries
             # `/x` also tries `/x.php`, `/x.bak` and `/x?debug=1`.
             if "." not in path.rsplit("/", 1)[-1]:
-                for ext in (".php", ".bak", ".zip"):
-                    rows.append((path + ext, 404, "", 1))
-            for q in ("?debug=1", "?id=1"):
-                rows.append((path + q, 404, "", 1))
-    for path, _st, _ua, _lab in list(rows):
-        for ua in ("curl/7.81.0", "python-requests/2.31", "Go-http-client/1.1"):
-            rows.append((path, 404, ua, 1))
+                for j, ext in enumerate((".php", ".bak", ".zip")):
+                    rows.append((path + ext, (403, 200, 404)[j % 3], "", 1))
+            for j, q in enumerate(("?debug=1", "?id=1")):
+                rows.append((path + q, (200, 302)[j % 2], "", 1))
+
     if with_negatives:
-        for shape in NEGATIVE_SHAPES:
-            rows.append((shape, 200, "Mozilla/5.0", 0))
-            rows.append((shape + "?v=2", 200, "Mozilla/5.0", 0))
-            rows.append((shape, 301, "Mozilla/5.0", 0))
+        for k, shape in enumerate(NEGATIVE_SHAPES):
+            # 正常流量同样会 404（断链、老书签），所以负例也不能只有 2xx。
+            rows.append((shape, (200, 301, 404, 403)[k % 4],
+                         ("Mozilla/5.0", "", "curl/7.81.0")[k % 3], 0))
+            rows.append((shape + "?v=2", 200, "", 0))
+            rows.append((shape, 301, "curl/7.81.0", 0))
         for shape, q in itertools.product(NEGATIVE_SHAPES[:10], ("?page=2", "?lang=zh")):
             rows.append((shape + q, 200, "Mozilla/5.0", 0))
     # De-duplicate; the same (path, status, ua) twice teaches nothing twice.
