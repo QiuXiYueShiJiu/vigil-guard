@@ -43,7 +43,9 @@ Everything here is reversible and additive:
 * the `robots.txt` block is appended between explicit markers and removed
   verbatim on uninstall; the site's own lines are never touched;
 * the sitemap is served by nginx from a generated snippet, so no file appears
-  in the site's webroot;
+  in the site's webroot -- and it is **not served at all** when the site
+  already publishes one of its own (see `own_sitemap`), because shadowing an
+  operator's sitemap is the same mistake as overwriting their `robots.txt`;
 * the block is stripped from the site corpus before decoy screening, so
   advertising a path cannot make that path look "referenced by the site" and
   quietly disqualify itself on the next run.
@@ -88,6 +90,85 @@ PREFERRED = (
     "/phpinfo.php",
     "/.htpasswd",
 )
+
+
+#: What may happen to `/sitemap.xml`, from `threat.lure.sitemap`:
+#:
+#: * ``auto``   -- serve the decoy only when the site does not publish a
+#:                 sitemap of its own (default);
+#: * ``always`` -- serve it regardless, shadowing the site's own file;
+#: * ``never``  -- never serve a decoy sitemap.
+#:
+#: `auto` is the default for the same reason `robots.txt` is never
+#: overwritten: taking a surface the operator is already using trades their
+#: control of their own site for our hit rate, and does it invisibly -- their
+#: `sitemap.xml` would still sit in the webroot while nginx served our
+#: fiction, so nothing in their own tooling would ever notice. The lure does
+#: not depend on it either way: every advertised path is still listed in the
+#: `robots.txt` block, which is the surface automated traffic reads first.
+SITEMAP_MODES = ("auto", "always", "never")
+
+#: Filenames a site might use for its own sitemap, most common first.
+SITEMAP_NAMES = ("sitemap.xml", "sitemap_index.xml", "sitemap-index.xml")
+
+
+def own_sitemap(cfg=None):
+    """The site's own sitemap, if it publishes one; otherwise ``None``.
+
+    Only the site's *own* file counts. A snippet we wrote ourselves lives in
+    the nginx include directory, never in the webroot, so it can never be
+    mistaken for the operator's.
+    """
+    for name in SITEMAP_NAMES:
+        p = _site_file(cfg, name)
+        try:
+            if p is not None and p.is_file() and p.stat().st_size > 0:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def sitemap_mode(cfg=None) -> str:
+    """The configured `threat.lure.sitemap` value, validated."""
+    raw = "auto"
+    if cfg is not None:
+        try:
+            raw = str(cfg.get("threat.lure.sitemap", "auto") or "auto")
+        except Exception:                                   # noqa: BLE001
+            raw = "auto"
+    raw = raw.strip().lower()
+    return raw if raw in SITEMAP_MODES else "auto"
+
+
+def should_serve_sitemap(cfg=None) -> bool:
+    """Whether vigil should answer `/sitemap.xml` with its decoy."""
+    mode = sitemap_mode(cfg)
+    if mode == "never":
+        return False
+    if mode == "always":
+        return True
+    return own_sitemap(cfg) is None
+
+
+def _sitemap_directive(cfg=None) -> str:
+    """The value of the `Sitemap:` line in the lure block.
+
+    Kept relative unless the site publishes a real sitemap. A relative URL is
+    ignored by the crawlers that honour the directive at all, and that is the
+    safe default while the only sitemap we could name is our own fiction --
+    pointing search engines at a list of paths that do not exist would be a
+    poor trade for a lure that `robots.txt` already carries. Once the
+    operator has a real sitemap, naming it is a straight improvement.
+    """
+    own = own_sitemap(cfg)
+    if own is None:
+        return "/sitemap.xml"
+    try:
+        domain, _webroot = decoy._site(cfg)
+    except Exception:                                       # noqa: BLE001
+        domain = ""
+    return ("https://%s/%s" % (domain, own.name)) if domain else ("/%s" % own.name)
 
 
 def _read_json(path: Path) -> dict:
@@ -161,7 +242,7 @@ def robots_block(cfg=None) -> str:
              "User-agent: *"]
     for p in advertised(cfg):
         lines.append("Disallow: %s" % p)
-    lines.append("Sitemap: /sitemap.xml")
+    lines.append("Sitemap: %s" % _sitemap_directive(cfg))
     lines.append(decoy.LURE_END)
     return "\n".join(lines) + "\n"
 
@@ -289,9 +370,15 @@ def conf_path(cfg=None):
 
 
 def install(cfg=None, dry_run: bool = False) -> dict:
-    """Publish both surfaces. All-or-nothing, and validated by nginx."""
+    """Publish both surfaces. All-or-nothing, and validated by nginx.
+
+    The `robots.txt` block is always published. The decoy sitemap is only
+    published when the site is not already serving one of its own -- see
+    `own_sitemap` -- and a snippet left over from an earlier run, when the
+    site had no sitemap yet, is withdrawn so it stops shadowing the real one.
+    """
     out = {"ok": False, "robots": "", "conf": "", "advertised": [],
-           "problems": []}
+           "sitemap": "", "sitemap_reason": "", "problems": []}
     out["advertised"] = advertised(cfg)
     if not out["advertised"]:
         out["problems"].append("没有已安装的诱饵可供宣传（先运行 vigil decoy install）")
@@ -303,41 +390,66 @@ def install(cfg=None, dry_run: bool = False) -> dict:
         return out
     out["conf"] = str(target)
 
+    serve = should_serve_sitemap(cfg)
+    own = own_sitemap(cfg)
+    out["sitemap"] = "served" if serve else "skipped"
+    if serve:
+        out["sitemap_reason"] = "站点没有自己的 sitemap，由 vigil 提供诱饵 sitemap"
+    elif own is not None:
+        out["sitemap_reason"] = ("站点已发布自己的 %s，不覆盖它（诱饵路径仍写在 robots.txt 里）"
+                                 % own.name)
+    else:
+        out["sitemap_reason"] = "配置为不发布诱饵 sitemap"
+
     if dry_run:
         out["ok"] = True
         return out
 
-    # Write the snippet first and validate before reloading: a snippet that
-    # breaks the config takes every site on this host down, which is far
-    # worse than an unpublished lure.
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(render(cfg), encoding="utf-8")
-        os.chmod(target, 0o644)
-    except OSError as e:
-        out["problems"].append("写入 sitemap 片段失败：%s" % e)
-        return out
+    withdrawn = False
+    if serve:
+        # Write the snippet first and validate before reloading: a snippet
+        # that breaks the config takes every site on this host down, which is
+        # far worse than an unpublished lure.
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(render(cfg), encoding="utf-8")
+            os.chmod(target, 0o644)
+        except OSError as e:
+            out["problems"].append("写入 sitemap 片段失败：%s" % e)
+            return out
 
-    ok, msg = decoy._nginx_test()
-    if not ok:
+        ok, msg = decoy._nginx_test()
+        if not ok:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            out["problems"].append("nginx 拒绝新配置，已撤回诱导片段：%s" % msg)
+            return out
+    elif target.exists():
+        # 站点后来有了自己的 sitemap：把之前装过的诱饵片段撤掉，
+        # 否则它会一直挡着站长那个文件（而且从外面完全看不出来）。
         try:
             target.unlink()
-        except OSError:
-            pass
-        out["problems"].append("nginx 拒绝新配置，已撤回诱导片段：%s" % msg)
-        return out
+            withdrawn = True
+        except OSError as e:
+            out["problems"].append("撤销旧的诱饵 sitemap 片段失败：%s" % e)
+            return out
 
     ok, detail = install_robots(cfg)
     out["robots"] = detail
     if not ok:
         out["problems"].append(detail)
-        try:
-            target.unlink()
-        except OSError:
-            pass
+        if serve:
+            try:
+                target.unlink()
+            except OSError:
+                pass
         return out
 
     decoy._nginx_reload()
+    if withdrawn:
+        out["sitemap_reason"] += "；已撤下之前装过的诱饵片段"
     out["ok"] = True
     return out
 
@@ -374,11 +486,14 @@ def status(cfg=None) -> dict:
     adv_set = set(adv)
     lure_hits = [h for h in hits if str(h.get("uri", "")) in adv_set]
     canary_hits = [h for h in hits if str(h.get("uri", "")) == c]
+    own = own_sitemap(cfg)
     return {
         "advertised": adv,
         "canary": c,
         "sitemap_installed": bool(target and target.exists()),
         "sitemap_conf": str(target) if target else "",
+        "sitemap_mode": sitemap_mode(cfg),
+        "own_sitemap": str(own) if own else "",
         "robots_installed": _robots_has_block(cfg),
         "lure_hits": len(lure_hits),
         "canary_hits": len(canary_hits),
@@ -399,9 +514,15 @@ def _robots_has_block(cfg=None) -> bool:
 
 def format_status(st: dict) -> str:
     """Report the lure the way it should be judged: did it work?"""
+    if st["sitemap_installed"]:
+        sm = "已发布（诱饵）"
+    elif st.get("own_sitemap"):
+        sm = "未发布 —— 站点自己的 %s 在用（模式 %s）" % (
+            Path(st["own_sitemap"]).name, st.get("sitemap_mode", "auto"))
+    else:
+        sm = "未发布（模式 %s）" % st.get("sitemap_mode", "auto")
     lines = ["宣传的诱饵路径  %d 条" % len(st["advertised"]),
-             "sitemap.xml     %s" % ("已发布" if st["sitemap_installed"]
-                                     else "未发布"),
+             "sitemap.xml     %s" % sm,
              "robots.txt      %s" % ("已写入诱导段" if st["robots_installed"]
                                      else "未写入"),
              "金丝雀          %s" % st["canary"],

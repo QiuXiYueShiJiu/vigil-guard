@@ -137,6 +137,18 @@ DEFAULTS: dict = {
             # the decoys is all that is needed to start catching them.
             "decoy": [],
         },
+        # -- lure surfaces (robots.txt / sitemap) --------------------------
+        # What may happen to /sitemap.xml:
+        #   "auto"   -- serve the decoy sitemap only when this site does not
+        #               already publish one of its own (default)
+        #   "always" -- serve it regardless, shadowing the site's own file
+        #   "never"  -- never serve a decoy sitemap
+        # The robots.txt block is independent of this: it always lists the
+        # same paths, so "auto" does not weaken the lure, it only declines to
+        # take a surface the operator is already using.
+        "lure": {
+            "sitemap": "auto",
+        },
         # -- second enforcement point: the web server ----------------------
     # Renders the active ban list into an nginx snippet, so a ban is
     # enforced even on a host without ipset, and so what is blocked can be

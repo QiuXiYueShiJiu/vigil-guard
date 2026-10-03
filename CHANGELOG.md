@@ -4,6 +4,74 @@
 
 ---
 
+## v1.1.0 — 2026-10-03
+
+**诱导面不再抢站长自己的 sitemap。**
+
+> 版本号保持三段，没有采用四段写法：本项目自带「禁止硬编码宿主机信息」的源码审计
+> （`core/sourceaudit.py`），其中一条规则按 IPv4 形状匹配公网 IP。四段式版本号
+> 的每个数字段都落在 0–255 内，**形状与一个 IP 地址完全一致，必然被判成泄漏的 IP**，
+> 从而让这项检查在发布前就失败。四段版本号与这条守卫不可兼得，
+> 所以按项目原有的三段 semver 约定发版。
+
+### 问题
+
+`vigil lure install` 会往站点 include 目录写一段：
+
+```nginx
+location = /sitemap.xml {
+    return 200 "<只列诱饵路径的假 sitemap>";
+}
+```
+
+`location =` 是精确匹配，优先级高于静态文件。于是只要这段配置在，**站长自己放在
+webroot 的 `sitemap.xml` 就再也不会被送出去**，而它在磁盘上还好端端躺着 ——
+从服务器外面完全看不出来，站长自己的任何工具也不会报错。
+
+实测过一次：站点真实 sitemap 里有 26 个页面地址，线上访问 `/sitemap.xml` 拿到的是
+7 条诱饵路径，搜索引擎侧等于「这个站只有一个不存在的备份文件」。对一个正在做 SEO 的
+站点来说，这比少一个诱饵渠道严重得多。
+
+### 为什么这是设计错误
+
+同一份 `lure.py` 里早就写明了不覆盖 `robots.txt` 的理由：
+
+> this site already has one, and silently replacing an operator's file to add a
+> lure would trade their control of their own site for our hit rate.
+
+Sitemap 是同一个东西，却做了相反的事。所以这一版把**同一条规则**补到 sitemap 上。
+
+### 改了什么
+
+- 新增 `own_sitemap()`：探测站点 webroot 里是否已有 `sitemap.xml` /
+  `sitemap_index.xml` / `sitemap-index.xml`（只认站长自己的文件，vigil 的片段在
+  nginx include 目录，不会被误认）。
+- 新增配置 **`threat.lure.sitemap`**，三档：
+  - `auto`（默认）—— 站点有自己的 sitemap 就不发诱饵 sitemap；
+  - `always` —— 照旧发，明确接受覆盖站长文件；
+  - `never` —— 从不发诱饵 sitemap。
+- `install()` 现在会把**之前装过的**诱饵片段撤下来：站点先没有 sitemap、
+  后来有了，这段配置会一直挡着，必须主动清理并 reload。
+- 非法配置值退回 `auto`，不会当成 `always`。
+- `robots.txt` 的 `Sitemap:` 行在**站点有真 sitemap 时**才写成绝对地址
+  （规范要求绝对地址，相对地址会被守规矩的爬虫忽略）。没有真 sitemap 时保持相对 ——
+  那时唯一能指的只有我们自己那份假 sitemap，指给搜索引擎看反而有害。
+- `vigil lure status` 现在会说明当前是谁在提供 sitemap。
+
+### 诱导面没有变弱
+
+`robots.txt` 诱导段与 sitemap 开关完全独立，照样列出全部宣传路径（含金丝雀）——
+而 robots.txt 本来就是自动化流量**最先读**的那个面。少的是「同一批路径的第二条渠道」，
+不是渠道本身。
+
+### 测试
+
+新增 6 项：站点有自己的 sitemap 时不覆盖、没有时照常发、已装的片段会被撤下并 reload、
+三档配置都生效、非法值退回默认、`Sitemap:` 行只在有真 sitemap 时转绝对。
+原来那套 21 项诱导面测试全部保持通过；全套 412 项通过。
+
+---
+
 ## v1.0.5 — 2026-10-02
 
 在**不惩罚真人**的前提下，把机器破解的成本抬高。杠杆放在「题目」上，不放在「拖动姿势」上。

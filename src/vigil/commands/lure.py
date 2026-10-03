@@ -1,6 +1,8 @@
 """`vigil lure` -- the crawler-facing lure surfaces and whether they work."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from .. import ui
 from ..core.config import load as load_config
 from ..guards import lure as lure_mod
@@ -13,8 +15,15 @@ def cmd_status(args) -> int:
     ui.out(lure_mod.format_status(st))
     ui.out()
     ui.kv("robots.txt", "站点自己的规则保留，vigil 只追加带标记的段落")
-    ui.kv("sitemap.xml", "由 nginx 片段提供，不在站点目录里留文件")
-    if not st["sitemap_installed"] or not st["robots_installed"]:
+    if st["sitemap_installed"]:
+        ui.kv("sitemap.xml", "由 nginx 片段提供诱饵 sitemap（不在站点目录里留文件）")
+    elif st.get("own_sitemap"):
+        ui.kv("sitemap.xml", "站点自己的 %s 在用，vigil 不覆盖它"
+              % Path(st["own_sitemap"]).name)
+    else:
+        ui.kv("sitemap.xml", "未发布（模式 %s）" % st.get("sitemap_mode", "auto"))
+    # 站点有自己的 sitemap 时「未发布」是正常状态，不该提示去 install
+    if not st["robots_installed"]:
         ui.hint("发布：vigil lure install")
     return 0
 

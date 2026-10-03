@@ -60,6 +60,27 @@ sudo vigil threat whitelist
 > 如果你的管理 IP 是运营商动态分配的，把它加进白名单等于没加 —— 换个网段就失效了。
 > 这种情况下靠的是「先确认能登录，再收紧」，而不是靠白名单。
 
+## sitemap：不抢站长自己的那一份
+
+`vigil lure install` 会往站点 include 目录写一段 nginx 片段，让 `/sitemap.xml`
+返回一份「列出诱饵路径的假 sitemap」，把扫描器引到诱饵端点上。
+
+但 `location = /sitemap.xml` 是精确匹配，会**盖住站长自己放在 webroot 的 sitemap** ——
+文件还在，只是永远送不出去，从外面完全看不出来。所以默认行为是：**站点自己有
+sitemap 就不发诱饵 sitemap**，把这一面留给站长。
+
+```sh
+# 三档，默认 auto
+sudo vigil config set threat.lure.sitemap auto     # 站点有就不发（默认）
+sudo vigil config set threat.lure.sitemap always   # 照发，明确接受覆盖站长文件
+sudo vigil config set threat.lure.sitemap never    # 从不发
+```
+
+`vigil lure status` 会说明当前是谁在提供 sitemap，以及金丝雀是否被请求过。
+
+> 诱导面本身不靠 sitemap：`robots.txt` 里那一段（`Disallow:` 一串诱饵路径 + 金丝雀）
+> 是独立的，跟这个开关无关，而它才是自动化流量最先读的地方。
+
 ## 配置校验
 
 `vigil config validate` 会指出真正会让告警发不出去的问题：没有渠道、没有收件人、

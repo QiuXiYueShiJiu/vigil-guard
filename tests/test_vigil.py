@@ -4412,6 +4412,105 @@ class TestLureSurfaces(unittest.TestCase):
         self.assertIn("确认有自动化流量读取了本机的诱导面",
                       self.lure.format_status(st))
 
+    # -- not shadowing a sitemap the site already publishes ---------------
+
+    def test_a_site_with_its_own_sitemap_is_not_shadowed(self):
+        """Shadowing it is the mistake this module already refuses to make
+        with robots.txt: the operator's file stays on disk while nginx serves
+        our fiction, and nothing in their tooling ever notices."""
+        (self.webroot / "sitemap.xml").write_text(
+            '<?xml version="1.0"?><urlset><url><loc>https://example.test/</loc></url></urlset>',
+            encoding="utf-8")
+        self.assertIsNotNone(self.lure.own_sitemap())
+        self.assertFalse(self.lure.should_serve_sitemap(),
+                         "站点已有 sitemap，却还要拿诱饵去顶掉它")
+
+    def test_the_decoy_sitemap_is_still_served_when_the_site_has_none(self):
+        self.assertIsNone(self.lure.own_sitemap())
+        self.assertTrue(self.lure.should_serve_sitemap())
+        self.assertIn("location = /sitemap.xml", self.lure.render())
+
+    def test_installing_withdraws_a_decoy_that_started_shadowing(self):
+        """The migration that matters: the snippet was installed while the
+        site had no sitemap; later the site published one. Without this the
+        decoy would keep winning and the real sitemap would never be served."""
+        calls = []
+        self._patch_nginx(calls)
+        target = self.lure.conf_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.lure.render(), encoding="utf-8")
+        (self.webroot / "sitemap.xml").write_text("<urlset/>", encoding="utf-8")
+
+        r = self.lure.install()
+        self.assertTrue(r["ok"], r["problems"])
+        self.assertEqual("skipped", r["sitemap"])
+        self.assertFalse(target.exists(), "旧的诱饵片段没有被撤下来")
+        self.assertIn("站点已发布自己的", r["sitemap_reason"])
+        self.assertIn("nginx", " ".join(calls), "撤下配置后必须 reload，否则线上没变")
+
+    def test_installing_writes_the_snippet_when_there_is_no_real_sitemap(self):
+        calls = []
+        self._patch_nginx(calls)
+        target = self.lure.conf_path()
+        r = self.lure.install()
+        self.assertTrue(r["ok"], r["problems"])
+        self.assertEqual("served", r["sitemap"])
+        self.assertTrue(target.exists())
+        self.assertIn("location = /sitemap.xml", target.read_text(encoding="utf-8"))
+
+    def test_the_mode_can_force_the_decoy_on_or_off(self):
+        cfg = vconfig.Config(path=self.root / "c.json",
+                             secrets_path=self.root / "s.json")
+        (self.webroot / "sitemap.xml").write_text("<urlset/>", encoding="utf-8")
+        self.assertFalse(self.lure.should_serve_sitemap(cfg))     # auto
+        cfg.set("threat.lure.sitemap", "always")
+        self.assertTrue(self.lure.should_serve_sitemap(cfg))
+        cfg.set("threat.lure.sitemap", "never")
+        self.assertFalse(self.lure.should_serve_sitemap(cfg))
+        cfg.set("threat.lure.sitemap", "不是合法值")
+        self.assertEqual("auto", self.lure.sitemap_mode(cfg),
+                         "非法值应当退回默认，而不是当成 always")
+
+    def test_the_sitemap_directive_only_turns_absolute_for_a_real_sitemap(self):
+        """A relative line is ignored by crawlers -- the safe default while
+        the only sitemap we could name is our own fiction."""
+        self.assertEqual("/sitemap.xml",
+                         self.lure._sitemap_directive())
+        (self.webroot / "sitemap.xml").write_text("<urlset/>", encoding="utf-8")
+        self.assertEqual("https://example.test/sitemap.xml",
+                         self.lure._sitemap_directive())
+
+    def test_status_says_whose_sitemap_is_being_served(self):
+        (self.webroot / "sitemap.xml").write_text("<urlset/>", encoding="utf-8")
+        st = self.lure.status()
+        self.assertTrue(st["own_sitemap"].endswith("sitemap.xml"))
+        self.assertFalse(st["sitemap_installed"])
+        self.assertIn("站点自己的 sitemap.xml 在用",
+                      self.lure.format_status(st))
+
+    def _patch_nginx(self, calls):
+        """Keep the tests off the real nginx and off the real include dir.
+
+        Without the `conf_path` stub the install path cannot be exercised at
+        all here: this box has no `/www/server/panel/vhost/nginx/extension`
+        for `example.test`, so `install()` bails out before doing anything --
+        which is how the first version of these tests managed to pass while
+        proving nothing.
+        """
+        conf = self.root / "include" / self.lure.CONF_NAME
+        self._old_test = self.decoy._nginx_test
+        self._old_reload = self.decoy._nginx_reload
+        self._old_conf_path = self.lure.conf_path
+        self.decoy._nginx_test = lambda: (True, "ok")
+        self.decoy._nginx_reload = lambda: calls.append("nginx reload")
+        self.lure.conf_path = lambda cfg=None: conf
+
+        def restore():
+            self.decoy._nginx_test = self._old_test
+            self.decoy._nginx_reload = self._old_reload
+            self.lure.conf_path = self._old_conf_path
+        self.addCleanup(restore)
+
 
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
