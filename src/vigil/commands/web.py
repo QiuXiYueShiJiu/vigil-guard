@@ -189,11 +189,12 @@ def cmd_unit(args) -> int:
     cfg = load_config(args.config or None)
     content = units.service(
         "vigil-web.service", "Built-in status and feedback page",
-        ["%s -m vigil.cli web serve" % units.python_bin()],
+        "ExecStart=%s -m vigil.cli web serve" % units.python_bin(),
         stype="simple", restart="always", restart_sec=5,
         nice=5, cpu_quota="3%", memory_max="128M",
         alerting=False, oom_score=300)
-    p = units.write_unit("vigil-web.service", content)
+    # 短名：`unit_path()` 会自己加上 UNIT_PREFIX（传全名会得到 vigil-vigil-web）
+    p = units.write_unit("web.service", content)
     units.ensure_timers_running(log=lambda m: ui.out("  " + m))
     shell.systemd_reload()
     shell.run(["systemctl", "enable", "--now", "vigil-web.service"], timeout=60)

@@ -322,7 +322,7 @@ def render_all(cfg, features) -> dict:
         units["evolve.service"] = service(
             "vigil-evolve.service",
             "Self-improvement loop (bounded, evidence-gated, reversible)",
-            ["%s -m vigil.cli evolve loop" % python_bin()],
+            "ExecStart=%s -m vigil.cli evolve loop" % python_bin(),
             stype="oneshot",
             restart="no",
             nice=19, cpu_quota="5%", io_weight="10", memory_max="256M",
@@ -343,7 +343,7 @@ def render_all(cfg, features) -> dict:
         units["watchdog.service"] = service(
             "vigil-watchdog.service",
             "Watchdog for the self-improvement loop",
-            ["%s -m vigil.cli evolve watchdog" % python_bin()],
+            "ExecStart=%s -m vigil.cli evolve watchdog" % python_bin(),
             stype="simple", restart="always", restart_sec=30,
             nice=10, cpu_quota="3%", io_weight="10", memory_max="128M",
             alerting=True, oom_score=100)
