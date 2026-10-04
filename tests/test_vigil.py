@@ -5608,6 +5608,106 @@ class TestHttpBurstIsAboutMissingPaths(unittest.TestCase):
         self.assertTrue(self._banned(), "只刷 403 的客户端再也封不掉了")
 
 
+class TestWebStatusPage(unittest.TestCase):
+    """The built-in page: no default credentials, and no host in the source.
+
+    Two properties matter more than the page itself. A monitoring page with a
+    shipped default login is an admin panel someone else already has the
+    password to; and a page generated from a template that names one machine is
+    a page that is wrong on every other machine.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil.web import server as wserver, status as wstatus, page as wpage
+        self.w, self.wstatus, self.wpage = wserver, wstatus, wpage
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def test_there_is_no_default_account(self):
+        self.assertFalse(self.w.credentials_set(self.cfg))
+        self.assertEqual("", str(self.cfg.get("web.username", "")))
+        self.assertFalse(self.w.verify_password(self.cfg, "admin", "admin"))
+        self.assertFalse(self.w.verify_password(self.cfg, "", ""))
+
+    def test_the_password_never_lands_in_the_config_file(self):
+        self.w.set_password(self.cfg, "op", "correct horse battery staple")
+        self.cfg.save(backup=False)
+        conf = (self.root / "c.json").read_text(encoding="utf-8")
+        secrets = (self.root / "s.json").read_text(encoding="utf-8")
+        self.assertNotIn("correct horse", conf)
+        self.assertNotIn("correct horse", secrets)
+        self.assertIn("password_hash", secrets)
+        self.assertIn("password_salt", secrets)
+        self.assertNotIn("password_hash", conf,
+                         "配置会被贴进工单，不该带凭据")
+
+    def test_verification_needs_both_halves(self):
+        self.w.set_password(self.cfg, "op", "a-long-enough-secret")
+        self.assertTrue(self.w.verify_password(self.cfg, "op", "a-long-enough-secret"))
+        self.assertFalse(self.w.verify_password(self.cfg, "op", "a-long-enough-secreT"))
+        self.assertFalse(self.w.verify_password(self.cfg, "someone", "a-long-enough-secret"))
+
+    def test_the_same_password_hashes_differently_every_time(self):
+        """A fixed salt would make two hosts with the same password identical
+        in an archive, and would let a precomputed table be reused."""
+        a = self.w.hash_password("same-secret-value")
+        b = self.w.hash_password("same-secret-value")
+        self.assertNotEqual(a[0], b[0])
+        self.assertNotEqual(a[1], b[1])
+
+    def test_the_proxy_block_names_no_host_that_was_not_configured(self):
+        from vigil.commands import web as cmd
+        blank = cmd.render_conf(self.cfg)
+        self.assertIn("server_name _;", blank,
+                      "没配域名时不该凭空出现一个域名")
+        self.assertIn("127.0.0.1:%d" % int(self.cfg.get("web.port", 9177)), blank)
+        self.cfg.set("web.domain", "status.example.com")
+        named = cmd.render_conf(self.cfg)
+        self.assertIn("status.example.com", named)
+        self.assertNotIn("vigil.example", named)
+
+    def test_host_details_come_from_the_running_machine(self):
+        board = self.wstatus.board(self.cfg)
+        import socket
+        self.assertEqual(socket.gethostname(), board["host"]["hostname"])
+        self.assertTrue(board["cards"] and board["tables"])
+
+    def test_sessions_are_not_written_to_disk(self):
+        tok = self.w._Sessions(ttl=60).new()
+        self.assertTrue(tok)
+        self.assertEqual([], list(self.root.rglob("*session*")))
+
+    def test_sessions_expire(self):
+        s = self.w._Sessions(ttl=60)
+        tok = s.new()
+        self.assertTrue(s.valid(tok))
+        s.drop(tok)
+        self.assertFalse(s.valid(tok))
+        self.assertFalse(s.valid(""))
+
+    def test_login_attempts_are_rate_limited(self):
+        a = self.w._Attempts(limit=3, window=60)
+        for _ in range(3):
+            self.assertFalse(a.blocked("203.0.113.9"))
+            a.bump("203.0.113.9")
+        self.assertTrue(a.blocked("203.0.113.9"), "登录没有被限流")
+        self.assertFalse(a.blocked("198.51.100.4"), "限流不该牵连别的来源")
+
+    def test_the_page_is_self_contained(self):
+        """No CDN: a status page must render on a host with no outbound network."""
+        body = self.wpage.status_page(title="t", host={"subtitle": "s"},
+                                      cards=[], tables=[], csrf="x")
+        self.assertIn("<style>", body)
+        for bad in ("http://", "https://", "src="):
+            self.assertNotIn(bad, body, "页面引用了外部资源：%s" % bad)
+        self.assertIn("noindex", body)
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

@@ -476,11 +476,20 @@ DEFAULTS: dict = {
         "immutable": True,          # set -e 2 so rules cannot be relaxed
     },
 
-    # -- web (local status page) ----------------------------------------
+    # -- web (自带的状态与反馈页面) ---------------------------------------
+    # 默认关闭：这是一个对外可达的页面，装不装由运维决定，不由默认值决定。
+    # 只监听本机，由已有的 Web 服务反代对外 —— 让这个进程直接对外就等于
+    # 自己实现一遍 TLS，而「差一点」的 TLS 会让它变成全机最薄弱的一环。
+    # 账号与密码由使用者在命令行交互设置（`vigil web passwd`）：程序**不
+    # 自带默认凭据**，只把 PBKDF2 派生值与随机盐存进 secrets.json。
+    # `domain` 默认留空：写死任何域名都会把一台机器的信息带进随包文件。
     "web": {
         "enabled": False,
         "listen": "127.0.0.1",
-        "port": 0,
+        "port": 9177,
+        "domain": "",
+        "username": "",
+        "session_minutes": 60,
     },
 
     # Filled in at install time; display only.
