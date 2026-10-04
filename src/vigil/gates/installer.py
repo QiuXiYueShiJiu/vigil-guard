@@ -32,15 +32,7 @@ from pathlib import Path
 
 from ..core import paths, shell
 from ..core.errors import UnsupportedError, VigilError
-from .spec import KIND_BT, KIND_LOGIN, GateSpec
-
-#: Layouts an earlier version of this tool created. Mirrored here so the
-#: installer can recognise and take over from its own previous output
-#: without disturbing the other gate type.
-LEGACY_LAYOUTS = (
-    {"kind": KIND_BT, "state_dir": "/www/server/bt-gate"},
-    {"kind": KIND_LOGIN, "state_dir": "/www/server/dsh-gate"},
-)
+from .spec import GateSpec, package_state_dir
 
 TEMPLATES = Path(__file__).resolve().parent / "templates"
 from ..core.paths import BACKUP_DIR as BACKUP_ROOT
@@ -607,7 +599,7 @@ def render_nginx(spec: GateSpec) -> str:
 """.format(cert=spec.cert_dir, zone=spec.zone("tls"))
         return """# ============================================================
 # Vigil gate: {kind}
-# GENERATED FILE — regenerate with `vigil gate reconfigure {kind}`
+# GENERATED FILE — regenerate with `{regen}`
 #
 # Listens on the loopback only. The reverse proxy in the control panel is
 # the sole path in, so the gate port is not reachable from the internet
@@ -664,15 +656,15 @@ server
         proxy_hide_header   X-Powered-By;
     }}
 }}
-""".format(kind=spec.kind, upstream=spec.upstream,
+""".format(kind=spec.slug, regen=_regen_cmd(spec), upstream=spec.upstream,
            listen=listen, server_name=spec.server_name, tls=tls,
            headers=headers, locations=locations, lua=lua_path(spec),
-           slug=re.sub(r"\W+", "-", spec.kind))
+           slug=spec.conf_slug)
 
     # Non-proxy mode: a snippet included at server scope in an existing vhost.
     return """# ============================================================
 # Vigil gate: {kind}  (server-scope snippet)
-# GENERATED FILE — regenerate with `vigil gate reconfigure {kind}`
+# GENERATED FILE — regenerate with `{regen}`
 #
 # Included at SERVER scope on purpose. Attaching a gate to `location /`
 # only leaves every other location open, which is the classic way to end up
@@ -685,7 +677,16 @@ server
 {locations}
 # ---------------- the gate itself ----------------
 access_by_lua_file {lua};
-""".format(kind=spec.kind, locations=locations, lua=lua_path(spec))
+""".format(kind=spec.slug, regen=_regen_cmd(spec), locations=locations,
+           lua=lua_path(spec))
+
+
+def _regen_cmd(spec: GateSpec) -> str:
+    """The command that regenerates this exact instance, for the banner."""
+    cmd = "vigil gate reconfigure %s" % spec.kind
+    if spec.name and spec.name != spec.kind:
+        cmd += " --name %s" % spec.name
+    return cmd
 
 
 def lua_path(spec: GateSpec) -> str:
@@ -833,7 +834,7 @@ def install(spec: GateSpec, env: dict = None, log=None,
     # 3. the ZONES file must land in http{} before any vhost uses it
     zones_file = Path(spec.zones_file or (
         Path(spec.nginx_conf).parent / ("vigil-gate-%s-zones.conf"
-                                        % re.sub(r"\W+", "-", spec.kind))))
+                                        % re.sub(r"\W+", "_", spec.slug))))
     try:
         if zones_file.exists():
             _backup(zones_file)
@@ -985,6 +986,20 @@ def _php_smoke_test(php: str, rendered: dict, spec: GateSpec) -> list:
     try:
         shutil.rmtree(str(stage), ignore_errors=True)
         # Reproduce the real on-disk layout so relative paths resolve.
+        #
+        # The generated config.php requires its library by *absolute* path
+        # (`<state_dir>/lib/gate-lib.php`). On a brand-new instance that path
+        # does not exist yet, so executing the staged copy emitted "Failed to
+        # open stream" and aborted the whole install before a single file was
+        # written -- this check only ever passed for an instance that already
+        # had its files on disk, and for those it silently loaded the *old*
+        # library rather than the one just rendered. Rewriting the absolute
+        # roots to the staging tree makes the staged copy self-contained, so
+        # the library and policy actually exercised are this render's. Only
+        # the throwaway copies under /tmp are touched; the content that gets
+        # written to the real paths is never altered.
+        roots = ((str(Path(spec.state_dir)), str(stage)),
+                 (str(Path(spec.webroot)), str(stage / "__web__")))
         rel = {}
         for path, (content, _mode) in rendered.items():
             try:
@@ -996,9 +1011,13 @@ def _php_smoke_test(php: str, rendered: dict, spec: GateSpec) -> list:
                         Path(spec.webroot))
                 except ValueError:
                     rel_path = Path(Path(path).name)
+            text = content
+            for real, staged in roots:
+                if real:
+                    text = text.replace(real, staged)
             target = stage / rel_path
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            target.write_text(text, encoding="utf-8")
             rel[str(path)] = target
 
         for path, (content, _mode) in rendered.items():
@@ -1082,10 +1101,12 @@ def _withdraw_conflicts(spec: GateSpec, env: dict, keep: Path, log=None) -> list
                     candidates.update(site.glob("*.conf"))
 
     lua = lua_path(spec)
-    own_lua = [str(Path(e["state_dir"]) / "gate.lua") for e in LEGACY_LAYOUTS
-               if e["kind"] == spec.kind]
-    if str(Path(spec.state_dir) / "gate.lua") not in own_lua:
-        own_lua.append(str(Path(spec.state_dir) / "gate.lua"))
+    # Only wiring for *this instance* may be withdrawn: its current script,
+    # or the packaged location an earlier version of the same instance used.
+    # Widening this to the whole kind is exactly how installing a second
+    # login gate used to tear down the first one's nginx configuration.
+    own_lua = [lua, str(Path(package_state_dir(spec.kind, spec.name))
+                        / "gate.lua")]
     port_re = (re.compile(r"listen\s+[0-9a-fA-F:.]+:%d\b" % spec.listen_port)
                if spec.listen_port else None)
 
@@ -1097,11 +1118,15 @@ def _withdraw_conflicts(spec: GateSpec, env: dict, keep: Path, log=None) -> list
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        has_lua = "access_by_lua_file" in text and "gate.lua" in text
+        # A file wiring a different gate is not ours to remove, on any
+        # grounds -- including a port clash, which is reported before the
+        # installer is ever reached.
+        foreign = has_lua and not any(own in text for own in own_lua)
         conflict = False
-        if "access_by_lua_file" in text and "gate.lua" in text:
-            if lua not in text and any(own in text for own in own_lua):
-                conflict = True
-        if port_re and port_re.search(text):
+        if has_lua and not foreign and lua not in text:
+            conflict = True
+        if port_re and port_re.search(text) and not foreign:
             conflict = True
         if not conflict:
             continue
@@ -1235,7 +1260,7 @@ def uninstall(spec: GateSpec, env: dict = None, remove_state: bool = False) -> d
             pass
     zones = Path(spec.zones_file or (
         target.parent / ("vigil-gate-%s-zones.conf"
-                         % re.sub(r"\W+", "-", spec.kind))))
+                         % re.sub(r"\W+", "_", spec.slug))))
     if zones.exists():
         try:
             zones.unlink()

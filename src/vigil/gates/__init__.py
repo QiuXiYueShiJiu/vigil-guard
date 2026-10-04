@@ -29,20 +29,29 @@ from pathlib import Path
 from ..core import detect, shell
 from ..core.errors import VigilError
 from . import installer
-from .spec import KIND_BT, KIND_LOGIN, KIND_META, GateSpec
+from .spec import (BT_INSTANCE_NAME, KIND_BT, KIND_LOGIN, KIND_META,
+                   LEGACY_LOGIN_NAME, GateSpec, config_section,
+                   instance_cookie, instance_dir_basename, instance_label,
+                   instance_nav_cookie, instance_state_dir, instance_webroot,
+                   normalize_instance, package_state_dir)
 
 __all__ = [
     "KIND_BT", "KIND_LOGIN", "KIND_META", "GateSpec",
+    "BT_INSTANCE_NAME", "LEGACY_LOGIN_NAME",
+    "config_section", "instance_candidates", "instance_label",
+    "normalize_instance",
     "detect_all", "detect_one", "adopt", "status", "install", "uninstall",
     "reconfigure", "hash_password",
 ]
 
 #: Layouts produced by earlier versions of this tool, or configured by hand.
 #: Each is still fully readable, so an existing installation can be adopted
-#: rather than replaced.
+#: rather than replaced. Kept as data because they are also the source of the
+#: default instance's directory, cookie and config key.
 LEGACY_LAYOUTS = (
     {
         "kind": KIND_BT,
+        "name": BT_INSTANCE_NAME,
         "state_dir": "/www/server/bt-gate",
         "webroot": "/www/wwwroot/bt-gate",
         "entry": "/__btgate",
@@ -50,6 +59,7 @@ LEGACY_LAYOUTS = (
     },
     {
         "kind": KIND_LOGIN,
+        "name": LEGACY_LOGIN_NAME,
         "state_dir": "/www/server/dsh-gate",
         "webroot": "/www/wwwroot/dsh-gate",
         "entry": "/__gate/login",
@@ -57,6 +67,125 @@ LEGACY_LAYOUTS = (
         "nav_cookie": "dshnav",
     },
 )
+
+def conf_slug(kind: str, name: str = "") -> str:
+    """Hyphenated slug used in this instance's nginx file names."""
+    return re.sub(r"\W+", "-", normalize_instance(kind, name))
+
+
+def instance_name_from_dir(path) -> str:
+    """Recover an instance name from a `*-gate` state directory."""
+    base = os.path.basename(str(path).rstrip("/"))
+    if base == "bt-gate":
+        return BT_INSTANCE_NAME
+    if base == "dsh-gate":
+        return LEGACY_LOGIN_NAME
+    if not base.endswith("-gate"):
+        return ""
+    try:
+        # `dsh-gate` and `bt-gate` are handled above; anything else that
+        # normalises back to a reserved name is not an instance we created.
+        return normalize_instance(KIND_LOGIN, base[:-len("-gate")])
+    except VigilError:
+        return ""
+
+
+def declared_instances(cfg) -> list:
+    """``(config_section, kind, name)`` for every instance in the config.
+
+    The two original gates are always present, whether or not they are
+    installed, because `status` has always shown both. Named instances are
+    read from `gate.<name>` sections -- that key is the instance's identity,
+    so no separate index needs to be kept in sync with it.
+    """
+    out = [("bt_panel", KIND_BT, BT_INSTANCE_NAME),
+           ("dsh_gate", KIND_LOGIN, LEGACY_LOGIN_NAME)]
+    gate_cfg = cfg.get("gate") if cfg is not None else None
+    if not isinstance(gate_cfg, dict):
+        return out
+    for key in sorted(gate_cfg):
+        if key in ("bt_panel", "dsh_gate", "demo"):
+            continue
+        if not isinstance(gate_cfg[key], dict):
+            continue
+        try:
+            name = normalize_instance(KIND_LOGIN, key)
+        except VigilError:
+            continue
+        if name == key:
+            out.append((key, KIND_LOGIN, name))
+    return out
+
+
+def _env_gate_dirs(env) -> list:
+    """State directories discovered on this host, from env or a live scan."""
+    found = (env or {}).get("gate")
+    if isinstance(found, dict) and found.get("dirs") is not None:
+        return [Path(d) for d in (found.get("dirs") or [])]
+    return [Path(d) for d in (detect.gate_instances().get("dirs") or [])]
+
+
+def _resolve_state_dir(kind: str, name: str, env):
+    """Where this instance's files actually are, or None.
+
+    The canonical ``/www/server/<name>-gate`` wins. A directory discovered
+    under a different root -- a non-standard layout, or a test tree -- is
+    accepted when its name is the one this instance would use, so discovery
+    and detection cannot disagree about which directory belongs to which
+    instance.
+    """
+    canonical = Path(instance_state_dir(kind, name))
+    if canonical.is_dir():
+        return canonical
+    want = instance_dir_basename(kind, name)
+    for cand in _env_gate_dirs(env):
+        if cand.is_dir() and cand.name == want:
+            return cand
+    return None
+
+
+def _directory_is_gate(directory, kind: str, name: str, env) -> bool:
+    """Does this `*-gate` directory actually hold a gate?
+
+    A directory whose name merely ends in `-gate` is not an instance. On a
+    real host there is an unrelated `convert-gate` directory, and treating
+    it as a login gate listed it with every field blank -- a fabricated
+    instance is worse than a missing one, because it invites the operator to
+    reconfigure it. The same two facts the detector uses decide it: a
+    `gate.lua`, or nginx wiring that points at this instance's script.
+    """
+    if (Path(directory) / "gate.lua").is_file():
+        return True
+    conf, _text = _find_gate_nginx_conf(kind, env, "", name, str(directory))
+    return bool(conf)
+
+
+def instance_candidates(env=None, cfg=None) -> list:
+    """``(kind, name)`` for every instance that could exist here.
+
+    Filesystem discovery comes first because it is the truth; config is
+    consulted as well so an instance whose files were removed still appears
+    as a broken installation instead of silently vanishing from `status`.
+    """
+    env = env or detect.full()
+    out = [(KIND_BT, BT_INSTANCE_NAME), (KIND_LOGIN, LEGACY_LOGIN_NAME)]
+    seen = set(out)
+    for directory in _env_gate_dirs(env):
+        name = instance_name_from_dir(directory)
+        if not name:
+            continue
+        kind = KIND_BT if name == BT_INSTANCE_NAME else KIND_LOGIN
+        if not _directory_is_gate(directory, kind, name, env):
+            continue
+        key = (kind, name)
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    for _section, kind, name in declared_instances(cfg):
+        if (kind, name) not in seen:
+            seen.add((kind, name))
+            out.append((kind, name))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -145,20 +274,20 @@ def nginx_text(env=None) -> str:
     return out if ok else ""
 
 
-def _find_gate_nginx_conf(kind: str, env, conf_text: str) -> tuple:
-    """Locate the nginx file that owns this gate, and its text.
+def _find_gate_nginx_conf(kind: str, env, conf_text: str,
+                          name: str = "", state_dir: str = "") -> tuple:
+    """Locate the nginx file that owns *this instance*, and its text.
 
-    Checked in order of specificity: our own generated file, then whatever
-    the current installation used, then a scan of the effective config for
-    the Lua reference.
+    Matching is by the Lua script the file points at, which is unique per
+    instance. A *name* match is only accepted against the exact file this
+    instance generates -- a substring match would let instance `log` claim
+    instance `login`'s wiring.
     """
-    state_dir = None
-    for legacy in LEGACY_LAYOUTS:
-        if legacy["kind"] == kind:
-            state_dir = Path(legacy["state_dir"])
-            break
-    lua = str((state_dir or Path("/nonexistent")) / "gate.lua")
-    ours = Path("/usr/local/lib/vigil/gate") / kind / "gate.lua"
+    name = normalize_instance(kind, name)
+    if not state_dir:
+        state_dir = instance_state_dir(kind, name)
+    lua = str(Path(state_dir) / "gate.lua")
+    ours = os.path.join(package_state_dir(kind, name), "gate.lua")
 
     candidates = []
     ng_conf = env.get("nginx", {}).get("conf", "")
@@ -176,6 +305,8 @@ def _find_gate_nginx_conf(kind: str, env, conf_text: str) -> tuple:
         if ext.is_dir():
             candidates.extend(sorted(ext.glob("*/*.conf")))
 
+    want = "vigil-gate-%s.conf" % conf_slug(kind, name)
+    fallback = ""
     for path in candidates:
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -183,8 +314,12 @@ def _find_gate_nginx_conf(kind: str, env, conf_text: str) -> tuple:
             continue
         if "access_by_lua_file" not in text:
             continue
-        if lua in text or str(ours) in text or kind.replace("_", "-") in path.name:
+        if lua in text or ours in text:
             return str(path), text
+        if not fallback and path.name == want:
+            fallback = (str(path), text)
+    if fallback:
+        return fallback
     return "", ""
 
 
@@ -193,28 +328,31 @@ def _find_gate_nginx_conf(kind: str, env, conf_text: str) -> tuple:
 # --------------------------------------------------------------------------
 
 
-def detect_one(kind: str, env=None, conf_text: str = "") -> GateSpec:
-    """Reconstruct the spec of an installed gate, or a blank one."""
+def detect_one(kind: str, env=None, conf_text: str = "",
+               name: str = "") -> GateSpec:
+    """Reconstruct the spec of one installed instance, or a blank one.
+
+    *name* selects the instance; empty means the original login/panel gate,
+    so every pre-instances caller keeps its behaviour.
+    """
     env = env or detect.full()
-    spec = GateSpec.for_kind(kind, cfg=None, env=env)
+    name = normalize_instance(kind, name)
+    spec = GateSpec.for_kind(kind, cfg=None, env=env, name=name)
 
-    legacy = next((l for l in LEGACY_LAYOUTS if l["kind"] == kind), None)
-    if not legacy:
-        return spec
-
-    state_dir = Path(legacy["state_dir"])
-    if not state_dir.is_dir():
-        ours = Path("/usr/local/lib/vigil/gate") / kind
+    state_dir = _resolve_state_dir(kind, name, env)
+    webroot = instance_webroot(kind, name)
+    if state_dir is None:
+        ours = Path(package_state_dir(kind, name))
         if not ours.is_dir():
             return spec
         state_dir = ours
-        legacy = dict(legacy, state_dir=str(ours), webroot=str(ours / "web"))
+        webroot = str(ours / "web")
 
     spec.state_dir = str(state_dir)
-    spec.webroot = legacy["webroot"]
-    spec.entry_path = legacy["entry"]
-    spec.cookie = legacy["cookie"]
-    spec.nav_cookie = legacy.get("nav_cookie", "")
+    spec.webroot = webroot
+    spec.entry_path = KIND_META[kind]["default_entry"]
+    spec.cookie = instance_cookie(kind, name)
+    spec.nav_cookie = instance_nav_cookie(kind, name)
     base = spec.entry_path.rsplit("/", 1)[0]
     spec.captcha_path = base + "/captcha"
     spec.logout_path = base + "/logout"
@@ -256,7 +394,8 @@ def detect_one(kind: str, env=None, conf_text: str = "") -> GateSpec:
             base += "/"
         spec.upstream_mint_url = base
 
-    nginx_conf, ntext = _find_gate_nginx_conf(kind, env, conf_text)
+    nginx_conf, ntext = _find_gate_nginx_conf(kind, env, conf_text, name,
+                                              str(state_dir))
     if nginx_conf:
         spec.nginx_conf = nginx_conf
         info = parse_listen(ntext)
@@ -277,13 +416,13 @@ def detect_one(kind: str, env=None, conf_text: str = "") -> GateSpec:
     return spec
 
 
-def detect_all(env=None) -> list:
-    """Every gate currently present on this host."""
+def detect_all(env=None, cfg=None) -> list:
+    """Every gate instance currently present on this host."""
     env = env or detect.full()
     text = nginx_text(env)
     out = []
-    for kind in (KIND_BT, KIND_LOGIN):
-        spec = detect_one(kind, env, text)
+    for kind, name in instance_candidates(env, cfg):
+        spec = detect_one(kind, env, text, name=name)
         if (Path(spec.state_dir) / "gate.lua").exists() or (
                 spec.nginx_conf and Path(spec.nginx_conf).exists()):
             out.append(spec)
@@ -354,7 +493,7 @@ def generated_artifacts(env=None) -> list:
     return sorted(p for p in out if p)
 
 
-def adopt(cfg, kind: str, spec: GateSpec = None) -> dict:
+def adopt(cfg, kind: str, spec: GateSpec = None, name: str = "") -> dict:
     """Record an existing gate in our configuration. Writes nothing else.
 
     Explicitly preserved, because losing any of them would be an outage:
@@ -364,12 +503,12 @@ def adopt(cfg, kind: str, spec: GateSpec = None) -> dict:
     * the login log's byte offset, so the login notifier resumes instead of
       re-sending the whole history.
     """
-    spec = spec or detect_one(kind)
+    spec = spec or detect_one(kind, name=name)
     if not Path(spec.state_dir).is_dir():
         raise VigilError("没有检测到已安装的 %s 网关"
                          % KIND_META.get(kind, {}).get("label", kind))
 
-    section = "gate.bt_panel" if kind == KIND_BT else "gate.dsh_gate"
+    section = "gate.%s" % config_section(kind, spec.name)
     cfg.set("%s.enabled" % section, True)
     for field in ("state_dir", "webroot", "entry_path", "cookie",
                   "captcha_path", "logout_path", "title", "subtitle",
@@ -414,15 +553,21 @@ def adopt(cfg, kind: str, spec: GateSpec = None) -> dict:
 
 
 def status(cfg, env=None) -> list:
+    """One row per candidate instance, installed or not.
+
+    The two original gates are always listed -- that is what `vigil gate
+    status` has always shown -- and named instances appear as soon as their
+    directory or their `gate.<name>` config section exists.
+    """
     env = env or detect.full()
     text = nginx_text(env)
     listening = shell.out(["ss", "-tlnH"], timeout=10)
     rows = []
-    for kind, meta in KIND_META.items():
-        spec = detect_one(kind, env, text)
+    for kind, name in instance_candidates(env, cfg):
+        section = config_section(kind, name)
+        spec = detect_one(kind, env, text, name=name)
         installed = Path(spec.state_dir).is_dir()
         wired = bool(spec.nginx_conf) and Path(spec.nginx_conf).exists()
-        section = "bt_panel" if kind == KIND_BT else "dsh_gate"
         notes = []
         if installed and not wired:
             notes.append("网关文件存在但 nginx 未引用 —— 当前**没有生效**")
@@ -431,7 +576,10 @@ def status(cfg, env=None) -> list:
                 notes.append("端口 %d 当前没有在监听" % spec.listen_port)
         rows.append({
             "kind": kind,
-            "label": meta["label"],
+            "name": name,
+            "section": section,
+            "config_key": "gate.%s" % section,
+            "label": instance_label(kind, name),
             "installed": installed,
             "wired": wired,
             "state_dir": spec.state_dir,
@@ -450,6 +598,58 @@ def status(cfg, env=None) -> list:
     return rows
 
 
+def _port_owner(cfg, env, spec) -> str:
+    """Name of another instance already listening on *spec*'s port, if any."""
+    for other in detect_all(env, cfg):
+        if (other.kind, other.name) == (spec.kind, spec.name):
+            continue
+        if other.listen_port and int(other.listen_port) == int(spec.listen_port):
+            return instance_label(other.kind, other.name)
+    return ""
+
+
+def _allocate_port(cfg, env, spec) -> None:
+    """Give a proxy-mode gate a port that is not already taken.
+
+    Two gates on one port is a bind conflict, not a choice: nginx fails to
+    load and takes every other site down with it. An explicitly requested
+    port is never silently changed -- that is reported instead -- while an
+    instance with no port yet gets the first free one from the historical
+    4399 upwards, so the first instance keeps the number existing wiring
+    expects and the next one gets a predictable neighbour.
+    """
+    if not spec.proxy_mode:
+        return
+    if spec.listen_port:
+        owner = _port_owner(cfg, env, spec)
+        if owner:
+            raise VigilError(
+                "端口 %d 已被网关实例「%s」占用" % (spec.listen_port, owner),
+                hint="换一个 --port，或先卸载/改端口那个实例")
+        return
+    used = {int(o.listen_port) for o in detect_all(env, cfg)
+            if o.listen_port and (o.kind, o.name) != (spec.kind, spec.name)}
+    port = 4399
+    while port in used:
+        port += 1
+    if port > 65535:
+        raise VigilError("没有可用的监听端口")
+    spec.listen_port = port
+
+
+def _allocate_cert(spec) -> None:
+    """Fill in the conventional certificate directory once the port is known.
+
+    The port is not known when the spec is first built for a named instance
+    (it is allocated above), so doing this earlier produced a path ending in
+    `local-0`.
+    """
+    if spec.use_https and not spec.cert_dir and spec.proxy_mode \
+            and spec.listen_port:
+        spec.cert_dir = ("/www/server/panel/vhost/cert/local-%d"
+                         % spec.listen_port)
+
+
 # --------------------------------------------------------------------------
 # Install / reconfigure
 # --------------------------------------------------------------------------
@@ -459,10 +659,11 @@ def hash_password(plain: str) -> str:
     return installer.hash_password(plain)
 
 
-def _spec_from_current(kind: str, cfg, env) -> GateSpec:
+def _spec_from_current(kind: str, cfg, env, name: str = "") -> GateSpec:
     """Start from what is live on disk, then let config fill any gaps."""
-    current = detect_one(kind, env)
-    spec = GateSpec.for_kind(kind, cfg=cfg, env=env)
+    name = normalize_instance(kind, name)
+    current = detect_one(kind, env, name=name)
+    spec = GateSpec.for_kind(kind, cfg=cfg, env=env, name=name)
     for field in ("state_dir", "webroot", "entry_path", "captcha_path",
                   "logout_path", "cookie", "nav_cookie", "title", "subtitle",
                   "lang", "require_password", "username", "pass_hash",
@@ -477,6 +678,7 @@ def _spec_from_current(kind: str, cfg, env) -> GateSpec:
         val = getattr(current, field, None)
         if val not in (None, ""):
             setattr(spec, field, val)
+    spec.name = name
     return spec
 
 
@@ -506,14 +708,17 @@ def upstream_module_base():
     return None
 
 
-def install(cfg, kind: str, env=None, save: bool = True, **overrides) -> dict:
-    """Build a spec from config plus overrides and install it."""
+def install(cfg, kind: str, env=None, save: bool = True, name: str = "",
+            **overrides) -> dict:
+    """Build a spec from config plus overrides and install one instance."""
     env = env or detect.full()
+    name = normalize_instance(kind, name or overrides.pop("name", ""))
     password = overrides.pop("password", "")
-    spec = _spec_from_current(kind, cfg, env)
+    spec = _spec_from_current(kind, cfg, env, name)
     for k, v in overrides.items():
         if v is not None and hasattr(spec, k):
             setattr(spec, k, v)
+    spec.name = name
     if spec.kind == KIND_LOGIN and not spec.settings_patches:
         spec.settings_patches = _default_patches(KIND_LOGIN)
     if spec.require_password:
@@ -522,42 +727,60 @@ def install(cfg, kind: str, env=None, save: bool = True, **overrides) -> dict:
         elif not spec.pass_hash:
             raise VigilError("登录网关需要密码",
                              hint="用 --password 指定，或改用 bt_panel 类型")
+    _allocate_port(cfg, env, spec)
+    _allocate_cert(spec)
     result = installer.install(spec, env=env, log=_log())
     if result.get("ok") and save:
         _persist(cfg, kind, spec)
     return result
 
 
-def reconfigure(cfg, kind: str, **overrides) -> dict:
-    """Re-apply an existing gate with new parameters.
+def reconfigure(cfg, kind: str, name: str = "", **overrides) -> dict:
+    """Re-apply an existing instance with new parameters.
 
     The state directory comes from the live installation so sessions in
     flight survive; only the requested fields change.
     """
     env = detect.full()
-    if not Path(detect_one(kind, env).state_dir).is_dir():
-        raise VigilError("没有可重新配置的 %s 网关" % kind,
-                         hint="请先用 `vigil gate install %s` 安装" % kind)
-    return install(cfg, kind, env=env, **overrides)
+    name = normalize_instance(kind, name or overrides.pop("name", ""))
+    if not Path(detect_one(kind, env, name=name).state_dir).is_dir():
+        raise VigilError("没有可重新配置的 %s 网关%s"
+                         % (kind, "（%s）" % name
+                            if name != LEGACY_LOGIN_NAME else ""),
+                         hint="请先用 `vigil gate install %s --name %s` 安装"
+                              % (kind, name))
+    return install(cfg, kind, env=env, name=name, **overrides)
 
 
 def _persist(cfg, kind: str, spec: GateSpec) -> None:
-    section = "gate.bt_panel" if kind == KIND_BT else "gate.dsh_gate"
+    section = "gate.%s" % config_section(kind, spec.name)
     cfg.set("%s.enabled" % section, True)
-    for field in ("entry_path", "cookie", "listen_port", "listen_host",
-                  "use_https", "cert_dir", "upstream", "domain",
-                  "server_name", "nginx_conf", "username"):
+    cfg.set("%s.name" % section, spec.name)
+    # Persisted even when False: "this gate needs no password" is a setting,
+    # not the absence of one, and rewriting it as absent would turn the next
+    # reconfigure into a gate that suddenly demands credentials.
+    cfg.set("%s.require_password" % section, bool(spec.require_password))
+    for field in ("state_dir", "webroot", "entry_path", "cookie",
+                  "nav_cookie", "listen_port", "listen_host", "use_https",
+                  "cert_dir", "upstream", "domain", "server_name",
+                  "nginx_conf"):
         val = getattr(spec, field, None)
         if val not in (None, "", 0, False):
             cfg.set("%s.%s" % (section, field), val)
+    # The username is kept for display. The hash deliberately stays out of
+    # config.json and is only ever read from the gate's own file.
+    if spec.username:
+        cfg.set("%s.username" % section, spec.username)
     cfg.save()
 
 
-def uninstall(cfg, kind: str, remove_state: bool = False, env=None) -> dict:
-    spec = detect_one(kind, env)
+def uninstall(cfg, kind: str, remove_state: bool = False, env=None,
+              name: str = "") -> dict:
+    name = normalize_instance(kind, name)
+    spec = detect_one(kind, env, name=name)
     result = installer.uninstall(spec, env=env, remove_state=remove_state)
     if result.get("ok"):
-        section = "gate.bt_panel" if kind == KIND_BT else "gate.dsh_gate"
+        section = "gate.%s" % config_section(kind, name)
         cfg.set("%s.enabled" % section, False)
         cfg.save()
     return result

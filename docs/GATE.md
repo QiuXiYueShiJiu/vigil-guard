@@ -16,6 +16,33 @@ sudo vigil gate status
 sudo vigil gate test login             # 端到端自检
 ```
 
+## 多个实例
+
+`login` 类型可以装任意多个**互相独立**的实例。`--name` 指定实例名，名字决定它
+的状态目录（`/www/server/<名字>-gate`）、网页目录（`/www/wwwroot/<名字>-gate`）、
+会话 Cookie、nginx 接线文件和配置键（`gate.<名字>`）。省略 `--name` 时落到默认
+实例 `login`，也就是历史安装的 `/www/server/dsh-gate` 与 `gate.dsh_gate`——
+老安装因此原样继续工作，不需要迁移。
+
+```sh
+# 给某个只监听本机的服务加一层仅人机验证的网关
+sudo vigil gate install login --name astrbot \
+    --domain gate.example.com --upstream http://127.0.0.1:6185 \
+    --port 4400 --https --no-password
+
+sudo vigil gate list                                   # 所有实例一眼看清
+sudo vigil gate status      --name astrbot
+sudo vigil gate detect      --name astrbot
+sudo vigil gate reconfigure login --name astrbot --password '新密码'
+sudo vigil gate repair      login --name astrbot
+sudo vigil gate holds       --name astrbot
+sudo vigil gate uninstall   login --name astrbot
+```
+
+每个实例各占一个监听端口和一组限流区。`--port` 若已被别的实例占用，命令会
+直接报错，而**不会**去改那个实例。`bt_panel` 天然只有一个面板，固定为单实例，
+不接受 `--name`。
+
 ## 接入已有配置（不改动任何文件）
 
 已经有一套网关配置在跑，不想重建会话、不想重置密码：

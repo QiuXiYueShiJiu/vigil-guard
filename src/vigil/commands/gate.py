@@ -22,8 +22,9 @@ from ..core import detect
 from ..core.config import load as load_config
 from ..core.errors import VigilError
 from ..gates import (KIND_BT, KIND_LOGIN, KIND_META, GateSpec, adopt,
-                     detect_all, detect_one, install, nginx_text, reconfigure,
-                     status, uninstall)
+                     config_section, detect_all, detect_one, install,
+                     instance_label, nginx_text, normalize_instance,
+                     reconfigure, status, uninstall)
 from ..gates import scenes
 
 
@@ -36,38 +37,82 @@ def _wrap(text, width=74):
     return textwrap.wrap(str(text), width=width)
 
 
+def _spec_name(args, kind: str) -> str:
+    """The instance name for a command whose gate *kind* is known."""
+    return normalize_instance(kind, getattr(args, "name", "") or "")
+
+
+def _watched_name(args) -> str:
+    """The raw instance selector for commands that span kinds."""
+    return (getattr(args, "name", "") or "").strip().lower()
+
+
+def _instance_matches(spec, want: str) -> bool:
+    """Does *spec* answer to *want*?
+
+    Both the instance name and the kind are accepted, so `--name login`
+    (the default instance), `--name bt_panel` and `--name astrbot` all do
+    what the operator means without a separate lookup.
+    """
+    if not want:
+        return True
+    return want in (spec.name, spec.kind)
+
+
+def _reconfigure_hint(spec) -> str:
+    cmd = "vigil gate reconfigure %s" % spec.kind
+    if spec.name and spec.name != spec.kind:
+        cmd += " --name %s" % spec.name
+    return cmd + " [选项]"
+
+
+def _instance_cmd(action: str, kind: str, name: str = "") -> str:
+    """`vigil gate <action> <kind> [--name <instance>]` as a copyable string."""
+    cmd = "vigil gate %s %s" % (action, kind)
+    if name and name != kind:
+        cmd += " --name %s" % name
+    return cmd
+
+
 # --------------------------------------------------------------------------
 # Informational
 # --------------------------------------------------------------------------
 
 
 def cmd_list(args) -> int:
-    ui.header("支持的登录防护类型")
-    for kind, meta in KIND_META.items():
-        ui.section(meta["label"])
-        ui.kv("类型 ID", kind)
-        ui.kv("需要账号密码", "否（仅人机验证）" if meta.get("no_credentials")
-              else "是（bcrypt 存储）")
-        ui.kv("监听方式", "独立端口（反向代理指向它）" if meta.get("proxy_mode")
-              else "挂在已有站点上")
+    """Every gate instance on this host, one row each.
+
+    Deliberately instance-first rather than type-first: with more than one
+    login gate, "which gate am I looking at" is the question this has to
+    answer, and the type alone cannot answer it.
+    """
+    cfg = load_config(args.config or None)
+    rows = status(cfg)
+    installed = [r for r in rows if r["installed"]]
+    ui.header("登录网关实例", "已安装 %d 个" % len(installed))
+    ui.table(
+        [(r["kind"], r["name"], r["state_dir"], r["domain"] or "—",
+          str(r["port"]) if r["port"] else "—", r["upstream"] or "—",
+          "是" if r["credentials"] else "否（仅人机验证）")
+         for r in rows],
+        headers=("类型", "实例名", "状态目录", "域名", "端口", "上游", "要密码"))
+    for r in rows:
+        if not r["installed"] and r["adopted"]:
+            ui.warning("%s（%s）在配置里是启用的，但状态目录不存在"
+                       % (r["label"], r["state_dir"]))
+    ui.out()
+    if getattr(args, "types", False):
+        ui.section("支持的网关类型")
+        for kind, meta in KIND_META.items():
+            ui.kv(kind, meta["label"])
+            for line in _wrap(meta["desc"]):
+                ui.out("        " + line)
         ui.out()
-        for line in _wrap(meta["desc"]):
-            ui.out("    " + line)
-    ui.out()
-    ui.section("常用示例")
-    ui.out("    # 给面板入口加人机验证")
-    ui.out("    vigil gate install bt_panel --domain panel.example.com")
-    ui.out()
-    ui.out("    # 把一个只监听本机的服务投影出来（自定义端口 / 账号 / 密码 / HTTPS）")
-    ui.out("    vigil gate install login --domain dsh.example.com \\")
-    ui.out("        --upstream http://127.0.0.1:8080 --port 4399 --https \\")
-    ui.out("        --username admin --password '你的密码'")
-    ui.out()
-    ui.out("    # 只改密码和端口，其余保持不动")
-    ui.out("    vigil gate reconfigure login --password '新密码' --port 4400")
-    ui.out()
-    ui.out("    # 关掉 HTTPS")
-    ui.out("    vigil gate reconfigure login --no-https")
+    ui.note("新增一个独立实例（名字决定状态目录、Cookie 与配置键）：")
+    ui.hint("vigil gate install login --name astrbot \\")
+    ui.hint("    --domain gate.example.com --upstream http://127.0.0.1:6185 \\")
+    ui.hint("    --port 4400 --https --no-password")
+    ui.note("类型说明与更多示例：vigil gate list --types")
     return 0
 
 
@@ -75,6 +120,13 @@ def cmd_detect(args) -> int:
     cfg = load_config(args.config or None)
     env = detect.full()
     found = detect_all(env)
+    want = _watched_name(args)
+    if want:
+        found = [s for s in found if _instance_matches(s, want)]
+        if not found:
+            ui.failure("没有找到匹配的网关实例：%s" % want)
+            ui.hint("先用 `vigil gate list` 看有哪些实例")
+            return 1
     if args.json:
         ui.out(_json.dumps([s.to_dict() for s in found],
                            ensure_ascii=False, indent=2, default=str))
@@ -86,10 +138,12 @@ def cmd_detect(args) -> int:
         ui.hint("安装：vigil gate install bt_panel --domain 你的域名")
         return 0
 
-    rows = {r["kind"]: r for r in status(cfg, env)}
+    rows = {(r["kind"], r["name"]): r for r in status(cfg, env)}
     for spec in found:
-        ui.section(KIND_META[spec.kind]["label"])
+        ui.section(instance_label(spec.kind, spec.name))
         ui.kv("类型 ID", spec.kind)
+        ui.kv("实例名", spec.name)
+        ui.kv("配置键", "gate.%s" % config_section(spec.kind, spec.name))
         ui.kv("状态目录", spec.state_dir)
         ui.kv("验证页目录", spec.webroot)
         ui.kv("入口路径", spec.entry_path)
@@ -117,14 +171,14 @@ def cmd_detect(args) -> int:
                  spec.captcha_min_seconds))
         ui.kv("锁定策略", "%d 次失败锁 %ds（倍率 %d）"
               % (spec.lock_max, spec.lock_secs, spec.lock_backoff))
-        for n in (rows.get(spec.kind, {}).get("notes") or []):
+        for n in (rows.get((spec.kind, spec.name), {}).get("notes") or []):
             ui.warning(n)
 
     ui.out()
     ui.note("接入已有配置（不改动任何现有文件与登录状态）：")
     ui.hint("vigil gate adopt")
     ui.note("或者直接改参数重装（会自动保留未指定的项）：")
-    ui.hint("vigil gate reconfigure %s [选项]" % found[0].kind)
+    ui.hint(_reconfigure_hint(found[0]))
     return 0
 
 
@@ -138,9 +192,12 @@ def cmd_selftest(args) -> int:
             "页面里是否还有客户端求答案的代码。")
     ui.out()
 
-    results = st.verify_all()
+    want = _watched_name(args)
+    gates = [s for s in detect_all() if _instance_matches(s, want)]
+    results = st.verify_all(gates)
     if not results:
-        ui.warning("没有检测到已安装的登录网关")
+        ui.warning("没有检测到已安装的登录网关"
+                   + ("（实例：%s）" % want if want else ""))
         return 1
     for r in results:
         (ui.success if r["ok"] else ui.failure)("%s（%s）"
@@ -162,6 +219,13 @@ def cmd_selftest(args) -> int:
 def cmd_status(args) -> int:
     cfg = load_config(args.config or None)
     rows = status(cfg)
+    want = _watched_name(args)
+    if want:
+        rows = [r for r in rows if want in (r["name"], r["kind"])]
+        if not rows:
+            ui.failure("没有找到匹配的网关实例：%s" % want)
+            ui.hint("先用 `vigil gate list` 看有哪些实例")
+            return 1
     if args.json:
         ui.out(_json.dumps([{k: v for k, v in r.items() if k != "spec"}
                             for r in rows], ensure_ascii=False, indent=2,
@@ -171,6 +235,8 @@ def cmd_status(args) -> int:
     any_installed = False
     for r in rows:
         ui.section(r["label"])
+        ui.kv("实例名", r["name"])
+        ui.kv("配置键", r["config_key"])
         if not r["installed"]:
             ui.note("未安装")
             continue
@@ -192,7 +258,7 @@ def cmd_status(args) -> int:
             ui.warning(n)
     ui.out()
     if any_installed:
-        ui.hint("修改参数：vigil gate reconfigure <类型> [选项]")
+        ui.hint("修改参数：vigil gate reconfigure <类型> --name <实例名> [选项]")
         ui.hint("查看全部可用参数：vigil gate install --help")
     return 0
 
@@ -238,10 +304,12 @@ def _collect(args, kind: str) -> dict:
         # where "1" would re-prompt on every menu click.
         ov["strict_nav"] = 2
     if args.https is not None:
+        # The certificate directory is derived *after* the listening port is
+        # known. Guessing it here used the requested port or the historical
+        # 4399, which is wrong the moment a named instance is allocated a
+        # different port -- it produced a certificate path ending in
+        # `local-0`. See gates.install.
         ov["use_https"] = bool(args.https)
-        if args.https and not ov.get("cert_dir"):
-            ov["cert_dir"] = ("/www/server/panel/vhost/cert/local-%d"
-                              % (args.port or 4399))
     if args.no_password:
         ov["require_password"] = False
         ov["username"] = ""
@@ -344,7 +412,7 @@ def _apply_password(ov: dict, kind: str, for_update: bool) -> None:
 # --------------------------------------------------------------------------
 
 
-def _report(result, kind: str, title: str) -> int:
+def _report(result, kind: str, title: str, name: str = "") -> int:
     if not result.get("ok"):
         ui.failure(result.get("error", "操作失败"))
         for p in result.get("problems") or []:
@@ -364,24 +432,26 @@ def _report(result, kind: str, title: str) -> int:
                 % len(result["patched"]))
     ui.out()
     ui.note("重要：先用浏览器实际走一遍登录，确认能通过，再关闭当前会话。")
-    ui.note("面板「修复 nginx」后接线可能丢失，用 `vigil gate repair %s` 恢复。"
-            % kind)
+    ui.note("面板「修复 nginx」后接线可能丢失，用 `%s` 恢复。"
+            % _instance_cmd("repair", kind, name))
     return 0
 
 
 def cmd_install(args) -> int:
     cfg = load_config(args.config or None)
     kind = args.kind
+    name = _spec_name(args, kind)
     env = detect.full()
 
-    ui.header("安装登录防护", KIND_META[kind]["label"])
+    ui.header("安装登录防护", instance_label(kind, name))
 
-    existing = detect_one(kind, env)
+    existing = detect_one(kind, env, name=name)
     if Path(existing.state_dir).is_dir() and not args.force:
-        ui.warning("检测到该类型已存在：%s" % existing.state_dir)
-        ui.note("直接重装会覆盖现有网关（可能打断正在使用的登录会话；"
+        ui.warning("检测到实例「%s」已存在：%s" % (name, existing.state_dir))
+        ui.note("直接重装会覆盖这个实例（可能打断它正在使用的登录会话；"
                 "若不知道原密码，会因只存哈希而无法恢复）")
-        if ui.confirm("改为「重新配置」现有网关？", default=True):
+        ui.note("要新建另一个实例，请换一个 --name。")
+        if ui.confirm("改为「重新配置」这个实例？", default=True):
             return cmd_reconfigure(args)
 
     problems = []
@@ -395,7 +465,7 @@ def cmd_install(args) -> int:
         ui.problems_block(problems)
         return 1
 
-    spec = GateSpec.for_kind(kind, cfg=cfg, env=env)
+    spec = GateSpec.for_kind(kind, cfg=cfg, env=env, name=name)
     ov = _collect(args, kind)
     ov.update(_interactive_fill(args, kind, spec, for_update=False))
     _apply_password(ov, kind, for_update=False)
@@ -403,6 +473,8 @@ def cmd_install(args) -> int:
     if not args.yes and ui.is_interactive():
         ui.out()
         ui.section("即将执行")
+        ui.bullet("实例名 %s（配置键 gate.%s）"
+                  % (name, config_section(kind, name)))
         ui.bullet("写入网关文件到 %s" % spec.state_dir)
         if ov.get("listen_port"):
             ui.bullet("监听 %s:%s（仅本机）"
@@ -416,21 +488,24 @@ def cmd_install(args) -> int:
             ui.note("已取消")
             return 0
 
-    result = install(cfg, kind, env=env, **ov)
-    return _report(result, kind, "安装")
+    result = install(cfg, kind, env=env, name=name, **ov)
+    return _report(result, kind, "安装", name=name)
 
 
 def cmd_reconfigure(args) -> int:
     cfg = load_config(args.config or None)
     kind = args.kind
+    name = _spec_name(args, kind)
     env = detect.full()
-    current = detect_one(kind, env)
+    current = detect_one(kind, env, name=name)
     if not Path(current.state_dir).is_dir():
-        ui.failure("没有找到可重新配置的 %s 网关" % kind)
-        ui.hint("改用 `vigil gate install %s` 安装" % kind)
+        ui.failure("没有找到可重新配置的 %s 网关（实例 %s）" % (kind, name))
+        ui.hint("改用 `%s` 安装"
+                % _instance_cmd("install", kind, name))
+        ui.hint("现有实例：vigil gate list")
         return 1
 
-    ui.header("重新配置登录防护", KIND_META[kind]["label"])
+    ui.header("重新配置登录防护", instance_label(kind, name))
     ui.note("未指定的参数保持现状（包括密码哈希）。")
 
     ov = _collect(args, kind)
@@ -447,10 +522,10 @@ def cmd_reconfigure(args) -> int:
     else:
         ui.note("未指定修改项 —— 将按现有参数重新生成网关文件"
                 "（用于升级实现，配置保持不变）")
-    result = reconfigure(cfg, kind, **ov)
-    rc = _report(result, kind, "重新配置")
+    result = reconfigure(cfg, kind, name=name, **ov)
+    rc = _report(result, kind, "重新配置", name=name)
     if rc == 0:
-        _mirror_to_config(cfg, kind)
+        _mirror_to_config(cfg, kind, name)
     return rc
 
 
@@ -458,8 +533,12 @@ def cmd_adopt(args) -> int:
     cfg = load_config(args.config or None)
     ui.header("接入已有登录防护", "不会修改现有文件，也不会重置任何登录状态")
     found = detect_all()
+    want = _watched_name(args)
+    if want:
+        found = [s for s in found if _instance_matches(s, want)]
     if not found:
-        ui.warning("没有检测到已存在的网关配置")
+        ui.warning("没有检测到已存在的网关配置"
+                   + ("（实例：%s）" % want if want else ""))
         ui.hint("如果要新装：vigil gate install <类型>")
         return 1
 
@@ -467,8 +546,11 @@ def cmd_adopt(args) -> int:
     for spec in found:
         if args.kind and spec.kind != args.kind:
             continue
-        label = KIND_META.get(spec.kind, {}).get("label", spec.kind)
+        label = instance_label(spec.kind, spec.name)
         ui.section(label)
+        ui.kv("类型 ID", spec.kind)
+        ui.kv("实例名", spec.name)
+        ui.kv("配置键", "gate.%s" % config_section(spec.kind, spec.name))
         ui.kv("状态目录", spec.state_dir)
         ui.kv("入口路径", spec.entry_path)
         if spec.listen_port:
@@ -483,7 +565,7 @@ def cmd_adopt(args) -> int:
             ui.note("已保留原有账号与密码哈希，未做任何改动")
         if not info["wired"]:
             ui.warning("nginx 未引用该网关脚本 —— 需要重新接线才生效")
-            ui.hint("运行 `vigil gate repair %s`" % spec.kind)
+            ui.hint("运行 `%s`" % _instance_cmd("repair", spec.kind, spec.name))
 
     if adopted_any:
         if cfg.save():
@@ -504,26 +586,29 @@ def cmd_repair(args) -> int:
     """
     cfg = load_config(args.config or None)
     kind = args.kind
-    spec = detect_one(kind)
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, name=name)
     if not Path(spec.state_dir).is_dir():
-        ui.failure("没有找到该类型的网关文件，无法接线")
-        ui.hint("改用 `vigil gate install %s`" % kind)
+        ui.failure("没有找到实例「%s」的网关文件，无法接线" % name)
+        ui.hint("改用 `%s`" % _instance_cmd("install", kind, name))
         return 1
 
-    ui.header("重新接线", KIND_META[kind]["label"])
+    ui.header("重新接线", instance_label(kind, name))
     ui.kv("网关脚本", "%s/gate.lua" % spec.state_dir)
     ui.note("保留全部网关文件与会话，只重写 nginx 配置。")
-    return _report(install(cfg, kind, **{}), kind, "重新接线")
+    return _report(install(cfg, kind, name=name, **{}), kind, "重新接线", name)
 
 
 def cmd_uninstall(args) -> int:
     cfg = load_config(args.config or None)
     kind = args.kind
+    name = _spec_name(args, kind)
     if not args.yes and not ui.confirm(
-            "卸载 %s 网关？" % KIND_META.get(kind, {}).get("label", kind),
+            "卸载实例「%s」（%s）网关？"
+            % (name, KIND_META.get(kind, {}).get("label", kind)),
             default=False):
         return 0
-    result = uninstall(cfg, kind, remove_state=args.purge)
+    result = uninstall(cfg, kind, remove_state=args.purge, name=name)
     if not result.get("ok"):
         ui.failure(result.get("error", "卸载失败"))
         return 1
@@ -537,13 +622,14 @@ def cmd_test(args) -> int:
     """Exercise the live gate end to end and report what actually happened."""
     cfg = load_config(args.config or None)
     kind = args.kind
+    name = _spec_name(args, kind)
     env = detect.full()
-    spec = detect_one(kind, env)
+    spec = detect_one(kind, env, name=name)
     if not Path(spec.state_dir).is_dir():
-        ui.failure("没有安装该网关")
+        ui.failure("没有安装该网关（实例 %s）" % name)
         return 1
 
-    ui.header("网关自检", KIND_META[kind]["label"])
+    ui.header("网关自检", instance_label(kind, name))
     ok_all = True
 
     ui.section("1. nginx 配置")
@@ -566,7 +652,7 @@ def cmd_test(args) -> int:
         ui.success("nginx 已引用网关脚本")
     else:
         ui.failure("nginx 未引用网关脚本 —— 网关当前无效")
-        ui.hint("运行 `vigil gate repair %s`" % kind)
+        ui.hint("运行 `%s`" % _instance_cmd("repair", kind, name))
         ok_all = False
 
     ui.section("3. 验证页与验证码")
@@ -632,7 +718,18 @@ def cmd_test(args) -> int:
 # --------------------------------------------------------------------------
 
 
+def _add_name_option(p, help_text: str = "") -> None:
+    """The instance selector for commands that operate on one gate."""
+    p.add_argument("--name", default="",
+                   help=help_text or "网关实例名（省略为默认实例 login）")
+
+
 def _add_common_options(p) -> None:
+    p.add_argument("--name", default="",
+                   help="实例名。login 类型可创建任意多个互相独立的实例"
+                        "（状态目录、Cookie、端口、nginx 接线与配置键都各自独立）；"
+                        "省略即默认实例 login。bt_panel 只有一个面板，"
+                        "固定为单实例，不接受其它名字")
     p.add_argument("--domain", default="", help="对外访问域名")
 
     g = p.add_argument_group("监听与上游")
@@ -754,7 +851,7 @@ def _scene_counts(spec: GateSpec):
     return rows, total
 
 
-def _scene_apply(cfg, kind: str, **ov) -> int:
+def _scene_apply(cfg, kind: str, name: str = "", **ov) -> int:
     """Re-render a gate with only the appearance settings changed.
 
     Everything else -- password hash, port, certificate, session policy --
@@ -763,20 +860,21 @@ def _scene_apply(cfg, kind: str, **ov) -> int:
     """
     if "image_dirs" in ov:
         ov["image_dirs"] = [str(Path(d).expanduser()) for d in ov["image_dirs"]]
-    result = reconfigure(cfg, kind, **ov)
-    rc = _report(result, kind, "更新画面来源")
+    result = reconfigure(cfg, kind, name=name, **ov)
+    rc = _report(result, kind, "更新画面来源", name=name)
     if rc == 0:
-        _mirror_to_config(cfg, kind)
+        _mirror_to_config(cfg, kind, name)
     return rc
 
 
 
-# The gate *kind* and the config *key* are not the same string: the login
-# gate is `login` everywhere in the gate module and `dsh_gate` in the config
-# schema, from when it was written for one specific application. A sync that
-# assumed they matched wrote `gate.login.*`, which is not a key the schema
-# knows, so the real entry stayed empty and every reader kept seeing blanks.
-CONFIG_KEY = {KIND_BT: "bt_panel", KIND_LOGIN: "dsh_gate"}
+# The gate *kind* and the config *key* are not the same string for the
+# default login gate: it is `login` everywhere in the gate module and
+# `dsh_gate` in the config schema, from when it was written for one specific
+# application. A sync that assumed they matched wrote `gate.login.*`, which
+# is not a key the schema knows, so the real entry stayed empty and every
+# reader kept seeing blanks. Named instances use their name as the key, which
+# `gates.spec.config_section` resolves in one place.
 
 # Fields worth mirroring into the vigil configuration. Deliberately excludes
 # the password hash: that lives in the gate's own config.php, is never
@@ -787,7 +885,7 @@ SYNC_FIELDS = ("state_dir", "webroot", "entry_path", "cookie", "nav_cookie",
                "abs_ttl", "captcha_ttl")
 
 
-def _mirror_to_config(cfg, kind: str) -> None:
+def _mirror_to_config(cfg, kind: str, name: str = "") -> None:
     """Write the live gate's settings back into the vigil configuration.
 
     Without this, `vigil gate reconfigure --scene image --image-dir ...`
@@ -799,11 +897,9 @@ def _mirror_to_config(cfg, kind: str) -> None:
     Only the appearance/plumbing fields are mirrored (see SYNC_FIELDS); the
     password hash is deliberately not among them.
     """
-    key = CONFIG_KEY.get(kind)
-    if not key:
-        return
+    key = config_section(kind, name)
     try:
-        spec = detect_one(kind, detect.full())
+        spec = detect_one(kind, detect.full(), name=name)
     except Exception:                                       # noqa: BLE001
         return
     changed = 0
@@ -824,13 +920,15 @@ def _mirror_to_config(cfg, kind: str) -> None:
         cfg.save()
 
 
-def _gate_state_dirs(cfg, only: str = "") -> list:
+def _gate_state_dirs(cfg, only: str = "", name: str = "") -> list:
     """Installed gates as (label, kind, state_dir)."""
     out = []
     for r in status(cfg):
         if not r.get("installed") or not r.get("state_dir"):
             continue
         if only and r.get("kind") != only:
+            continue
+        if name and r.get("name") != name:
             continue
         out.append((r.get("label") or r.get("kind") or "?", r.get("kind") or "",
                     str(r["state_dir"])))
@@ -894,7 +992,8 @@ def _php_str(text: str) -> str:
 def cmd_holds(args) -> int:
     """List, and reset, the login lockouts on this host."""
     cfg = load_config(args.config or None)
-    gates = _gate_state_dirs(cfg, getattr(args, "gate_kind", "") or "")
+    gates = _gate_state_dirs(cfg, getattr(args, "gate_kind", "") or "",
+                             _watched_name(args))
     action = getattr(args, "holds_action", "list")
     now = int(time.time())
 
@@ -938,8 +1037,8 @@ def cmd_holds(args) -> int:
         removed, swept = [], []
         targets = set()
         if getattr(args, "ip", ""):
-            name = hashlib.sha256(args.ip.strip().encode()).hexdigest() + ".json"
-            targets.add(name)
+            fname = hashlib.sha256(args.ip.strip().encode()).hexdigest() + ".json"
+            targets.add(fname)
         if getattr(args, "stale", False):
             for label, _k, state_dir in gates:
                 n = _php_sweep(state_dir)
@@ -1004,10 +1103,8 @@ def cmd_gate_sync(args) -> int:
     ui.header("同步网关配置", "把已安装网关的真实参数写回 vigil 配置")
     changed = 0
     for spec in detect_all():
-        key = CONFIG_KEY.get(spec.kind)
-        if not key:
-            continue
-        ui.section("%s（%s）" % (KEY_LABEL.get(spec.kind, spec.kind), key))
+        key = config_section(spec.kind, spec.name)
+        ui.section("%s（%s）" % (instance_label(spec.kind, spec.name), key))
         for field in SYNC_FIELDS:
             val = getattr(spec, field, None)
             if field == "image_dirs":
@@ -1104,6 +1201,7 @@ def cmd_scene(args) -> int:
     cfg = load_config(args.config or None)
     action = getattr(args, "scene_action", "") or "show"
     kind = getattr(args, "kind", "") or KIND_LOGIN
+    name = _spec_name(args, kind)
 
     from ..gates import scenes as sc
 
@@ -1119,10 +1217,10 @@ def cmd_scene(args) -> int:
         return 0
 
     if action == "fetch":
-        return _scene_fetch(cfg, kind, args)
+        return _scene_fetch(cfg, kind, args, name)
 
     if action in ("clear",):
-        spec = detect_one(kind, detect.full())
+        spec = detect_one(kind, detect.full(), name=name)
         dest = _scene_dir(cfg, kind, spec)
         if not dest.is_dir():
             ui.note("还没有下载过任何图片：%s" % dest)
@@ -1150,7 +1248,7 @@ def cmd_scene(args) -> int:
         return 0
 
     # ---- mutate the gate config ------------------------------------------
-    spec = detect_one(kind, detect.full())
+    spec = detect_one(kind, detect.full(), name=name)
     if not Path(spec.state_dir).is_dir():
         ui.failure("没有找到 %s 网关" % kind)
         return 1
@@ -1168,7 +1266,7 @@ def cmd_scene(args) -> int:
         ui.header("设置画面来源", KIND_META[kind]["label"])
         if want == "auto" and total == 0:
             ui.warning("图片池为空，auto 会一直使用生成风景图")
-        return _scene_apply(cfg, kind, scene_kind=want)
+        return _scene_apply(cfg, kind, name, scene_kind=want)
 
     if action == "add":
         target = str(Path(args.path).expanduser())
@@ -1195,7 +1293,7 @@ def cmd_scene(args) -> int:
             ui.note("已在列表中：%s" % target)
             return 0
         dirs.append(target)
-        return _scene_apply(cfg, kind, image_dirs=dirs)
+        return _scene_apply(cfg, kind, name, image_dirs=dirs)
 
     if action == "remove":
         target = str(Path(args.path).expanduser())
@@ -1203,7 +1301,7 @@ def cmd_scene(args) -> int:
         if len(dirs) == len(spec.image_dirs or []):
             ui.failure("不在列表中：%s" % target)
             return 1
-        return _scene_apply(cfg, kind, image_dirs=dirs)
+        return _scene_apply(cfg, kind, name, image_dirs=dirs)
 
     if action == "scan":
         ui.header("探测本机可用的图库", "只读，不会改动任何配置")
@@ -1270,7 +1368,8 @@ def cmd_scene(args) -> int:
 def cmd_scene_credits(args) -> int:
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     dest = _scene_dir(cfg, kind, spec)
     book_path = dest / "credits.json"
     if not book_path.is_file():
@@ -1316,7 +1415,8 @@ def cmd_scene_compact(args) -> int:
     from ..gates.installer import php_bin
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     dest = _scene_dir(cfg, kind, spec)
     if not dest.is_dir():
         ui.note("还没有下载过任何图片：%s" % dest)
@@ -1434,7 +1534,8 @@ def cmd_scene_review(args) -> int:
     from ..gates.installer import php_bin
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     dest = _scene_dir(cfg, kind, spec)
     pool = [p for p in sorted(dest.glob("*"))
             if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")] if dest.is_dir() else []
@@ -1496,7 +1597,8 @@ def cmd_scene_review(args) -> int:
 def cmd_scene_block(args) -> int:
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     dest = _scene_dir(cfg, kind, spec)
 
     keys = []
@@ -1532,7 +1634,8 @@ def cmd_scene_block(args) -> int:
 def cmd_scene_unblock(args) -> int:
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     entries = scenes.load_blocklist(spec.state_dir)
     removed = []
     for token in args.key:
@@ -1552,7 +1655,8 @@ def cmd_scene_unblock(args) -> int:
 def cmd_scene_blocked(args) -> int:
     cfg = load_config(args.config or None)
     kind = getattr(args, "kind", "") or KIND_LOGIN
-    spec = detect_one(kind, detect.full())
+    name = _spec_name(args, kind)
+    spec = detect_one(kind, detect.full(), name=name)
     entries = scenes.load_blocklist(spec.state_dir)
     if not entries:
         ui.note("屏蔽列表为空。")
@@ -1648,10 +1752,10 @@ def _provider_help():
     return pv.provider_help()
 
 
-def _scene_fetch(cfg, kind: str, args) -> int:
+def _scene_fetch(cfg, kind: str, args, name: str = "") -> int:
     from ..gates import providers as pv
 
-    spec = detect_one(kind, detect.full())
+    spec = detect_one(kind, detect.full(), name=name)
     if not Path(spec.state_dir).is_dir():
         ui.failure("没有找到 %s 网关" % kind)
         return 1
@@ -1731,7 +1835,7 @@ def _scene_fetch(cfg, kind: str, args) -> int:
         dirs.append(str(dest))
     ui.out()
     ui.note("正在把图库接入网关并刷新图片池…")
-    rc = _scene_apply(cfg, kind, image_dirs=dirs,
+    rc = _scene_apply(cfg, kind, name, image_dirs=dirs,
                       scene_kind=("auto" if getattr(spec, "scene_kind", "auto") == "art"
                                   else getattr(spec, "scene_kind", "auto")))
     if rc == 0:
@@ -1751,15 +1855,6 @@ def _scene_fetch(cfg, kind: str, args) -> int:
 def _preset_names():
     from ..gates.providers import PRESETS
     return tuple(sorted(PRESETS))
-
-
-
-def _key_label():
-    from ..gates import KIND_META
-    return {k: v.get("label", k) for k, v in KIND_META.items()}
-
-
-KEY_LABEL = _key_label()
 
 
 def _provider_help_names():
@@ -1868,6 +1963,12 @@ def register(sub) -> None:
     q.add_argument("--yes", "-y", action="store_true")
     q.set_defaults(func=cmd_scene, scene_action="clear")
 
+    # Every scene action edits one gate's picture pool, so they all take the
+    # same instance selector. Added in one place so a new action cannot ship
+    # without it.
+    for _q in ss.choices.values():
+        _add_name_option(_q, "图片池所属的网关实例名（省略为默认 login 实例）")
+
     sp = ps.add_parser("demo", help="人机验证演示页（可以随便玩，不拦截任何东西）",
                        description="在站点上发布一个公开的拼图演示页。背后没有"
                                    "受保护的服务，因此没有会话、限流与封禁 —— "
@@ -1886,11 +1987,14 @@ def register(sub) -> None:
                                    "重装或改动网关后跑一次即可。")
     sp.set_defaults(func=cmd_gate_sync)
 
-    sp = ps.add_parser("list", help="列出支持的网关类型与用法示例")
+    sp = ps.add_parser("list", help="列出所有已安装的网关实例")
+    sp.add_argument("--types", action="store_true",
+                    help="同时列出支持的网关类型与用法示例")
     sp.set_defaults(func=cmd_list)
 
     sp = ps.add_parser("detect", help="检测已安装的网关并读出全部参数")
     sp.add_argument("--json", action="store_true")
+    _add_name_option(sp, "只看这个实例（名字或类型，如 astrbot / login）")
     sp.set_defaults(func=cmd_detect)
 
     sp = ps.add_parser("holds", help="查看登录封禁（锁定）状态",
@@ -1898,6 +2002,7 @@ def register(sub) -> None:
                                    "sha256(客户端 IP)，所以这里只能显示摘要，"
                                    "不能反推出地址。")
     sp.add_argument("--json", action="store_true")
+    _add_name_option(sp, "只看这个网关实例的锁定")
     sp.set_defaults(func=cmd_holds, holds_action="list")
 
     sp = ps.add_parser("reset-holds", help="立刻解除登录封禁（解锁）",
@@ -1909,10 +2014,12 @@ def register(sub) -> None:
                     help="按清扫策略删除陈旧记录（不碰活动锁定）")
     sp.add_argument("--gate", dest="gate_kind", default="",
                     help="只针对某类网关（login / bt_panel）")
+    _add_name_option(sp, "只重置这个网关实例的锁定")
     sp.set_defaults(func=cmd_holds, holds_action="reset")
 
     sp = ps.add_parser("status", help="网关状态总览")
     sp.add_argument("--json", action="store_true")
+    _add_name_option(sp, "只看这个实例（名字或类型，如 astrbot / login）")
     sp.set_defaults(func=cmd_status)
 
     sp = ps.add_parser(
@@ -1922,6 +2029,7 @@ def register(sub) -> None:
                     "能否盖住缺口、页面里是否还有客户端求答案的代码。"
                     "这个检查的存在是因为有一次改动让拼片和缺口完全对不上，"
                     "而所有自动化测试都通过了——唯一发现它的是人眼看屏幕。")
+    _add_name_option(sp, "只自检这个实例（名字或类型）")
     sp.set_defaults(func=cmd_selftest)
 
     sp = ps.add_parser("install", help="安装网关",
@@ -1949,16 +2057,19 @@ def register(sub) -> None:
     sp.add_argument("kind", nargs="?", default="",
                     choices=("", KIND_BT, KIND_LOGIN))
     sp.add_argument("--yes", "-y", action="store_true")
+    _add_name_option(sp, "只接入这个实例（名字或类型）")
     sp.set_defaults(func=cmd_adopt)
 
     sp = ps.add_parser("repair", help="只重新接线 nginx，不重建网关文件")
     sp.add_argument("kind", nargs="?", default=KIND_LOGIN,
                     choices=tuple(KIND_META))
+    _add_name_option(sp, "要重新接线的实例名（省略为默认 login）")
     sp.set_defaults(func=cmd_repair)
 
     sp = ps.add_parser("test", help="端到端自检：配置、接线、页面、上游")
     sp.add_argument("kind", nargs="?", default=KIND_LOGIN,
                     choices=tuple(KIND_META))
+    _add_name_option(sp, "要自检的实例名（省略为默认 login）")
     sp.set_defaults(func=cmd_test)
 
     sp = ps.add_parser("uninstall", help="卸载网关")
@@ -1966,4 +2077,5 @@ def register(sub) -> None:
                     choices=tuple(KIND_META))
     sp.add_argument("--purge", action="store_true", help="同时删除网关文件")
     sp.add_argument("--yes", "-y", action="store_true")
+    _add_name_option(sp, "要卸载的实例名（省略为默认 login）")
     sp.set_defaults(func=cmd_uninstall)

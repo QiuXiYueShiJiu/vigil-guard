@@ -174,11 +174,36 @@ GATE_APP = {
 }
 
 #: Config key -> gate kind. The two names differ because the login gate was
-#: written for one application before this project generalised.
+#: written for one application before this project generalised. Kept as the
+#: seed for :func:`gate_config_keys`, which adds the named instances.
 GATE_KEY_KIND = {"dsh_gate": "login", "bt_panel": "bt_panel"}
 
+#: Instance name shown for the two original config keys.
+GATE_KEY_NAME = {"dsh_gate": "login", "bt_panel": "bt_panel"}
 
-def _gate_app_label(state_dir: str, kind: str) -> str:
+
+def gate_config_keys(cfg) -> list:
+    """``[(config_key, kind, name)]`` for every configured gate instance.
+
+    The two original keys are always present; named login instances are
+    discovered from their own ``gate.<name>`` section, which is the
+    instance's identity. Reading only the fixed map made every named
+    instance's logins invisible to the alert reader.
+    """
+    out = [(key, kind, GATE_KEY_NAME.get(key, key))
+           for key, kind in GATE_KEY_KIND.items()]
+    gate_cfg = cfg.get("gate") if cfg is not None else None
+    if isinstance(gate_cfg, dict):
+        for key in sorted(gate_cfg):
+            if key in GATE_KEY_KIND or key == "demo":
+                continue
+            if not isinstance(gate_cfg[key], dict):
+                continue
+            out.append((key, "login", key))
+    return out
+
+
+def _gate_app_label(state_dir: str, kind: str, name: str = "") -> str:
     """What this gate actually protects, as a person would name it.
 
     Taken from the gate's own generated config where possible: a gate knows
@@ -186,6 +211,10 @@ def _gate_app_label(state_dir: str, kind: str) -> str:
     the alert rather than a generic category. The kind is only a fallback.
     """
     app = GATE_APP.get(kind, kind or "网关")
+    if name and name != kind:
+        # Two login gates on one host produce two identical category names;
+        # the instance name is what tells them apart in the inbox.
+        app = "%s［%s］" % (app, name)
     cfg_path = os.path.join(state_dir, "config.php")
     if os.path.isfile(cfg_path):
         try:
@@ -230,7 +259,7 @@ def gate_log_sources(cfg) -> list:
     """
     out = []
     seen = set()
-    for key, kind in GATE_KEY_KIND.items():
+    for key, kind, name in gate_config_keys(cfg):
         path = str(cfg.get("gate.%s.auth_log" % key, "") or "")
         if not path or path in seen:
             continue
@@ -240,9 +269,11 @@ def gate_log_sources(cfg) -> list:
             if base and base != path:
                 state_dir = base
         seen.add(path)
-        out.append((path, _gate_app_label(state_dir, kind), kind))
-    if out:
-        return out
+        out.append((path, _gate_app_label(state_dir, kind, name), kind))
+    # Always look at the live installations too. A gate can be installed and
+    # working before anything writes its `auth_log` into the config (that
+    # happens on adopt/sync), and it must not stay invisible just because
+    # some *other* gate was configured first.
     try:
         from ..gates import detect_all
         for spec in detect_all():
@@ -253,7 +284,8 @@ def gate_log_sources(cfg) -> list:
             if not os.path.isfile(candidate) or candidate in seen:
                 continue
             seen.add(candidate)
-            out.append((candidate, _gate_app_label(state_dir, spec.kind),
+            out.append((candidate,
+                        _gate_app_label(state_dir, spec.kind, spec.name),
                         spec.kind))
     except Exception:
         # A gate that cannot be inspected must not stop SSH login alerts.

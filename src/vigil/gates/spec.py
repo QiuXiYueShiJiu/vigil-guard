@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from ..core import detect
+from ..core.errors import VigilError
 
 KIND_BT = "bt_panel"
 KIND_LOGIN = "login"
@@ -66,6 +67,163 @@ KIND_META = {
 }
 
 
+# --------------------------------------------------------------------------
+# Instances
+#
+# A gate *kind* is the software (a login gate, a panel gate). An *instance*
+# is one installation of it. `login` used to be a singleton: its directory,
+# cookie and config key were constants, so asking for a second one silently
+# reconfigured the first -- the installer found the existing wiring and
+# updated it in place. Naming instances is what makes the second install a
+# second install.
+#
+# The historical login gate keeps its name, directory, cookie and config key.
+# Anything else is new and gets a layout derived from its name. That split is
+# the whole backward-compatibility story: an existing installation is never
+# renamed, moved, or migrated.
+# --------------------------------------------------------------------------
+
+#: Name of the original login gate, whose layout predates instances.
+LEGACY_LOGIN_NAME = "login"
+
+#: bt_panel is a single instance by nature -- there is one panel -- so its
+#: name is fixed and `--name` is refused for it rather than silently ignored.
+BT_INSTANCE_NAME = KIND_BT
+
+#: Names that would collide with a historical layout, with a non-instance key
+#: already living under `gate`, or that would make the state directory
+#: ambiguous. Refused up front instead of being sanitised into something the
+#: operator did not ask for.
+RESERVED_INSTANCE_NAMES = frozenset({
+    "bt", "dsh", "demo", "dsh_gate", "bt_panel",
+    "login_alerts", "login_notify",
+})
+
+_INSTANCE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+
+
+def normalize_instance(kind: str, name: str = "") -> str:
+    """Resolve a user-supplied instance name, or refuse it.
+
+    The name is user input that ends up in three places at once -- a path, a
+    config key and a cookie -- so it is validated once, here, rather than
+    being sanitised differently at each use site.
+    """
+    if kind == KIND_BT:
+        if name and name != KIND_BT:
+            raise VigilError(
+                "bt_panel 只能有一个实例（面板本身只有一个）",
+                hint="去掉 --name，或改用 login 类型创建独立网关")
+        return BT_INSTANCE_NAME
+    name = (name or "").strip().lower()
+    if not name:
+        return LEGACY_LOGIN_NAME
+    if name == LEGACY_LOGIN_NAME:
+        return name
+    if not _INSTANCE_NAME_RE.match(name):
+        raise VigilError(
+            "实例名只能用小写字母、数字、下划线和连字符，且以字母或数字开头: %s"
+            % name)
+    if name in RESERVED_INSTANCE_NAMES or name.endswith("_gate"):
+        raise VigilError(
+            "实例名 %s 与已有的目录或配置项冲突，请换一个" % name,
+            hint="避开 bt、dsh、demo、dsh_gate、bt_panel 等保留名")
+    return name
+
+
+def is_legacy_instance(kind: str, name: str = "") -> bool:
+    """Does this instance use the pre-instances layout and config key?"""
+    return kind == KIND_BT or normalize_instance(kind, name) == LEGACY_LOGIN_NAME
+
+
+def config_section(kind: str, name: str = "") -> str:
+    """The ``gate.<section>`` key an instance's settings live under.
+
+    The original login gate was configured as ``gate.dsh_gate`` before
+    instances existed. Renaming that key now would silently orphan every
+    existing installation's stored settings, so the default instance keeps
+    it and only new instances use their own name.
+    """
+    if kind == KIND_BT:
+        return "bt_panel"
+    name = normalize_instance(kind, name)
+    return "dsh_gate" if name == LEGACY_LOGIN_NAME else name
+
+
+def instance_dir_basename(kind: str, name: str = "") -> str:
+    """Directory name an instance's state lives in under /www/server."""
+    if kind == KIND_BT:
+        return "bt-gate"
+    name = normalize_instance(kind, name)
+    return "dsh-gate" if name == LEGACY_LOGIN_NAME else "%s-gate" % name
+
+
+def instance_state_dir(kind: str, name: str = "") -> str:
+    return os.path.join("/www/server", instance_dir_basename(kind, name))
+
+
+def instance_webroot(kind: str, name: str = "") -> str:
+    if kind == KIND_BT:
+        return KIND_META[KIND_BT]["default_webroot"]
+    name = normalize_instance(kind, name)
+    if name == LEGACY_LOGIN_NAME:
+        return KIND_META[KIND_LOGIN]["default_webroot"]
+    return "/www/wwwroot/%s-gate" % name
+
+
+def instance_cookie(kind: str, name: str = "") -> str:
+    """Per-instance session cookie.
+
+    Distinct cookies are the difference between two gates and one gate with
+    two doors: a session minted by instance A must never be accepted by
+    instance B, and a shared cookie name is exactly how that happens.
+    """
+    if kind == KIND_BT:
+        return KIND_META[KIND_BT]["default_cookie"]
+    name = normalize_instance(kind, name)
+    if name == LEGACY_LOGIN_NAME:
+        return KIND_META[KIND_LOGIN]["default_cookie"]      # dshgate
+    return "%sgate" % name
+
+
+def instance_nav_cookie(kind: str, name: str = "") -> str:
+    if kind == KIND_BT:
+        return KIND_META[KIND_BT].get("default_nav_cookie", "")
+    name = normalize_instance(kind, name)
+    if name == LEGACY_LOGIN_NAME:
+        return KIND_META[KIND_LOGIN].get("default_nav_cookie", "")   # dshnav
+    return "%snav" % name
+
+
+def instance_label(kind: str, name: str = "") -> str:
+    """Human label that distinguishes instances of the same kind."""
+    label = KIND_META.get(kind, {}).get("label", kind)
+    name = normalize_instance(kind, name)
+    if kind == KIND_BT or name == LEGACY_LOGIN_NAME:
+        return label
+    return "%s（%s）" % (label, name)
+
+
+#: Where a packaged installation keeps a gate's files when it does not use a
+#: state directory under /www/server.
+PACKAGE_GATE_ROOT = "/usr/local/lib/vigil/gate"
+
+
+def package_dir_name(kind: str, name: str = "") -> str:
+    """Package-tree directory name for an instance.
+
+    The default instance uses its *kind*, which is what earlier versions
+    wrote; a named instance uses its own name, or two instances would share
+    one directory.
+    """
+    name = normalize_instance(kind, name)
+    return kind if is_legacy_instance(kind, name) else name
+
+
+def package_state_dir(kind: str, name: str = "") -> str:
+    return os.path.join(PACKAGE_GATE_ROOT, package_dir_name(kind, name))
+
+
 def _derive_endpoints(spec: "GateSpec") -> None:
     """Set the captcha and logout paths from the entry path.
 
@@ -104,8 +262,12 @@ def _resolve_nginx_targets(spec: "GateSpec", env: dict) -> None:
     conf = ng.get("conf", "")
     conf_dir = os.path.dirname(conf) if conf else "/etc/nginx"
 
-    # Zones: http{}-scope, so the main config must include the file.
-    spec.zones_file = os.path.join(conf_dir, "vigil-gate-%s-zones.conf" % _slug(spec.kind))
+    # Zones: http{}-scope, so the main config must include the file. The
+    # file is per *instance*, not per kind: two login gates sharing one zones
+    # file would each try to declare the same zone names, and nginx treats a
+    # second declaration as fatal.
+    spec.zones_file = os.path.join(
+        conf_dir, "vigil-gate-%s-zones.conf" % _slug(spec.slug))
 
     include_dirs = [d for d in (ng.get("include_dirs") or []) if os.path.isdir(d)]
     # The vhost directory is the one that is included as *.conf at http scope.
@@ -123,9 +285,8 @@ def _resolve_nginx_targets(spec: "GateSpec", env: dict) -> None:
         vhost_dir = conf_dir
 
     lua = os.path.join(spec.state_dir, "gate.lua")
-    existing = _existing_gate_conf(kind=spec.kind, lua=lua,
-                                   listen_port=spec.listen_port,
-                                   vhost_dir=vhost_dir, env=env)
+    existing = _existing_gate_conf(lua=lua, listen_port=spec.listen_port,
+                                   vhost_dir=vhost_dir)
     if existing:
         # Reuse the file an earlier installation used, so a reconfigure
         # updates in place. Writing to a new name instead would leave two
@@ -136,7 +297,8 @@ def _resolve_nginx_targets(spec: "GateSpec", env: dict) -> None:
 
     if spec.proxy_mode:
         # A whole server{} block, dropped into the included vhost directory.
-        spec.nginx_conf = os.path.join(vhost_dir, "vigil-gate-%s.conf" % _slug(spec.kind))
+        spec.nginx_conf = os.path.join(
+            vhost_dir, "vigil-gate-%s.conf" % re.sub(r"\W+", "-", spec.slug))
     else:
         # A server-scope snippet, which only makes sense inside an existing
         # vhost, so it goes into that site's extension directory.
@@ -145,9 +307,8 @@ def _resolve_nginx_targets(spec: "GateSpec", env: dict) -> None:
         spec.nginx_conf = os.path.join(ext, "zz-vigil-gate.conf")
 
 
-def _existing_gate_conf(kind: str, lua: str, listen_port: int,
-                        vhost_dir: str, env: dict) -> str:
-    """Find the nginx file an earlier installation of this gate used."""
+def _existing_gate_conf(lua: str, listen_port: int, vhost_dir: str) -> str:
+    """Find the nginx file an earlier installation of *this instance* used."""
     import os
     if not vhost_dir or not os.path.isdir(vhost_dir):
         return ""
@@ -254,6 +415,9 @@ def _panel_site_dir(env: dict) -> str:
 class GateSpec:
     # -- identity ---------------------------------------------------------
     kind: str = KIND_BT
+    #: Instance name. Empty means "the original installation of this kind",
+    #: which is what every hand-built spec in tests and callers means.
+    name: str = ""
     state_dir: str = ""
     webroot: str = ""
     entry_path: str = ""
@@ -381,6 +545,22 @@ class GateSpec:
         return KIND_META.get(self.kind, {})
 
     @property
+    def slug(self) -> str:
+        """Identity used in nginx file names and rate-limit zone names.
+
+        The default instance's slug is its *kind*, which is what every
+        filename and zone name generated before instances existed was built
+        from -- so an existing installation's wiring is recognised and
+        updated rather than duplicated. Named instances use their own name.
+        """
+        return self.name or self.kind
+
+    @property
+    def conf_slug(self) -> str:
+        """Slug as it appears in hyphenated nginx file names."""
+        return re.sub(r"\W+", "-", self.slug)
+
+    @property
     def proxy_mode(self) -> bool:
         return bool(self.meta.get("proxy_mode"))
 
@@ -412,7 +592,7 @@ class GateSpec:
         return pref
 
     def zone(self, what: str) -> str:
-        return "vigil_%s_%s" % (_slug(self.kind), what)
+        return "vigil_%s_%s" % (_slug(self.slug), what)
 
     def validate(self) -> list:
         problems = []
@@ -452,20 +632,25 @@ class GateSpec:
     # -- construction ------------------------------------------------------
     @classmethod
     def for_kind(cls, kind: str, cfg=None, env: dict = None,
-                 **overrides) -> "GateSpec":
-        """Build a spec for *kind*, seeded from config and host discovery."""
+                 name: str = "", **overrides) -> "GateSpec":
+        """Build a spec for *kind*, seeded from config and host discovery.
+
+        *name* selects the instance. Empty means the original one, which is
+        why every pre-existing caller keeps its behaviour unchanged.
+        """
         meta = KIND_META[kind]
+        name = normalize_instance(kind, name or overrides.pop("name", ""))
         env = env or detect.full()
         ng = env.get("nginx", {})
         socks = env.get("php_fpm", {}).get("sockets", [])
         panel = env.get("bt_panel", {})
 
-        spec = cls(kind=kind)
-        spec.state_dir = meta["default_dir"]
-        spec.webroot = meta["default_webroot"]
+        spec = cls(kind=kind, name=name)
+        spec.state_dir = instance_state_dir(kind, name)
+        spec.webroot = instance_webroot(kind, name)
         spec.entry_path = meta["default_entry"]
-        spec.cookie = meta["default_cookie"]
-        spec.nav_cookie = meta.get("default_nav_cookie", "")
+        spec.cookie = instance_cookie(kind, name)
+        spec.nav_cookie = instance_nav_cookie(kind, name)
 
         base = spec.entry_path.rsplit("/", 1)[0] or "/__gate"
         spec.captcha_path = base + "/captcha"
@@ -496,10 +681,13 @@ class GateSpec:
             spec.domain = cfg.get("gate.bt_panel.domain", "") if cfg else ""
 
         # Then anything already recorded in config, then explicit overrides.
+        # The section is per *instance*: reading the default instance's
+        # settings while building a named one is precisely how instance B
+        # used to inherit instance A's port, domain and upstream.
         if cfg is not None:
-            section = "gate.bt_panel" if kind == KIND_BT else "gate.dsh_gate"
+            section = "gate.%s" % config_section(kind, name)
             for f in fields(cls):
-                if f.name in ("kind", "pass_hash", "username",
+                if f.name in ("kind", "name", "pass_hash", "username",
                               "settings_patches"):
                     continue
                 val = cfg.get("%s.%s" % (section, f.name), None)
@@ -521,11 +709,19 @@ class GateSpec:
 
         # Derived invariants that must hold whatever the caller passed.
         if spec.proxy_mode and not spec.listen_port:
-            spec.listen_port = 4399
-        if spec.use_https and not spec.cert_dir and spec.proxy_mode:
-            spec.cert_dir = "/www/server/panel/vhost/cert/local-%d" % spec.listen_port
+            # 4399 is the historical login-gate port and existing wiring
+            # depends on it, so the default instance keeps it. A named
+            # instance must NOT inherit it -- sharing a port with another
+            # gate is a bind conflict, so it is allocated later, once every
+            # installed instance is known (see gates.install).
+            if is_legacy_instance(kind, name):
+                spec.listen_port = 4399
+        if (spec.use_https and not spec.cert_dir and spec.proxy_mode
+                and spec.listen_port):
+            spec.cert_dir = ("/www/server/panel/vhost/cert/local-%d"
+                             % spec.listen_port)
         if not spec.nav_cookie and spec.proxy_mode:
-            spec.nav_cookie = "dshnav"
+            spec.nav_cookie = instance_nav_cookie(kind, name)
         return spec
 
     @classmethod

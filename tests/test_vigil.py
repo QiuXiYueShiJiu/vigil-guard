@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -42,6 +43,7 @@ if str(SRC) not in sys.path:
 from vigil import i18n, ui                                    # noqa: E402
 from vigil.core import config as vconfig                       # noqa: E402
 from vigil.core import paths, shell, state                     # noqa: E402
+from vigil.core.errors import VigilError                       # noqa: E402
 from vigil.gates import spec as gspec                          # noqa: E402
 from vigil.gates.spec import KIND_BT, KIND_LOGIN               # noqa: E402
 from vigil.mail import queue as mqueue                         # noqa: E402
@@ -747,6 +749,382 @@ class TestGateSpec(unittest.TestCase):
         lg = gspec.GateSpec.for_kind(KIND_LOGIN)
         for what in ("req", "cap", "conn"):
             self.assertNotEqual(bt.zone(what), lg.zone(what))
+
+
+class TestGateInstances(unittest.TestCase):
+    """Named login gates are independent, and the old one is never touched.
+
+    The failure these pin is specific and expensive. Before instances
+    existed, `gate install login` with a second set of parameters found the
+    one existing login gate, decided that *was* the gate being asked for,
+    and reconfigured it in place: upstream, port, domain and certificate
+    were overwritten, and because the command carried `--no-password` the
+    stored password hash was cleared and `require_password` turned off. The
+    operator's working DSH gate was redirected at an unrelated service.
+
+    So the central test here is not "two instances can be created" but
+    "creating the second one leaves the first byte-for-byte unchanged".
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name)
+        (self.base / "vhost").mkdir()
+        # A discovered `gate.dirs` list is how a test (or a host with a
+        # non-standard layout) points instance discovery at another tree.
+        self.env = {
+            "nginx": {"present": True, "binary": "", "lua": True, "conf": "",
+                      "include_dirs": [str(self.base / "vhost")],
+                      "worker_user": "www"},
+            "php_fpm": {"sockets": [{"socket": str(self.base / "php.sock"),
+                                     "user": "www"}]},
+            "bt_panel": {"present": False},
+            "gate": {"root": str(self.base / "server"), "dirs": []},
+        }
+        # A real Store over a throwaway file, seeded from the shipped
+        # defaults, so nothing here reads or writes /etc/vigil.
+        self.cfg = state.Store(
+            self.base / "config.json",
+            defaults=json.loads(json.dumps(vconfig.DEFAULTS)))
+
+    def _capture_install(self):
+        """Replace the real installer so a test never writes to the host.
+
+        The spec is captured instead. In particular the fake does *not*
+        create the state directory: these tests must not create anything
+        under the real /www/server, even by accident.
+        """
+        from vigil.gates import installer as ginstaller
+        captured = {}
+
+        def fake_install(spec, env=None, log=None, start_override=True):
+            captured["spec"] = spec
+            return {"ok": True, "entry": spec.entry_path, "written": []}
+
+        patcher = mock.patch.object(ginstaller, "install", fake_install)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return captured
+
+    # -- layout -----------------------------------------------------------
+
+    def test_named_instances_have_disjoint_layouts(self):
+        a = gspec.GateSpec.for_kind(KIND_LOGIN, name="astrbot")
+        b = gspec.GateSpec.for_kind(KIND_LOGIN, name="wiki")
+        default = gspec.GateSpec.for_kind(KIND_LOGIN)
+
+        self.assertEqual("/www/server/astrbot-gate", a.state_dir)
+        self.assertEqual("/www/wwwroot/astrbot-gate", a.webroot)
+        self.assertEqual("astrbotgate", a.cookie)
+        self.assertEqual("astrbotnav", a.nav_cookie)
+        self.assertEqual("astrbot", gspec.config_section(KIND_LOGIN, "astrbot"))
+
+        self.assertEqual("/www/server/wiki-gate", b.state_dir)
+        self.assertEqual("/www/wwwroot/wiki-gate", b.webroot)
+        self.assertEqual("wikigate", b.cookie)
+
+        for field in ("state_dir", "webroot", "cookie", "nav_cookie",
+                      "conf_slug", "slug"):
+            self.assertNotEqual(getattr(a, field), getattr(b, field), field)
+            self.assertNotEqual(getattr(a, field), getattr(default, field),
+                                field)
+        self.assertNotEqual(gspec.config_section(KIND_LOGIN, "astrbot"),
+                            gspec.config_section(KIND_LOGIN, "wiki"))
+        for what in ("req", "cap", "conn", "tls"):
+            self.assertNotEqual(a.zone(what), b.zone(what))
+            self.assertNotEqual(a.zone(what), default.zone(what))
+
+    def test_omitting_the_name_keeps_the_legacy_layout(self):
+        default = gspec.GateSpec.for_kind(KIND_LOGIN)
+        explicit = gspec.GateSpec.for_kind(KIND_LOGIN, name="login")
+        self.assertEqual("/www/server/dsh-gate", default.state_dir)
+        self.assertEqual("/www/wwwroot/dsh-gate", default.webroot)
+        self.assertEqual("dshgate", default.cookie)
+        self.assertEqual("dsh_gate", gspec.config_section(KIND_LOGIN, ""))
+        self.assertEqual(default.state_dir, explicit.state_dir)
+        self.assertEqual(default.cookie, explicit.cookie)
+        self.assertEqual("login", gspec.normalize_instance(KIND_LOGIN, ""))
+        self.assertEqual("login", gspec.normalize_instance(KIND_LOGIN, None))
+
+    def test_bt_panel_refuses_a_second_instance(self):
+        self.assertEqual("bt_panel", gspec.normalize_instance(KIND_BT, ""))
+        with self.assertRaises(VigilError):
+            gspec.GateSpec.for_kind(KIND_BT, name="second")
+
+    def test_reserved_and_malformed_names_are_refused(self):
+        for bad in ("dsh", "bt", "demo", "dsh_gate", "bt_panel",
+                    "my_gate", "a.b", "-lead", "x" * 40):
+            with self.assertRaises(VigilError, msg=bad):
+                gspec.normalize_instance(KIND_LOGIN, bad)
+        # Upper case is normalised rather than rejected; the layout it
+        # produces is still lower case and therefore safe in a path.
+        self.assertEqual("astrbot",
+                         gspec.normalize_instance(KIND_LOGIN, "AstrBot"))
+
+    # -- credentials ------------------------------------------------------
+
+    def test_installing_a_second_instance_never_touches_the_first(self):
+        from vigil.gates import install as gate_install
+        self._capture_install()
+        with mock.patch("vigil.gates.detect_all", return_value=[]):
+            gate_install(self.cfg, KIND_LOGIN, env=self.env, name="alpha",
+                         require_password=False,
+                         upstream="http://127.0.0.1:6185", listen_port=4400,
+                         domain="alpha.example.com")
+            alpha = json.loads(json.dumps(self.cfg.get("gate.alpha")))
+            legacy = json.loads(json.dumps(self.cfg.get("gate.dsh_gate")))
+            gate_install(self.cfg, KIND_LOGIN, env=self.env, name="beta",
+                         require_password=False,
+                         upstream="http://127.0.0.1:9999", listen_port=4401,
+                         domain="beta.example.com")
+            alpha_after = json.loads(json.dumps(self.cfg.get("gate.alpha")))
+        self.assertEqual(alpha, alpha_after,
+                         "创建实例 beta 改动了实例 alpha 的配置")
+        self.assertEqual(legacy, self.cfg.get("gate.dsh_gate"),
+                         "创建命名实例改动了默认实例的配置")
+        self.assertEqual("/www/server/alpha-gate",
+                         self.cfg.get("gate.alpha.state_dir"))
+        self.assertEqual("/www/server/beta-gate",
+                         self.cfg.get("gate.beta.state_dir"))
+        self.assertEqual("alphagate", self.cfg.get("gate.alpha.cookie"))
+        self.assertEqual("betagate", self.cfg.get("gate.beta.cookie"))
+        self.assertEqual(4400, self.cfg.get("gate.alpha.listen_port"))
+        self.assertEqual(4401, self.cfg.get("gate.beta.listen_port"))
+
+    def test_no_password_instance_stores_no_credentials(self):
+        from vigil.gates import install as gate_install
+        captured = self._capture_install()
+        with mock.patch("vigil.gates.detect_all", return_value=[]):
+            res = gate_install(self.cfg, KIND_LOGIN, env=self.env,
+                               name="astrbot", require_password=False,
+                               upstream="http://127.0.0.1:6185",
+                               domain="astrbot.example.com")
+        self.assertTrue(res["ok"], res)
+        spec = captured["spec"]
+        self.assertFalse(spec.require_password)
+        self.assertEqual("", spec.pass_hash)
+        self.assertFalse(self.cfg.get("gate.astrbot.require_password"))
+        self.assertIsNone(self.cfg.get("gate.astrbot.pass_hash"),
+                          "密码哈希不应被写进 config.json")
+        self.assertEqual("/www/server/astrbot-gate",
+                         self.cfg.get("gate.astrbot.state_dir"))
+
+    def test_password_instance_hashes_but_never_copies_the_hash(self):
+        from vigil.gates import install as gate_install
+        captured = self._capture_install()
+        digest = "$2y$10$" + "x" * 53
+        with mock.patch("vigil.gates.detect_all", return_value=[]), \
+                mock.patch("vigil.gates.installer.hash_password",
+                           return_value=digest):
+            res = gate_install(self.cfg, KIND_LOGIN, env=self.env,
+                               name="wiki", password="correct horse",
+                               upstream="http://127.0.0.1:8080")
+        self.assertTrue(res["ok"], res)
+        spec = captured["spec"]
+        self.assertTrue(spec.require_password)
+        self.assertEqual(digest, spec.pass_hash)
+        self.assertTrue(self.cfg.get("gate.wiki.require_password"))
+        self.assertIsNone(self.cfg.get("gate.wiki.pass_hash"),
+                          "密码哈希不应被复制到配置里")
+
+    # -- discovery / listing ---------------------------------------------
+
+    def test_status_lists_instances_and_reflects_removal(self):
+        from vigil.gates import status as gate_status
+        server = self.base / "server"
+        for name in ("alpha", "beta"):
+            d = server / ("%s-gate" % name)
+            d.mkdir(parents=True)
+            (d / "gate.lua").write_text("-- test\n", encoding="utf-8")
+        # A directory that merely ends in `-gate` is not a gate. A real host
+        # had one, and it was being listed as an installed instance.
+        stray = server / "stray-gate"
+        stray.mkdir(parents=True)
+        (stray / "unrelated.php").write_text("<?php\n", encoding="utf-8")
+        # Alpha stays in config after its files go away, so it is reported
+        # as a broken installation instead of silently disappearing.
+        self.cfg.set("gate.alpha.enabled", True)
+        env = json.loads(json.dumps(self.env))
+        env["gate"] = {"root": str(server),
+                       "dirs": [str(server / "alpha-gate"),
+                                str(stray),
+                                str(server / "beta-gate")]}
+        with mock.patch("vigil.gates.nginx_text", return_value=""), \
+                mock.patch("vigil.gates.shell.out", return_value=""):
+            rows = {(r["kind"], r["name"]): r
+                    for r in gate_status(self.cfg, env)}
+            self.assertIn(("login", "alpha"), rows)
+            self.assertIn(("login", "beta"), rows)
+            self.assertNotIn(("login", "stray"), rows,
+                             "不是网关的目录被当成了实例")
+            self.assertTrue(rows[("login", "alpha")]["installed"])
+            self.assertEqual("alpha", rows[("login", "alpha")]["name"])
+            self.assertEqual("gate.alpha",
+                             rows[("login", "alpha")]["config_key"])
+            self.assertEqual(str(server / "alpha-gate"),
+                             rows[("login", "alpha")]["state_dir"])
+
+            shutil.rmtree(str(server / "alpha-gate"))
+            env["gate"]["dirs"] = [str(server / "beta-gate")]
+            after = {(r["kind"], r["name"]): r
+                     for r in gate_status(self.cfg, env)}
+        self.assertIn(("login", "alpha"), after)
+        self.assertFalse(after[("login", "alpha")]["installed"],
+                         "状态目录已删除却仍报告为已安装")
+        self.assertTrue(after[("login", "beta")]["installed"])
+
+    def test_list_renders_every_instance(self):
+        from vigil.commands import gate as gate_cmd
+        rows = [
+            {"kind": KIND_BT, "name": "bt_panel", "label": "面板",
+             "installed": True, "adopted": True,
+             "state_dir": "/www/server/bt-gate", "domain": "panel.example.com",
+             "port": 0, "upstream": "", "credentials": False},
+            {"kind": KIND_LOGIN, "name": "alpha", "label": "登录 alpha",
+             "installed": True, "adopted": True,
+             "state_dir": "/www/server/alpha-gate",
+             "domain": "alpha.example.com", "port": 4400,
+             "upstream": "http://127.0.0.1:6185", "credentials": False},
+            {"kind": KIND_LOGIN, "name": "beta", "label": "登录 beta",
+             "installed": False, "adopted": True,
+             "state_dir": "/www/server/beta-gate", "domain": "", "port": 0,
+             "upstream": "", "credentials": True},
+        ]
+        captured = {}
+
+        def fake_table(table_rows, headers=None):
+            captured["rows"] = list(table_rows)
+            captured["headers"] = headers
+
+        class _A:
+            types = False
+            config = None
+
+        with mock.patch.object(gate_cmd, "status", return_value=rows), \
+                mock.patch.object(gate_cmd, "load_config",
+                                  return_value=self.cfg), \
+                mock.patch.object(gate_cmd.ui, "table", fake_table), \
+                mock.patch.object(gate_cmd.ui, "header", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "warning", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "section", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "kv", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "out", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "note", lambda *a, **k: None), \
+                mock.patch.object(gate_cmd.ui, "hint", lambda *a, **k: None):
+            rc = gate_cmd.cmd_list(_A())
+        self.assertEqual(0, rc)
+        self.assertEqual(["bt_panel", "alpha", "beta"],
+                         [row[1] for row in captured["rows"]])
+        self.assertEqual(7, len(captured["headers"]))
+        self.assertIn("http://127.0.0.1:6185", captured["rows"][1])
+
+    def test_generated_nginx_is_per_instance(self):
+        from vigil.gates import installer
+        a = gspec.GateSpec.for_kind(KIND_LOGIN, name="alpha")
+        b = gspec.GateSpec.for_kind(KIND_LOGIN, name="beta")
+        a.listen_port, a.upstream = 4400, "http://127.0.0.1:6185"
+        b.listen_port, b.upstream = 4401, "http://127.0.0.1:9999"
+        text_a = installer.render_nginx(a)
+        text_b = installer.render_nginx(b)
+        self.assertIn(a.zone("req"), text_a)
+        self.assertNotIn(a.zone("req"), text_b)
+        self.assertIn("/www/server/alpha-gate/gate.lua", text_a)
+        self.assertNotIn("/www/server/beta-gate/gate.lua", text_a)
+        self.assertIn("listen 127.0.0.1:4400", text_a)
+        self.assertIn("listen 127.0.0.1:4401", text_b)
+        zones_a = installer.render_zones(a)
+        self.assertIn(a.zone("req"), zones_a)
+        self.assertNotIn(b.zone("req"), zones_a)
+
+    def test_a_port_collision_is_reported_not_forced(self):
+        """A second gate must never take over another gate's port.
+
+        Withdrawing the other instance's listener is how a "second" install
+        could still take the first one down, so a clash is an error.
+        """
+        from vigil.gates import install as gate_install
+        alpha = gspec.GateSpec.for_kind(KIND_LOGIN, name="alpha")
+        alpha.listen_port = 4400
+        with mock.patch("vigil.gates.detect_all", return_value=[alpha]):
+            with self.assertRaises(VigilError):
+                gate_install(self.cfg, KIND_LOGIN, env=self.env, name="beta",
+                             require_password=False,
+                             upstream="http://127.0.0.1:9999",
+                             listen_port=4400)
+
+    def test_a_fresh_named_instance_installs_before_its_dir_exists(self):
+        """The whole install aborted for every brand-new instance.
+
+        The generated `config.php` requires its library by absolute path,
+        and PHP validation runs the staged copy in /tmp *before* anything is
+        written to the state directory. So `require_once
+        <state_dir>/lib/gate-lib.php` hit a path that did not exist yet and
+        the install stopped with "Failed to open stream". The default
+        instance only ever passed because its library had been on disk since
+        an earlier install -- which is exactly why this was not caught.
+        """
+        from vigil.gates import installer
+        php = installer.php_bin()
+        if not php:
+            self.skipTest("没有可用的 php，无法执行 PHP 校验")
+        base = self.base
+        ng_conf = base / "nginx.conf"
+        ng_conf.write_text("http {\n    include       proxy.conf;\n}\n",
+                           encoding="utf-8")
+        env = {
+            "nginx": {"present": True, "lua": True, "binary": "/bin/true",
+                      "conf": str(ng_conf),
+                      "include_dirs": [str(base / "vhost")],
+                      "worker_user": "www"},
+            "php_fpm": {"sockets": [{"socket": str(base / "php.sock"),
+                                     "user": "www"}]},
+            "bt_panel": {"present": False},
+            "gate": {"root": str(base / "server"), "dirs": []},
+        }
+        spec = gspec.GateSpec.for_kind(KIND_LOGIN, cfg=None, env=env,
+                                       name="astrbot")
+        spec.state_dir = str(base / "server" / "astrbot-gate")
+        spec.webroot = str(base / "www" / "astrbot-gate")
+        spec.upstream = "http://127.0.0.1:6185"
+        spec.listen_port = 4400
+        spec.require_password = False
+        spec.fastcgi_pass = "unix:%s" % (base / "php.sock")
+        self.assertFalse(Path(spec.state_dir).exists())
+
+        real_run = shell.run
+
+        def fake_run(argv, **kw):
+            # nginx -t and the reload are the only things that must not run;
+            # the PHP version probe and everything else stays real.
+            if "-t" in argv or (argv and argv[0] == "systemctl"):
+                return True, "", ""
+            return real_run(argv, **kw)
+
+        smoke = []
+        real_smoke = installer._php_smoke_test
+
+        def spy(php_bin_, rendered, spec_):
+            result = real_smoke(php_bin_, rendered, spec_)
+            smoke.append(result)
+            return result
+
+        with mock.patch("vigil.gates.installer.shell.run", fake_run), \
+                mock.patch.object(installer, "BACKUP_ROOT",
+                                  base / "backups"), \
+                mock.patch("vigil.gates.installer._php_smoke_test",
+                           side_effect=spy):
+            res = installer.install(spec, env=env, log=None)
+
+        self.assertTrue(res.get("ok"), res)
+        self.assertTrue(smoke, "PHP 校验根本没有运行")
+        self.assertEqual([], smoke[0], "PHP 校验报告了问题")
+        state = Path(spec.state_dir)
+        for rel in ("gate.lua", "config.php", "policy.conf",
+                    "lib/gate-lib.php"):
+            self.assertTrue((state / rel).is_file(), rel)
+        for name in ("verify.php", "captcha.php", "logout.php"):
+            self.assertTrue((Path(spec.webroot) / name).is_file(), name)
 
 
 # --------------------------------------------------------------------------
@@ -3157,8 +3535,26 @@ class TestBackupRestore(unittest.TestCase):
         self.b.paths.CONFIG = self.root / "etc" / "config.json"
         self.b.paths.SECRETS = self.root / "etc" / "secrets.json"
         self.b.paths.STATE_STATE = self.root / "state"
+        # Restoring must not write to the live gate state or the live nginx
+        # directory. It used to: this class's round-trip test extracted the
+        # archived gate files straight back over /www/server/<gate>/ and the
+        # zones snippet over the real nginx conf directory -- identical
+        # bytes, but a production write from a unit test.
+        self.saved_gate_root = self.b.GATE_ROOT
+        self.b.GATE_ROOT = self.root / "gates"
+        # 站点配置的目标目录同样要指到临时树里：否则往返测试会往真实的
+        # vhost 目录写（字节相同，但那是测试不该碰的生产路径）。
+        self.saved_vhost_root = self.b.VHOST_ROOT
+        self.b.VHOST_ROOT = self.root / "vhost"
+        self._conf_patch = mock.patch(
+            "vigil.gates.shield.conf_dir",
+            return_value=self.root / "nginx-conf")
+        self._conf_patch.start()
 
     def tearDown(self):
+        self.b.GATE_ROOT = self.saved_gate_root
+        self.b.VHOST_ROOT = self.saved_vhost_root
+        self._conf_patch.stop()
         (self.b.paths.CONFIG, self.b.paths.SECRETS,
          self.b.paths.STATE_STATE) = self.saved
         self.tmp.cleanup()
@@ -3226,6 +3622,25 @@ class TestBackupRestore(unittest.TestCase):
         # write outside anything this program owns.
         self.assertIsNone(self.b._destination("extra/whatever"))
         self.assertIsNone(self.b._destination("../../etc/shadow"))
+
+    def test_a_named_instances_config_can_be_restored(self):
+        """Every `-gate` instance, not only the two historical names.
+
+        A named login gate's `config.php` holds the only copy of its password
+        hash. It was archived but had no restore destination, so a restore
+        reported success while leaving it behind.
+        """
+        dest = self.b._destination("gates/astrbot-gate/config.php")
+        self.assertIsNotNone(dest)
+        self.assertEqual(self.b.GATE_ROOT / "astrbot-gate" / "config.php",
+                         Path(dest))
+        # 网关的站点配置在面板的 vhost 目录里，也必须有目标 —— 它同样是
+        # 「备份里有、还原时没人认领」的一类。原来这条断言把缺口当成了规范。
+        site = self.b._destination("gates/nginx/vigil-gate-astrbot.conf")
+        self.assertIsNotNone(site, "网关站点配置没有还原目标")
+        self.assertEqual(self.b.vhost_dir() / "vigil-gate-astrbot.conf", Path(site))
+        # 仍然不能给出目录（没有文件名）的条目编一个目标。
+        self.assertIsNone(self.b._destination("gates/nginx/"))
 
     def test_everything_archived_can_actually_be_restored(self):
         """The invariant that caught a real gap.

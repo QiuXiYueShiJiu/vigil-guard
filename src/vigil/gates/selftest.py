@@ -353,7 +353,10 @@ def _page_problems(webroot: str) -> list:
 def verify_gate(spec, php: str = "") -> dict:
     """Run the puzzle self-test for one installed gate."""
     php = php or php_binary()
-    res = {"kind": spec.kind, "label": spec.kind, "ok": False,
+    # The instance name, not the kind: two login gates would otherwise be
+    # reported under one indistinguishable label.
+    label = getattr(spec, "name", "") or spec.kind
+    res = {"kind": spec.kind, "label": label, "ok": False,
            "problems": [], "checks": {}}
     if not php:
         res["problems"].append("找不到可用的 php 可执行文件")

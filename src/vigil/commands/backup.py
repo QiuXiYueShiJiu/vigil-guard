@@ -47,6 +47,32 @@ KEEP = 14
 
 MANIFEST = "manifest.json"
 
+#: Root the archived gate state directories resolve back to. A module
+#: attribute, not a literal in `_destination`, so a test can point restores
+#: at a throwaway tree instead of overwriting the live gates -- which the
+#: round-trip test used to do (with identical bytes, but still a write to a
+#: production path it had no business touching).
+GATE_ROOT = Path("/www/server")
+
+#: Where a gate's *site* config lives (`vigil-gate-<name>.conf`). `None` means
+#: "ask `detect`", which is the answer that survives being restored on a host
+#: laid out differently from the one that made the archive. A hard-coded
+#: restore target is how a file ends up in the wrong directory while the
+#: operator is told the restore succeeded.
+VHOST_ROOT = None
+
+
+def vhost_dir():
+    """The directory a gate's site config belongs in, or None."""
+    if VHOST_ROOT:
+        return Path(VHOST_ROOT)
+    try:
+        from ..core import detect
+        d = str((detect.panel() or {}).get("vhost_dir") or "")
+    except (ImportError, OSError):
+        d = ""
+    return Path(d) if d else None
+
 
 def _gate_configs() -> list:
     """Config-ish files inside each installed gate's state directory."""
@@ -376,11 +402,28 @@ def _destination(arcname: str):
             return shield.conf_dir() / Path(arcname).name
         except (ImportError, OSError):
             return None
+    if arcname.startswith("gates/nginx/"):
+        # The gate's *site* config lives in the panel's vhost directory, not
+        # under /www/server/<gate>/. It was archived and had no destination, so
+        # restoring reported success while leaving the site's gate config
+        # behind -- precisely the failure the round-trip invariant exists to
+        # catch, and the reason this file refuses to archive what it cannot put
+        # back. Resolved through `detect` for the same reason `gates/conf/`
+        # is: an archive must not bake in one host's paths.
+        parts = Path(arcname).parts
+        if len(parts) < 3 or not parts[2]:
+            return None          # 只有目录、没有文件名：不该给它编一个目标
+        base = vhost_dir()
+        return (base / parts[2]) if base else None
     if arcname.startswith("gates/"):
         parts = Path(arcname).parts
-        if len(parts) >= 3:
-            return Path("/www/server") / parts[1] / parts[2] \
-                if parts[1] in ("bt-gate", "dsh-gate") else None
+        # Any installed instance, not just the two historical directory
+        # names: every `--name` instance's state directory ends in `-gate`.
+        # Without the general rule, a named login gate's `config.php` -- the
+        # only copy of its password hash -- was archived but restored
+        # nowhere, and the operator would believe it had come back.
+        if len(parts) >= 3 and parts[1].endswith("-gate"):
+            return GATE_ROOT / parts[1] / parts[2]
         return None
     if arcname.startswith("extra/"):
         return None          # operator-added paths are advisory only

@@ -277,7 +277,7 @@ def _panel_threat(sess: Session) -> None:
 def _panel_gates(sess: Session, cfg) -> None:
     ui.section("登录界面防护")
     try:
-        from ..gates import detect_all
+        from ..gates import detect_all, instance_label
         found = detect_all()
     except Exception as exc:                           # noqa: BLE001
         ui.failure("无法检测网关：%s" % exc)
@@ -285,7 +285,8 @@ def _panel_gates(sess: Session, cfg) -> None:
     if not found:
         ui.note("本机尚未安装任何登录网关。")
     for spec in found:
-        ui.kv(spec.kind, "%s  入口 %s  刷新重验证=%s"
+        ui.kv(instance_label(spec.kind, spec.name),
+              "%s  入口 %s  刷新重验证=%s"
               % (spec.state_dir, spec.entry_path, spec.strict_nav))
 
     choice = ui.choose("要做什么？", [
@@ -311,14 +312,19 @@ def _panel_gates(sess: Session, cfg) -> None:
         _A.kind = kind
         args = _A()
         # Hand over to the real installer: it already prompts for every
-        # option and validates them.
+        # option and validates them. Instance selection is an option, so the
+        # wizard installs the default instance and the operator adds
+        # `--name` on the command line to create a second one.
+        args.name = ""
         for attr, val in (("force", False), ("yes", False), ("no_prompt", False)):
             setattr(args, attr, val)
         cmd_gate._add_common_options  # noqa: B018 - documented dependency
         from .gate import cmd_install
         cmd_install(args)
     elif choice == "reconfig" and found:
-        pick = ui.choose("哪一个？", [(s.kind, s.kind) for s in found], default=1)
+        pick = ui.choose("哪一个？",
+                         [((s.kind, s.name), instance_label(s.kind, s.name))
+                          for s in found], default=1)
         if not pick:
             return
         from . import gate as cmd_gate
@@ -326,7 +332,7 @@ def _panel_gates(sess: Session, cfg) -> None:
         class _A2:
             pass
         args = _A2()
-        args.kind = pick
+        args.kind, args.name = pick
         args.yes = False
         args.no_prompt = False
         cmd_gate.cmd_reconfigure(args)
@@ -337,14 +343,16 @@ def _panel_gates(sess: Session, cfg) -> None:
             pass
         cmd_gate.cmd_gate_sync(_A3())
     elif choice == "test" and found:
-        pick = ui.choose("测哪一个？", [(s.kind, s.kind) for s in found], default=1)
+        pick = ui.choose("测哪一个？",
+                         [((s.kind, s.name), instance_label(s.kind, s.name))
+                          for s in found], default=1)
         if pick:
             from . import gate as cmd_gate
 
             class _A4:
                 pass
             args = _A4()
-            args.kind = pick
+            args.kind, args.name = pick
             cmd_gate.cmd_test(args)
 
 

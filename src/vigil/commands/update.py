@@ -248,7 +248,7 @@ def _refresh_gates(cfg, dry_run: bool) -> list:
     """
     refreshed = []
     try:
-        from ..gates import detect_all, reconfigure
+        from ..gates import detect_all, instance_label, reconfigure
     except Exception as exc:                           # noqa: BLE001
         ui.warning("无法载入网关模块：%s" % exc)
         return refreshed
@@ -259,20 +259,21 @@ def _refresh_gates(cfg, dry_run: bool) -> list:
         return refreshed
 
     for spec in found:
+        label = instance_label(spec.kind, spec.name)
         if dry_run:
-            ui.note("预演：将重新生成网关 %s" % spec.kind)
-            refreshed.append(spec.kind)
+            ui.note("预演：将重新生成网关 %s" % label)
+            refreshed.append(label)
             continue
         try:
-            result = reconfigure(cfg, spec.kind)
+            result = reconfigure(cfg, spec.kind, name=spec.name)
         except Exception as exc:                       # noqa: BLE001
-            ui.failure("重新生成网关 %s 失败：%s" % (spec.kind, exc))
+            ui.failure("重新生成网关 %s 失败：%s" % (label, exc))
             continue
         if isinstance(result, dict) and result.get("ok") is False:
             ui.failure("网关 %s 未刷新：%s"
-                       % (spec.kind, result.get("error") or result))
+                       % (label, result.get("error") or result))
             continue
-        refreshed.append(spec.kind)
+        refreshed.append(label)
     if refreshed and not dry_run:
         ui.success("已用新模板重新生成 %d 个登录网关" % len(refreshed))
     return refreshed

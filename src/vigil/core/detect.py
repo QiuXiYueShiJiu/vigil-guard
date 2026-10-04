@@ -552,6 +552,28 @@ def sshd_config() -> dict:
 # --------------------------------------------------------------------------
 
 
+def gate_instances() -> dict:
+    """Login-gate state directories present on this host.
+
+    Discovery is by directory name, not by config entry. A gate created with
+    `vigil gate install login --name x` has to be visible before anything is
+    written to config.json, and a gate whose config entry was lost or never
+    written must still be found rather than silently ignored. Anything
+    ending in `-gate` under the panel's server directory is a candidate;
+    whether it is really a gate is decided by the caller looking for
+    `gate.lua` or its nginx wiring.
+    """
+    root = "/www/server"
+    dirs = []
+    try:
+        for path in sorted(glob.glob(os.path.join(root, "*-gate"))):
+            if os.path.isdir(path):
+                dirs.append(path)
+    except OSError:
+        pass
+    return {"root": root, "dirs": dirs}
+
+
 _FULL_CACHE: dict = {}
 
 
@@ -582,6 +604,7 @@ def _full_uncached() -> dict:
         "php_fpm": {"sockets": php_fpm_sockets(), "binaries": php_fpm_binaries()},
         "web_roots": web_roots(),
         "bt_panel": bt_panel(),
+        "gate": gate_instances(),
         "cpanel": cpanel(),
         "plesk": plesk(),
         "firewall": firewall(),
