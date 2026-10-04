@@ -67,3 +67,18 @@ sudo vigil audit disable
 
 登录界面防护装到哪里，由 `--state-dir` / `--webroot` 决定，默认见
 [GATE.md](GATE.md)。
+
+## 卸载
+
+```sh
+sudo vigil uninstall                # 停服务、删程序；保留配置、状态与日志
+sudo vigil uninstall --keep-logs    # 再加删配置与状态，只留 /var/log/vigil
+sudo vigil uninstall --purge        # 全部删除，不可恢复
+```
+
+**三种方式都会撤回本程序生成的网页配置**（诱饵、诱导面、请求卫生、登录网关、
+状态页反代），只按本程序命名的文件匹配，不会碰站点自己的 vhost。
+
+撤回是**可逆**的：脚本先把文件移到隔离区并摘掉相关的 `include` 行，跑 `nginx -t`，
+通过才真正删除；**不通过就把文件和 include 行一起搬回**。这样即使撤回逻辑本身出错，
+站点也不会因为一次卸载而无法重载。

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from .. import ui
@@ -431,6 +432,10 @@ _OWNED_SUFFIXES = (
     "zz-dsh-auth.conf",
 )
 _OWNED_PREFIXES = ("vigil-gate-", "vigil-web", "vigil.")
+#: nginx 主配置。**可注入**：写死的路径让单元测试会去改真实文件 ——
+#: 我在验证这条卸载路径时正是这样把生产 nginx.conf 改坏过两次。
+NGINX_CONF = Path("/www/server/nginx/conf/nginx.conf")
+
 _OWNED_DIRS = (
     "/www/server/panel/vhost/nginx",
     "/www/server/panel/vhost/nginx/extension",
@@ -472,13 +477,14 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
 
     # 再按名字白名单扫一遍：子系统可能改过名、可能被禁用、也可能上次没清干净。
     #
-    # **顺序很重要**：必须先删「引用别人」的（站点 vhost、闸门站点配置），
-    # 再删「被别人引用」的（zones、deny、map）。反过来做，中间那一刻的配置是
-    # 坏的 —— 引用还在、目标已没了 —— 于是 `nginx -t` 失败、reload 被拒，
-    # 而 nginx 还在跑内存里的旧配置。第一次实现就是倒着删的，实测把
-    # `nginx -t` 打成了 unable to open zones 文件。
-    found = []
-    zones, includers = [], []
+    # **先搬走、验配置、通过了才真删。** 这不是谨慎过头：先删再验的做法实测
+    # 出过事 —— 删掉被引用的 zones 文件之后 `nginx -t` 直接失败，而 nginx 还在
+    # 跑内存里的旧配置，于是「看起来正常」和「下一次 reload 会带走所有站点」
+    # 同时成立。搬走是可逆的，删除不是。
+    #
+    # 顺序也要紧：先动「引用别人」的（站点 vhost、闸门站点配置），再动
+    # 「被别人引用」的（zones、deny、map），否则中间那一刻配置一定是坏的。
+    found, zones, includers = [], [], []
     for d in _OWNED_DIRS:
         base = Path(d)
         if not base.is_dir():
@@ -489,23 +495,64 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
             (zones if path.name.endswith("-zones.conf")
              or path.name in ("vigil-deny.conf",) else includers).append(path)
 
-    for path in includers + zones:
-            if dry_run:
-                continue
+    ordered = includers + zones
+    if not ordered or dry_run:
+        return [str(p) for p in ordered]
+
+    # 隔离区保留相对路径，搬回去才能原位 —— 之前用 `removed-<文件名>` 平铺，
+    # 同名文件（四个站点目录都有 vigil-deny.conf）互相覆盖，还原时丢了三个。
+    quarr = Path("/var/lib/vigil/withdrawn") / time.strftime("%Y%m%d-%H%M%S")
+    moved = []
+    for path in ordered:
+        rel = str(path).lstrip("/")
+        dst = quarr / rel
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dst))
+            moved.append((path, dst))
+            found.append(str(path))
+        except OSError:
+            continue
+
+    # nginx.conf **直接 include** 的文件（vigil-deny.conf 就是），只把文件搬走
+    # 是不够的 —— include 那一行还在，`nginx -t` 立刻报 unable to open。
+    # 所以「摘掉 include 行」和「搬走文件」必须作为同一个改动一起验、一起回滚。
+    nginx_conf = Path(NGINX_CONF)
+    conf_backup, conf_removed = "", []
+    try:
+        text = nginx_conf.read_text(encoding="utf-8", errors="replace")
+        for original, _dst in moved:
+            line = "include %s;" % original
+            for candidate in (line, "    " + line):
+                if candidate in text:
+                    conf_removed.append(candidate)
+                    text = text.replace(candidate + "\n", "", 1)
+                    break
+        if conf_removed:
+            conf_backup = text if False else nginx_conf.read_text(encoding="utf-8")
+            nginx_conf.write_text(text, encoding="utf-8")
+    except OSError:
+        conf_removed = []
+
+    def _restore_all():
+        for original, dst in moved:
             try:
-                shutil.copy2(str(path), "/root/vigil-pretest/removed-%s" % path.name)
+                original.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dst), str(original))
             except OSError:
                 pass
+        if conf_removed and conf_backup:
             try:
-                path.unlink()
+                nginx_conf.write_text(conf_backup, encoding="utf-8")
             except OSError:
                 pass
 
-    if found and not dry_run:
-        ok, out, err = shell.run(["nginx", "-t"], timeout=20)
-        if ok:
-            shell.run(["systemctl", "reload", "nginx"], timeout=30)
-        else:
-            # 万一删出问题，把 nginx 配置目录的状态如实报出来，不假装成功
-            return found + ["!! nginx -t 未通过：%s" % (err or out).strip()[:120]]
+    ok, out, err = shell.run(["nginx", "-t"], timeout=20)
+    if not ok:
+        _restore_all()
+        return ["!! 撤回后 nginx -t 未通过，已把文件和 include 行一并还原：%s"
+                % (err or out).strip().splitlines()[-1][:150]]
+
+    shell.run(["systemctl", "reload", "nginx"], timeout=30)
+    shutil.rmtree(str(quarr), ignore_errors=True)
     return found
