@@ -30,6 +30,49 @@ PAGES = (
 )
 
 
+# --------------------------------------------------------------------------
+# 界面：对外只有方框、进度和结果。内部细节（路径、单元名、配置键）一律不出现
+# —— 使用者要知道的是「配好了没有」，不是「写到了哪个文件」。
+# --------------------------------------------------------------------------
+
+TOTAL_STEPS = 6
+
+
+def _panel(lines, title: str = "", color=None) -> None:
+    """一个圆角方框。宽度按终端实际宽度自适应，窄终端也不会折断。"""
+    w = max(46, min(ui.width(), 76))
+    inner = w - 4
+    top = "╭" + "─" * (w - 2) + "╮"
+    bot = "╰" + "─" * (w - 2) + "╯"
+    ui.out(ui.c(top, color or "cyan"))
+    if title:
+        t = title[:inner]
+        ui.out(ui.c("│ ", color or "cyan") + ui.bold(t)
+               + " " * max(0, inner - ui._display_len(t)) + ui.c(" │", color or "cyan"))
+        ui.out(ui.c("├" + "─" * (w - 2) + "┤", color or "cyan"))
+    for ln in lines:
+        text = str(ln)
+        pad = inner - ui._display_len(text)
+        ui.out(ui.c("│ ", color or "cyan") + text + " " * max(0, pad)
+               + ui.c(" │", color or "cyan"))
+    ui.out(ui.c(bot, color or "cyan"))
+
+
+def _step(n: int, title: str) -> None:
+    ui.out()
+    bar = "●" * n + "○" * (TOTAL_STEPS - n)
+    ui.out(ui.c("  %s  " % bar, "cyan")
+           + ui.dim("第 %d/%d 步 · " % (n, TOTAL_STEPS)) + ui.bold(title))
+
+
+def _ok(text: str) -> None:
+    ui.out("  " + ui.ok("✓") + " " + text)
+
+
+def _warn(text: str) -> None:
+    ui.out("  " + ui.warn("!") + " " + text)
+
+
 def _ask(prompt: str, default: str = "") -> str:
     if not sys.stdin.isatty():                     # pragma: no cover - 交互路径
         return default
@@ -65,13 +108,20 @@ def _ask_password(min_len: int = 10) -> str:
 
 def cmd_setup(args) -> int:
     cfg = load_config(args.config or None)
-    ui.header("vigil 快速设置", "一次问答，把管理页面配好")
 
-    # ---- 1. 要配哪些页面 -------------------------------------------------
-    ui.out("可配置的管理页面：")
-    for i, (key, title, desc) in enumerate(PAGES, 1):
-        ui.out("  %d) %-8s %s —— %s" % (i, key, title, desc))
-    picked = _ask("要配置哪些（逗号分隔序号，all=全部）", "all")
+    ui.out()
+    _panel([
+        "检测、封禁、告警、诱饵、自修正 —— 一个守护程序。",
+        "",
+        "接下来会问你 %d 个问题，然后自动把管理页面配好。" % TOTAL_STEPS,
+        "每个问题都有默认值，一路回车即可得到一个可用的安装。",
+    ], title="vigil · 快速设置")
+
+    # ── 1/6 页面 ──────────────────────────────────────────────────────────
+    _step(1, "要配置哪些管理页面")
+    _panel(["%d  %-10s %s" % (i, title, desc)
+            for i, (_k, title, desc) in enumerate(PAGES, 1)])
+    picked = _ask("  选择（逗号分隔，all=全部）", "all")
     if picked.lower() in ("all", "全部", ""):
         chosen = [k for k, _t, _d in PAGES]
     else:
@@ -81,49 +131,64 @@ def cmd_setup(args) -> int:
             if tok.isdigit() and 1 <= int(tok) <= len(PAGES):
                 chosen.append(PAGES[int(tok) - 1][0])
     if not chosen:
+        ui.out()
         ui.failure("没有选中任何页面")
         return 2
-    ui.success("将配置：%s" % "、".join(chosen))
+    _ok("将配置 %d 个页面" % len(chosen))
 
-    # ---- 2. 名字与访问方式 -----------------------------------------------
-    host = _ask("页面显示的名字（留空则用主机名）", "")
-    public = _yesno("是否用域名对外访问（否则只监听本机）", False)
-    domain, port = "", 9177
+    # ── 2/6 名字 ──────────────────────────────────────────────────────────
+    _step(2, "页面叫什么")
+    _panel(["这个名字会显示在页面上。留空则用本机主机名（运行时获取）。"])
+    display = _ask("  显示名字", "")
+    _ok("显示为 %s" % (display or "本机主机名"))
+
+    # ── 3/6 访问方式 ──────────────────────────────────────────────────────
+    _step(3, "怎么访问")
+    _panel(["只在域名访问时才对外开放；否则只监听本机，最安全。",
+            "对外开放需要你已经有域名解析，证书会自动尝试签发。"])
+    public = _yesno("  用域名对外访问吗", False)
+    domain, out_port = "", 443
     if public:
-        domain = _ask("域名（例如 status.example.com）", "")
+        domain = _ask("  域名（例如 status.example.com）", "")
         if not domain:
-            ui.warning("没填域名，按「只监听本机」处理")
+            _warn("没填域名，按「只监听本机」处理")
             public = False
         else:
-            port = int(_ask("对外端口（443 表示走 HTTPS）", "443") or 443)
-    listen_port = int(_ask("本地监听端口", "9177") or 9177)
+            out_port = int(_ask("  对外端口", "443") or 443)
+    listen_port = int(_ask("  本地监听端口", "9177") or 9177)
+    _ok("对外：%s" % ("https://%s/" % domain if public else "仅本机"))
 
-    # ---- 3. 登录方式 ------------------------------------------------------
-    ui.out("登录方式：")
-    ui.out("  1) 只用密码")
-    ui.out("  2) 密码 + 人机验证")
-    auth = _ask("选择", "1")
+    # ── 4/6 登录方式 ──────────────────────────────────────────────────────
+    _step(4, "谁可以登录")
+    _panel(["1  只用密码            最省事",
+            "2  密码 + 人机验证      更抗暴力破解"])
+    auth = _ask("  选择", "1")
     captcha = auth.strip() in ("2", "both", "都有")
-    username = _ask("登录账号", "admin")
-    password = ""
-    if args.password_stdin:                        # 供无人值守安装使用
+    username = _ask("  登录账号", "admin")
+    if args.password_stdin:
         password = sys.stdin.readline().strip()
     else:
         password = _ask_password()
     if not password:
+        ui.out()
         ui.failure("没有设置密码，页面会拒绝登录")
         return 1
+    _ok("账号 %s 已设置（只保存派生值，密码不入库）" % username)
 
-    # ---- 4. 邮件 ----------------------------------------------------------
-    email_to = _ask("告警收件邮箱（留空则跳过邮件配置）", "")
-    sender = _ask("发件人地址（留空则用收件邮箱）", email_to) if email_to else ""
+    # ── 5/6 邮件 ──────────────────────────────────────────────────────────
+    _step(5, "出了事通知谁")
+    _panel(["留空则跳过。填了会在最后发一封测试邮件，确认通道真的通。"])
+    email_to = _ask("  告警收件邮箱", "")
+    sender = _ask("  发件人地址", email_to) if email_to else ""
+    _ok("告警邮箱：%s" % (email_to or "未配置（可稍后 vigil mail setup）"))
 
     if args.dry_run:
         ui.out()
-        ui.note("预演结束，未写入任何配置。")
+        _panel(["预演结束，没有写入任何东西。"], title="完成", color="yellow")
         return 0
 
-    # ---- 5. 落地 ----------------------------------------------------------
+    # ── 6/6 落地 ──────────────────────────────────────────────────────────
+    _step(6, "正在配置")
     from . import web as web_cmd
     from ..web import server as web_server
 
@@ -131,30 +196,28 @@ def cmd_setup(args) -> int:
     cfg.set("web.listen", "127.0.0.1")
     cfg.set("web.port", listen_port)
     cfg.set("web.domain", domain)
-    cfg.set("web.display_name", host)
+    cfg.set("web.display_name", display)
     cfg.set("web.captcha", bool(captcha))
     if email_to:
         cfg.set("mail.recipients", [email_to])
         cfg.set("mail.from_address", sender or email_to)
     cfg.save()
     web_server.set_password(cfg, username, password)
-    ui.success("账号密码已设置（只保存派生值）")
+    _ok("账号与登录方式已写入")
 
     if public and domain:
-        res = web_cmd.cmd_install(_NS(domain=domain, config=args.config))
-        if res != 0:
-            ui.warning("反代配置未完成，页面仍只在本机可用")
+        if web_cmd.cmd_install(_NS(domain=domain, config=args.config)) == 0:
+            _ok("对外访问已就绪（反代 + 证书）")
+        else:
+            _warn("对外配置没成功，页面仍只在本机可用")
     else:
-        ui.note("未选择域名访问：页面只监听 %s:%d" % ("127.0.0.1", listen_port))
+        _ok("只监听本机 %s:%d" % ("127.0.0.1", listen_port))
 
     web_cmd.cmd_unit(_NS(config=args.config))
-    ui.kv("访问", "https://%s/" % domain if (public and domain)
-           else "http://127.0.0.1:%d/（本机）" % listen_port)
+    _ok("服务已启动并设为开机自启")
 
-    # ---- 6. 测试邮件 ------------------------------------------------------
+    mail_ok = None
     if email_to:
-        ui.out()
-        ui.out("发一封测试邮件确认通道可用……")
         from ..guards import threat as threat_mod
         try:
             alert = threat_mod.Alert(title="vigil 安装完成：这是一封测试邮件",
@@ -162,16 +225,27 @@ def cmd_setup(args) -> int:
                                      kind=threat_mod.KIND_ALERT,
                                      dedupe_key="setup|test")
             sec = alert.add_section("测试邮件")
-            sec.add("如果你收到这封信，说明告警通道已经配好了。")
-            sec.add("收件人：%s" % email_to)
-            ok = threat_mod.send_alert(alert, cfg=cfg)
-            (ui.success if ok else ui.warning)(
-                "测试邮件已发出" if ok else "测试邮件发送失败（检查发件服务配置）")
+            sec.add("收到这封信，说明告警通道已经配好了。")
+            mail_ok = bool(threat_mod.send_alert(alert, cfg=cfg))
         except Exception as e:                                 # noqa: BLE001
-            ui.warning("测试邮件发送失败：%s" % str(e)[:120])
+            mail_ok = False
+            _warn("测试邮件发送失败：%s" % str(e)[:80])
+        if mail_ok:
+            _ok("测试邮件已发出，请查收")
 
     ui.out()
-    ui.success("设置完成")
+    _panel([
+        "页面      %s" % (", ".join(dict((k, t) for k, t, _ in PAGES)[c]
+                                    for c in chosen)),
+        "地址      %s" % ("https://%s/" % domain if public and domain
+                          else "http://127.0.0.1:%d/" % listen_port),
+        "登录      %s" % ("%s + 人机验证" % username if captcha else username),
+        "告警      %s" % (email_to or "未配置"),
+        "邮件通道  %s" % ("已验证" if mail_ok else ("未验证" if email_to else "未配置")),
+    ], title="配置完成", color="green")
+    ui.out()
+    ui.out(ui.dim("  随时改：vigil setup ｜ 只改密码：vigil web passwd ｜ "
+                  "看状态：vigil status"))
     return 0
 
 
