@@ -392,6 +392,8 @@ def register(sub) -> None:
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("uninstall", help="卸载本系统")
+    p.add_argument("--keep-logs", action="store_true",
+                   help="卸载时保留 /var/log/vigil（配置、状态与生成的网页配置都删掉）")
     p.add_argument("--purge", action="store_true",
                    help="同时删除配置、状态与日志（不可恢复）")
     p.add_argument("--dry-run", action="store_true", help="只显示将要执行的操作")

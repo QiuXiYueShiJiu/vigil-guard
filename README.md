@@ -1,287 +1,171 @@
 <div align="center">
-  <img src="assets/hero.svg" alt="vigil-guard" width="100%">
-</div>
 
-# vigil-guard
+# vigil
+
+**一台服务器的观测、处置与自我改进。**
+
+检测、封禁、告警、诱饵、自修正 —— 一个不依赖第三方库、可以在锁死网络的机器上跑起来的守护程序。
 
 [![CI](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8%2B-3776ab.svg)](https://www.python.org/)
-[![No dependencies](https://img.shields.io/badge/dependencies-none-success.svg)](#技术栈与参考文献)
-[![Platform: Linux](https://img.shields.io/badge/Platform-Linux-333.svg)](#环境要求)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-6fa8d6.svg)](LICENSE)
 
-> ## ⚠️ 声明
->
-> **这是由 dsh 生成的用于 Linux 服务器防御的项目，只是一个小玩具，不能代替专业安全工具，
-> 请各位用于辅助使用。**
->
-> 它不保证拦住任何具体攻击，也不保证不误封。**上线前请务必配好白名单与告警通道，
-> 并保留回滚手段。** 完整免责条款见 [DISCLAIMER.md](DISCLAIMER.md)。
+<img src="assets/arch.svg" alt="架构与数据流" width="820">
 
-`vigil-guard` 是一个跑在单台 Linux 服务器上的轻量防御守护程序。它把「边缘拦截 → 登录闸门 →
-行为检测 → 自动处置 → 审计告警」串成一条可解释、可单独关闭、可回滚的链路，并且**每个结论
-都要有取证依据**：不猜、不靠单一信号下重手。
-
-- 纯 Python 标准库，**无第三方 pip 依赖**
-- 每个能力都可以单独开关，关掉它不影响其它
-- 所有改动写入前先验证（`nginx -t` 等），失败自动回滚
-- 面向小机器：单核 1 GB 内存也能跑
-
-### 它适合谁
-
-- 只有一台小 VPS，想给自己加一道**兜底**的人
-- 想给面板/登录页加一道人机验证，又不想上重型方案
-- 想知道「我这台机器上有没有能被公网直接下载的敏感文件」的人
-- 想手上有套**能自己验证有没有在工作**的巡检
-
-### 它不适合谁
-
-- 需要合规审计、日志留存、集中管控的生产环境 —— 请用成熟方案
-- 想用它替代 WAF / EDR / SIEM —— 它不打算做那些
-- 不愿意配白名单、也不看告警的人 —— 那样它只会给你添麻烦
-
-> 它不与你已有的安全措施冲突。已经有 fail2ban / CrowdSec / 云安全组的，完全可以只取本项目的
-> 闸门与暴露扫描，其余关掉。
+</div>
 
 ---
 
-## 目录
+## 它解决什么
 
-- [它适合谁](#它适合谁)
-- [它能做什么](#它能做什么)
-- [环境要求](#环境要求)
-- [安装](#安装)
-- [使用方法](#使用方法)
-- [工作原理](#工作原理)
-- [项目结构](#项目结构)
-- [技术栈与参考文献](#技术栈与参考文献)
-- [许可与贡献](#许可与贡献)
+服务器上真正难的不是「发现有人扫描」，而是**在你没看着的时候，它有没有在做正确的事**。
 
----
+vigil 把四件事放在同一条链路上：**观测**（谁在做什么）、**处置**（该拦的拦住）、
+**告知**（该知道的人知道），以及**改进**（下一次判断比上一次准）。
+每一环都能单独审计：判了什么、依据是什么、改了什么、怎么退回去。
 
-## 它能做什么
+<div align="center">
+<img src="assets/status-mock.svg" alt="状态与反馈页面" width="790">
+</div>
 
-<img src="assets/layers.svg" alt="防护分层" width="100%">
+## 开箱即用
 
-| 能力 | 一句话说明 | 命令 |
+```sh
+sudo ./install.sh          # 装依赖、部署、跑安装向导
+sudo vigil setup           # 一次问答，把管理页面配好
+```
+
+`vigil setup` 只问你会真正关心的问题 —— **配哪些管理页面、是否域名访问、用什么端口、
+登录方式（密码 / 密码+人机验证）、页面叫什么名字、告警邮箱** —— 然后自动完成反代配置、
+证书、凭据哈希与测试邮件。**每个问题的默认值都是保守的**：不问就不对外，
+默认只用密码登录，一路回车得到一个只监听本机、但已经能用的工作安装。
+
+```text
+$ sudo vigil setup
+vigil 快速设置 / 一次问答，把管理页面配好
+可配置的管理页面：
+  1) status   状态与反馈 —— 本机实时状态、最近的检查项与诱饵命中，附带反馈入口
+  2) gate     登录网关概览 —— 各登录网关的配置与命中情况
+要配置哪些（逗号分隔序号，all=全部） [all]：
+页面显示的名字（留空则用主机名） [ ]：
+是否用域名对外访问（否则只监听本机） [y/N]：y
+域名（例如 status.example.com）：status.example.com
+对外端口（443 表示走 HTTPS） [443]：
+本地监听端口 [9177]：
+登录方式：1) 只用密码  2) 密码 + 人机验证
+选择 [1]：2
+登录账号 [admin]：
+  设置密码（至少 10 位，不回显）：**********
+  再输一次：**********
+告警收件邮箱（留空则跳过邮件配置）：you@example.com
+  ✔ 账号密码已设置（只保存派生值）
+  ✔ 已写入 /www/server/panel/vhost/nginx/status.example.com.conf
+  ✔ nginx 配置检查通过     ✔ 已重新加载 nginx
+  ✔ 已安装并启动 vigil-web.service
+发一封测试邮件确认通道可用……
+  ✔ 测试邮件已发出
+  ✔ 设置完成
+```
+
+## 能力一览
+
+| 能力 | 说明 | 命令 |
 |---|---|---|
-| **请求卫生** | 在 nginx 解析阶段就拒掉超长请求行 / Host、非白名单方法与畸形请求 | `vigil hygiene` |
-| **Web 层防护** | 按 UA 拦扫描器，给每个站点加请求速率与并发上限 | `vigil shield` |
-| **登录闸门** | 给宝塔面板 / 自建登录页前置一道人机验证，挑战一次性、绑定客户端、渐进封禁 | `vigil gate` |
-| **敏感文件暴露** | 按**形状**（备份、轮转、时间戳尾巴、点文件）扫出会被公网下载的源码与凭据 | `vigil exposure` |
-| **实时风控** | 多来源特征匹配后封禁 IP，支持网段升级、白名单、手动封禁/解禁 | `vigil threat` |
-| **状态页** | 自带实时状态与反馈页面；只监听本机、由已有 Web 服务反代；账号密码在命令行交互设置，无默认凭据 | `vigil web` |
-| **自修正** | 自监督训练 + 泛化验证 + 闭环回看；有边界、可回滚、改前发邮件；关键文件禁碰；另有独立监控进程 | `vigil evolve` |
+| **实时威胁处置** | 观测 nginx / auth / 面板日志，按分级策略自动封禁 | `vigil threat` |
+| **登录闸门** | 给面板或自建登录页前置人机验证，支持多实例 | `vigil gate` |
 | **诱饵与诱导面** | 让扫描器自己撞上诱饵端点，并衡量诱导面是否真的被找到 | `vigil decoy` · `vigil lure` |
-| **Web 层封禁** | 在 nginx 上再执行一次封禁，作为第二道执行点 | `vigil bouncer` |
-| **负载卸载** | 持续过载时自动、可逆地降压 | `vigil loadshed` |
-| **内核审计归因** | 用 auditd 规则回答「是谁改了哪个文件」 | `vigil audit` |
-| **攻击演练** | 多来源、多层次的本地攻击演练，用来检验本机到底有没有发现 | `vigil drill` |
-| **健康巡检** | 一批可解释的检查项，告诉你「装好的东西是否真的在工作」 | `vigil health` |
-| **告警通道** | 邮件 / Webhook，支持优先级、额度与积压补发 | `vigil mail` |
-| **自学习** | 从真实请求中挖掘候选特征，并先用误报门控筛一遍 | `vigil learn` |
-| **发布前自检** | 扫描随包文件里是否混入了本机信息（IP / 域名 / 凭据 / 个人信息） | `vigil audit-source` |
+| **状态与反馈页** | 实时状态 + 反馈入口；只监听本机、由已有 Web 服务反代 | `vigil web` |
+| **自修正** | 自监督训练 + 泛化验证 + 闭环回看；有边界、可回滚、改前发邮件 | `vigil evolve` |
+| **请求卫生 / 完整性 / 审计** | 请求行限制、程序自身完整性基线、内核级改动归因 | `vigil hygiene` · `vigil audit` |
+| **快速设置** | 一次问答配好管理页面、反代、凭据与测试邮件 | `vigil setup` |
 
-> 登录闸门的人机验证是**拼图 + 读图问答**的组合，答案只在服务端；图片默认内联进页面，
-> 不依赖任何后续请求，因此不会出现「资源被拦导致整页空白」。
+## 自修正：它凭什么被允许改自己
 
-### 重点能力多讲两句
+这是本项目最需要解释的部分 —— 一个能改自己的安全组件，风险不在功能少，
+而在**限制失效**。
 
-**敏感文件暴露扫描（`vigil exposure`）** —— 这个能力来自一个真实教训：手写的后缀黑名单
-（`bak|old|orig|…`）看起来周全，却挡不住 `config.php.bak-20260930-215427` 这类**带时间戳**的备份，
-也挡不住 `index.htmlold` 这种**粘在一起的双扩展名**。所以它改成按**形状**匹配：轮转编号、
-时间戳尾巴、编辑器残留、点文件。并且**扫描器与 nginx 规则共用同一份定义** ——
-否则会出现「扫描说干净、服务器却在往外发」这种最糟的情况。
+<div align="center">
+<img src="assets/evolve-loop.svg" alt="自修正闭环" width="760">
+</div>
 
-**登录闸门（`vigil gate`）** —— 挑战一次性、与客户端绑定、渐进封禁，且**两个失败预算分开**：
-拼图失败与密码输错不共用额度（打错密码不该把人锁在验证码外面）。失败文案不区分是位置错还是
-题答错，避免让人把两个因素拆开猜。
+**两个层级。** 行为数据（诱饵路径）可以自动采纳，门槛是硬的：≥8 次命中
+**且** ≥3 个独立来源，且路径必须过严格文法 —— 含引号、花括号、分号的路径不是
+「不好的诱饵」，而是 **nginx 配置注入**。源码改动**默认关闭**，打开后也只能动唯一
+一个被许可的文件，并受单一锚点、行数上限、每日次数上限、改前备份、
+**测试不过自动还原**五重约束。
 
-**请求卫生（`vigil hygiene`）** —— 在 nginx 解析阶段就拒掉超长请求行与 Host、非白名单方法与
-畸形请求，检查挂在**原始** `$request_uri` 上：nginx 在匹配 location 之前就已经解码并归一化，
-写在 `$uri` 上判不出探测。
+**自己训练自己。** 标签不是人标的，是本机**已经发生的处置结果**：命中过诱饵、
+或随后被封禁的请求是正样本；被正常服务的是负样本；没有结论的 404 不参与训练
+（否则模型只是在重新学习程序自己的拦截行为）。
 
-**发布前自检（`vigil audit-source`）** —— 见 [CONTRIBUTING.md](CONTRIBUTING.md#️-最重要的一条规矩不要提交任何真实主机信息)。
-它扫描**所有会被打包发布的文件**（源码、测试、文档、示例），因为一份只看 `src/` 的守卫
-等于没在守。测试套件跑的是同一份代码。
+**而且能力是被验证的，不是被声明的。** `vigil evolve novel` 会把**整族**未见过的
+命名习惯排除在训练之外再来考它，并同时给出正常路径的对照组：
 
----
+| | 识别率（置信阈值 0.70） | 区分度 | 误报 |
+|---|---|---|---|
+| 完全未训练 | 0/21 | 0.000 | 0 |
+| 批量训练后 | 21/21 | 0.994 | 0 |
 
-## 环境要求
+> 这个测试的第一版对**完全未训练的模型**报出了 100% —— 未训练模型输出恒为 0.5，
+> 而阈值写的是 `>= 0.5`；而且只统计「认出多少攻击」，一个把什么都判成攻击的模型
+> 同样能拿 100%。现在有测试专门钉住：**空白模型必须通不过这个测试**。
 
-| 项目 | 要求 | 说明 |
-|---|---|---|
-| 系统 | Debian / Ubuntu / CentOS / RHEL / Rocky / Alma / Fedora / Arch | 安装脚本自动识别发行版 |
-| Python | **3.8+** | 只用标准库，不需要 pip |
-| 权限 | root | 需要写防火墙、nginx 配置与审计规则 |
-| 可选 | nginx、PHP-FPM + GD、auditd、ipset / iptables | 缺哪个就少哪个能力，其余照常工作 |
+**关键文件禁碰。** 许可表只允许改一个文件，但许可表本身是可编辑的 ——
+所以另有一份 `CRITICAL_FILES` 清单，覆盖封禁决策、观测入口、审计链、上报脱敏、
+配置、部署、命令入口与整个邮件通道，以及**这个循环自身的边界与资源上限**。
+一个能放宽自己限制、或让监督自己的东西失明的 agent，就不是有边界的 agent。
 
-**依赖会在安装时自动补齐。** `install.sh` 会先探测系统里已有什么，只用对应发行版的包管理器
-（`apt` / `dnf` / `yum` / `pacman` / `zypper`）安装**缺失的那几个**，不会升级你已有的软件，
-也不会在非交互环境下擅自安装 —— 它会打印出建议命令让你确认。
+**改前必发邮件。** 新增规则、撤下规则、改动源码 —— 每一次自我修改都先发一封
+说明邮件（改什么、依据、怎么回滚），改后写只增台账并可逐条撤销。
+这条保证是**结构性**的：所有变更都经过同一个收口函数，而不是靠每处调用点记得。
 
----
+## 资源占用
 
-## 安装
+按**可用量的比例**给，不写死绝对值 —— 「最多用 200 MB」在 1 GB 小机上太多、
+64 GB 机器上太少：
 
-<img src="assets/quickstart.svg" alt="三步上手" width="100%">
-
-```bash
-git clone https://github.com/QiuXiYueShiJiu/vigil-guard.git
-cd vigil-guard
-sudo ./install.sh
-```
-
-`install.sh` 只做三件事：检查 root、确保有 python3（必要时按发行版安装）、把控制权交给
-`vigil install`。真正的环境探测、配置生成与写盘都由 `vigil install` 完成，并且每一步都可回滚。
-
-装完先自检：
-
-```bash
-sudo vigil doctor      # 环境自检：这台机器支持哪些能力
-sudo vigil selftest    # 安装自检：装好的东西真的在工作吗
-sudo vigil status      # 一眼看完当前状态
-```
-
-<img src="assets/terminal.svg" alt="示例输出" width="100%">
-
----
-
-## 使用方法
-
-### 1. 先配告警通道（强烈建议第一步就做）
-
-出事时没人知道，等于没装。配好并**实测送达**：
-
-```bash
-sudo vigil mail setup     # 交互式配置 SMTP / Webhook
-sudo vigil mail test      # 真的发一封，确认能收到
-sudo vigil mail status    # 看额度与积压
-```
-
-### 2. 常用命令
-
-```bash
-# 总览
-sudo vigil status                          # 运行状态
-sudo vigil health run                      # 跑一遍巡检
-sudo vigil health list                     # 看有哪些检查项、各自什么含义
-
-# 风控
-sudo vigil threat list                     # 当前封禁
-sudo vigil threat ban   203.0.113.7        # 手动封禁
-sudo vigil threat allow 198.51.100.0/24    # 加白名单（务必先加自己）
-
-# 登录闸门
-sudo vigil gate detect                     # 检测本机已有的登录防护
-sudo vigil gate install --help             # 查看全部可配参数
-sudo vigil gate holds                      # 看当前登录封禁
-sudo vigil gate reset-holds --all          # 立刻解锁（无需重载）
-
-# Web 层
-sudo vigil shield status                   # 扫描器拦截与限流状态
-sudo vigil exposure status                 # 有站点用 ^~ 前缀跳过了正则规则吗
-sudo vigil exposure scan --site /var/www/html --url https://example.com
-
-# 维护
-sudo vigil backup                          # 备份配置、凭据与基线
-sudo vigil update                          # 从源码更新
-sudo vigil rollback                        # 回滚到上一次更新之前
-```
-
-### 3. 只用其中一个能力
-
-每个能力都能单独使用，互不依赖。例如只想加「请求卫生」：
-
-```bash
-sudo vigil hygiene status
-sudo vigil hygiene install
-```
-
-想确认某项改动到底做了什么，用对应的 `status` 与 `--help`，不要靠猜。
-
----
-
-## 工作原理
-
-<img src="assets/layers.svg" alt="防护分层" width="100%">
-
-三条贯穿整个项目的原则：
-
-1. **先取证，再下手。** 单个信号不足以封人。封禁要么来自高置信特征，要么来自多个独立来源的
-   相互印证；诱饵端点之所以有价值，正是因为它的命中本身就是高置信信号。
-2. **写盘前先验证。** nginx 配置、审计规则、网关文件在生效前都会先做语法 / 加载验证，
-   验证不过就整体回滚 —— 一次错误的加固不该让服务下线。
-3. **一切可解释、可回滚。** 每个结论都能追到具体证据，每个改动都留有回退路径。
-
----
-
-## 项目结构
-
-```
-vigil-guard/
-├── src/vigil/            # 主程序
-│   ├── commands/         # 各子命令的实现
-│   ├── core/             # 配置、路径、检测、安装器等基础设施
-│   ├── evolve/           # 自修正：资源闸门 / 自监督训练 / 语料 / 台账 / 上报
-│   ├── guards/           # 各防御能力（threat / hygiene / exposure / decoy …）
-│   ├── gates/            # 登录闸门与 nginx 片段生成
-│   └── mail/             # 告警通道（provider 可插拔）
-├── tests/                # 测试套件（394 项，含源码纯净度守卫）
-├── docs/                 # 安装、配置、架构、网关、告警、常见问题
-├── examples/             # 配置示例
-├── scripts/              # 开发检查、打包、画面预览
-├── tools/                # 独立小工具（含可被网页直接调用的校验接口）
-├── assets/               # 介绍图
-├── .github/              # CI、Issue / PR 模板
-├── CHANGELOG.md          # 更新记录
-├── CONTRIBUTING.md       # 贡献指南（含「不得提交真实主机信息」的规矩）
-└── SECURITY.md           # 安全策略与已知取舍
-```
-
----
-
-## 技术栈与参考文献
-
-### 使用了什么
-
-- **Python 3 标准库** —— 没有 `requirements.txt`，也没有 pip 依赖；打包、安装、运行都不需要联网。
-- **nginx** —— 请求卫生、限流、封禁执行点、网关接线。
-- **PHP-FPM + GD** —— 登录闸门的验证码与拼图画面的服务端渲染（可选，缺失时降级为文字验证码）。
-- **auditd / ipset / iptables / nftables** —— 文件改动归因与网络层封禁（按发行版可选）。
-- **systemd** —— 服务与定时器。
-
-### 设计依据
-
-| 主题 | 来源 |
+| 键 | 默认 |
 |---|---|
-| 请求语法与畸形请求处理 | RFC 9112（HTTP/1.1）、RFC 9110（HTTP Semantics） |
-| 文档与示例地址段 | RFC 5737（`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`） |
-| 特殊用途地址 | RFC 6890、RFC 6598、RFC 3927、RFC 1112 |
-| 安全响应头 | OWASP Secure Headers Project |
-| 敏感文件暴露清单 | OWASP 相关清单与社区 wordlist 的通行路径集合 |
-| 限流与连接控制 | nginx `limit_req` / `limit_conn` 官方文档 |
-| 文件完整性思路 | AIDE / Tripwire 一类主机的通行做法 |
-| 诱饵与欺骗防御 | 蜜罐 / 蜜标（honeytoken）通用实践 |
-| CSP 与 nonce | MDN / W3C CSP Level 3 |
+| `evolve.memory_pct` | 取**可用**内存的 5% |
+| `evolve.memory_floor_mb` | 可用内存低于 96 MB 就不开工 |
+| `evolve.load_ratio` | 负载超过 `核数 × 0.7` 就不开工 |
 
-> 本项目为独立实现，未包含上述任何项目的代码；引用仅用于说明设计依据。
+systemd 侧另有硬上限：`CPUQuota=5%`、`Nice=19`、`IOWeight=10`、`MemoryMax=256M`，
+并明确标注**不属于告警链路** —— 出问题时它该是第一个被牺牲的。
 
----
+## 隐私与可移植性
 
-## 许可与贡献
+**源码与随包文件里不含任何一台机器的信息。** 这一条由 `core/sourceaudit.py`
+在发布关卡里强制检查：公网 IP、域名（含 punycode）、个人邮箱、托管商名、
+本机绝对路径，出现即构建失败。
 
-- **许可证**：[MIT](LICENSE)
-- **贡献者**：[@QiuXiYueShiJiu](https://github.com/QiuXiYueShiJiu)
-- **更新记录**：[CHANGELOG.md](CHANGELOG.md)
-- **常见问题**：[docs/FAQ.md](docs/FAQ.md)
-- **贡献指南**：[CONTRIBUTING.md](CONTRIBUTING.md)
-- **安全策略**：[SECURITY.md](SECURITY.md)
-- **免责声明**：[DISCLAIMER.md](DISCLAIMER.md)
+- 主机名、域名、端口、上游地址**全部运行时获取**；
+- 上报通道发送前脱敏，服务端再校验一次；
+- 归档里不写死路径 —— 否则还原时会把文件放回**错误**的位置，而操作者以为成功了。
 
-欢迎提 Issue 与 PR。因为这是一个辅助性质的小工具，**请优先报告「误封」与「加固后服务不可用」
-这两类问题** —— 它们比漏拦更值得先修。
+## 发布关卡
 
-自修正的完整设计（边界、自监督标签、泛化验证、关键文件禁碰）见 [docs/EVOLVE.md](docs/EVOLVE.md)。
+```sh
+scripts/release-check.sh          # 语法 → 全套测试 → 源码审计 → 打包
+```
 
-状态与反馈页面的交互逻辑见 [docs/WEB.md](docs/WEB.md)。
+任何一步失败就**不推 tag**。测试若「首轮失败、复跑通过」，脚本会打出
+`!! FLAKY !!` 并要求显式 `--allow-flaky` —— 间歇性失败要去找根因，
+不能用重跑掩盖它。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | 安装与升级 |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 配置项与自修正开关 |
+| [docs/EVOLVE.md](docs/EVOLVE.md) | 自修正：边界、自监督、泛化验证 |
+| [docs/WEB.md](docs/WEB.md) | 状态页：交互逻辑与安全取舍 |
+| [docs/GATE.md](docs/GATE.md) | 登录闸门 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块结构 |
+| [docs/FAQ.md](docs/FAQ.md) | 常见问题 |
+
+## 许可
+
+AGPL-3.0。详见 [LICENSE](LICENSE) 与 [DISCLAIMER.md](DISCLAIMER.md)。
+
+**贡献者**：[@QiuXiYueShiJiu](https://github.com/QiuXiYueShiJiu)

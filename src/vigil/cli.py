@@ -57,6 +57,7 @@ COMMAND_GROUPS = [
         ("lure", "诱导面：让诱饵被找到，并衡量是否有效"),
         ("evolve", "自修正：有边界地改进自己，并监控它"),
         ("web", "自带的状态与反馈页面（只监听本机）"),
+        ("setup", "交互式快速设置：一次问答配好管理页面"),
         ("audit", "内核审计规则（文件改动归因）"),
     ]),
     ("运维", [
@@ -106,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
                            lure as cmd_lure,
                            evolve as cmd_evolve,
                            web as cmd_web,
+                           setup as cmd_setup,
                            selftest as cmd_selftest,
                            update as cmd_update,
                            wizard as cmd_wizard)
@@ -134,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_lure.register(sub)
     cmd_evolve.register(sub)
     cmd_web.register(sub)
+    cmd_setup.register(sub)
     return p
 
 
