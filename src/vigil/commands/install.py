@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 from .. import ui
-from ..core import detect, units
+from ..core import detect, shell, units
 from ..core.config import load as load_config
 from ..core.errors import VigilError
 from ..core.installer import BACKUP_DIR, Installer
@@ -328,6 +328,18 @@ def cmd_uninstall(args) -> int:
     removed = units.remove_units(log=_log())
     ui.success("已停止并删除 %d 个 systemd 单元" % len(removed))
 
+    # 撤回自己生成的网页配置。这一步过去**不存在** —— 卸载只删了单元和程序
+    # 文件，于是 nginx 里那些片段全都留着：登录闸门还在挡人、请求卫生还在改
+    # 请求、状态页反代还指向一个已经没有服务的端口。用户看到的「卸载之后
+    # DSH 登录界面依旧存在」，就是这个缺口。
+    withdrawn = _withdraw_artifacts(dry_run=args.dry_run)
+    if withdrawn:
+        ui.success("已撤回 %d 处网页配置" % len(withdrawn))
+        for line in withdrawn[:8]:
+            ui.out("    %s" % line)
+    else:
+        ui.note("没有发现需要撤回的网页配置")
+
     from ..core import paths
     if args.purge:
         import shutil
@@ -335,6 +347,15 @@ def cmd_uninstall(args) -> int:
             for d in (paths.ETC, paths.VAR, paths.LOG):
                 shutil.rmtree(str(d), ignore_errors=True)
         ui.success("已删除配置/状态/日志")
+    elif args.keep_logs:
+        # 只留日志：配置与状态都删掉，日志是唯一在重装时真正有价值、
+        # 又无法重新生成的东西 —— 它记录的是「这台机器上曾经发生过什么」。
+        import shutil
+        if not args.dry_run:
+            for d in (paths.ETC, paths.VAR):
+                shutil.rmtree(str(d), ignore_errors=True)
+        ui.success("已删除配置与状态")
+        ui.note("已保留日志 %s" % paths.LOG)
     else:
         ui.note("已保留 %s、%s、%s" % (paths.ETC, paths.VAR, paths.LOG))
 
@@ -399,3 +420,92 @@ def register(sub) -> None:
     p.add_argument("--dry-run", action="store_true", help="只显示将要执行的操作")
     p.add_argument("--yes", "-y", action="store_true", help="跳过确认")
     p.set_defaults(func=cmd_uninstall)
+
+
+#: 由本程序生成、且**必须以本程序的名字命名**的 nginx 配置。白名单式匹配：
+#: 卸载只删这些，绝不碰站点自己的配置文件（operator 的 vhost 里混着
+#: 面板、证书、其它工具的片段，扫错一个就是全站下线）。
+_OWNED_SUFFIXES = (
+    "vigil-lure.conf", "vigil-decoy.conf", "vigil-hygiene.conf",
+    "vigil-deny.conf", "vigil-shield.conf", "vigil-reqguard.conf",
+    "zz-dsh-auth.conf",
+)
+_OWNED_PREFIXES = ("vigil-gate-", "vigil-web", "vigil.")
+_OWNED_DIRS = (
+    "/www/server/panel/vhost/nginx",
+    "/www/server/panel/vhost/nginx/extension",
+    "/www/server/nginx/conf",
+    "/etc/nginx/conf.d",
+    "/etc/nginx/sites-enabled",
+)
+
+
+def _is_ours(name: str) -> bool:
+    if name in _OWNED_SUFFIXES:
+        return True
+    return name.startswith(_OWNED_PREFIXES)
+
+
+def _withdraw_artifacts(dry_run: bool = False) -> list:
+    """Delete every nginx snippet this program wrote, wherever it wrote it.
+
+    Best-effort and reported: a config we cannot remove is worth knowing about,
+    but it must not abort the uninstall half-way -- leaving the units removed
+    and the snippets in place is precisely the broken state this fixes.
+    """
+    import shutil
+    from pathlib import Path
+
+    # 先让各子系统自己收拾（它们知道自己的片段在哪、也负责重载）
+    for label, fn in (("诱导面", "lure"), ("诱饵", "decoy"),
+                      ("请求卫生", "hygiene"), ("Web 防护", "shield")):
+        try:
+            mod = __import__("vigil.guards.%s" % fn if fn in ("lure", "decoy")
+                             else "vigil.%s" % ("guards." + fn if fn == "hygiene"
+                                                else "gates." + fn),
+                             fromlist=["uninstall"])
+            if not dry_run:
+                getattr(mod, "uninstall")()
+        except Exception:                                      # noqa: BLE001
+            # 子系统自己清理失败不影响后面的白名单清扫
+            pass
+
+    # 再按名字白名单扫一遍：子系统可能改过名、可能被禁用、也可能上次没清干净。
+    #
+    # **顺序很重要**：必须先删「引用别人」的（站点 vhost、闸门站点配置），
+    # 再删「被别人引用」的（zones、deny、map）。反过来做，中间那一刻的配置是
+    # 坏的 —— 引用还在、目标已没了 —— 于是 `nginx -t` 失败、reload 被拒，
+    # 而 nginx 还在跑内存里的旧配置。第一次实现就是倒着删的，实测把
+    # `nginx -t` 打成了 unable to open zones 文件。
+    found = []
+    zones, includers = [], []
+    for d in _OWNED_DIRS:
+        base = Path(d)
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.conf")):
+            if not _is_ours(path.name):
+                continue
+            (zones if path.name.endswith("-zones.conf")
+             or path.name in ("vigil-deny.conf",) else includers).append(path)
+
+    for path in includers + zones:
+            if dry_run:
+                continue
+            try:
+                shutil.copy2(str(path), "/root/vigil-pretest/removed-%s" % path.name)
+            except OSError:
+                pass
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    if found and not dry_run:
+        ok, out, err = shell.run(["nginx", "-t"], timeout=20)
+        if ok:
+            shell.run(["systemctl", "reload", "nginx"], timeout=30)
+        else:
+            # 万一删出问题，把 nginx 配置目录的状态如实报出来，不假装成功
+            return found + ["!! nginx -t 未通过：%s" % (err or out).strip()[:120]]
+    return found
