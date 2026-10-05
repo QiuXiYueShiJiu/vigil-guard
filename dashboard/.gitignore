@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.gz
+config.json
+docs/*.png
+frontend/assets/world.json

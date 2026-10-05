@@ -1,0 +1,38 @@
+[Unit]
+Description=Vigil console (real-time server situation dashboard)
+Documentation=file:__DASHBOARD_DIR__/README.md
+After=network-online.target nginx.service vigil-threatd.service
+Wants=network-online.target
+PartOf=nginx.service
+
+[Service]
+Type=simple
+# __DASHBOARD_DIR__ is replaced by deploy/install.sh with wherever this
+# repository actually lives, so the unit is not tied to one checkout path.
+WorkingDirectory=__DASHBOARD_DIR__
+ExecStartPre=/usr/bin/python3 __DASHBOARD_DIR__/backend/serve.py --check
+ExecStart=/usr/bin/python3 __DASHBOARD_DIR__/backend/serve.py
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=0
+
+# It reads nginx logs, vigil's ledger and /proc, and it manages vhosts, so it
+# needs to be root. The hardening below is what keeps that acceptable.
+User=root
+Group=root
+NoNewPrivileges=yes
+ProtectHome=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+PrivateDevices=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vigil-dashboard
+
+[Install]
+WantedBy=multi-user.target

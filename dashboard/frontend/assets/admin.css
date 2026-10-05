@@ -1,0 +1,424 @@
+/* ──────────────────────────────────────────────────────────────
+   vigil console · management face
+   Warm white / grey with one orange accent, matched to the public
+   status page so the console feels like part of the same house.
+   ────────────────────────────────────────────────────────────── */
+
+body.admin {
+  /* Same warm family as the home page: paper white, warm greys, one orange
+     accent. Kept as its own token names so the admin page keeps its slightly
+     denser, more form-like feel. */
+  --ink: #2f2a25;
+  --ink-2: #615751;
+  --ink-3: #948a7f;
+  --sky-top: #f8f1e8;
+  --sky-mid: #fbf7f2;
+  --sky-bot: #fcfaf7;
+  --surface: #ffffff;
+  --surface-soft: #faf6f1;
+  --line-soft: #ebe3d9;
+  --line-2: #dbd0c2;
+  --blue: #d2762e;
+  --blue-deep: #b8631f;
+  --blue-soft: #fdf1e4;
+  --blue-line: #f2dcc4;
+  --ok: #2f8f63;
+  --bad: #c0392b;
+  --warn: #a8761a;
+  --shadow-soft: 0 1px 2px rgba(96, 74, 50, .05), 0 6px 18px rgba(96, 74, 50, .07);
+  --shadow-lift: 0 2px 8px rgba(96, 74, 50, .08), 0 16px 34px rgba(96, 74, 50, .12);
+
+  color: var(--ink-2);
+  background: var(--sky-mid);
+  font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+  min-height: 100vh;
+}
+
+/* Sky backdrop: three soft clouds over a blue-to-grey wash. */
+.sky {
+  position: fixed; inset: 0; z-index: -1;
+  background:
+    radial-gradient(1000px 560px at 50% -14%, #fbe6cf 0%, rgba(248, 241, 232, 0) 64%),
+    radial-gradient(760px 480px at 88% 4%, #f7eee3 0%, rgba(251, 247, 242, 0) 62%),
+    radial-gradient(680px 420px at 8% 22%, #faf3ea 0%, rgba(251, 247, 242, 0) 60%),
+    linear-gradient(180deg, var(--sky-top) 0%, var(--sky-mid) 46%, var(--sky-bot) 100%);
+}
+
+/* ── login gate ──────────────────────────────────────────── */
+.gate {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  padding: 28px 18px;
+  background:
+    radial-gradient(720px 420px at 50% 0%, #fbe7d0 0%, rgba(248, 241, 232, 0) 68%),
+    linear-gradient(180deg, #faf5ee 0%, #fdfaf6 100%);
+}
+.gate-card {
+  width: min(430px, 100%); text-align: center;
+  background: #fff;
+  border: 1px solid var(--line-soft); border-radius: 18px;
+  box-shadow: 0 2px 6px rgba(96, 74, 50, .06), 0 22px 48px rgba(96, 74, 50, .13);
+  padding: 34px 30px 28px;
+}
+.gate-mark {
+  color: var(--blue); display: flex; justify-content: center;
+  margin-bottom: 14px;
+}
+.gate-card h1 { font-size: 21px; color: var(--ink); letter-spacing: .02em; }
+.gate-sub { color: var(--ink-3); font-size: 13px; margin: 8px 0 22px; }
+#login-form { display: flex; flex-direction: column; gap: 13px; text-align: left; }
+#login-form label { display: flex; flex-direction: column; gap: 6px; }
+#login-form label span { font-size: 12.5px; color: var(--ink-3); letter-spacing: .06em; }
+#login-form input {
+  font: inherit; font-size: 14.5px; color: var(--ink);
+  padding: 11px 13px; border-radius: 10px;
+  border: 1px solid var(--line-2); background: #fff;
+  transition: border-color .18s, box-shadow .18s;
+}
+#login-form input:focus {
+  outline: none; border-color: var(--blue);
+  box-shadow: 0 0 0 3px rgba(210, 118, 46, .18);
+}
+.btn.wide { width: 100%; padding: 12px; font-size: 14.5px; }
+.gate-note { font-size: 11.5px; color: var(--ink-3); line-height: 1.75; margin-top: 4px; }
+.gate-note code, .hint code, .diag code {
+  font-family: var(--mono, monospace); font-size: 11.5px;
+  background: var(--blue-soft); color: var(--blue-deep);
+  padding: 1px 6px; border-radius: 5px;
+}
+.gate-error {
+  color: var(--bad); font-size: 13px; background: rgba(192, 57, 43, .08);
+  border: 1px solid rgba(192, 57, 43, .22); border-radius: 9px; padding: 9px 12px;
+}
+.gate-back { display: inline-block; margin-top: 20px; font-size: 12.5px; color: var(--blue); }
+
+/* Buttons on the light theme. */
+body.admin .btn {
+  border: 1px solid var(--blue-line); background: var(--blue-soft); color: var(--blue-deep);
+  border-radius: 9px; padding: 8px 15px; font-size: 13px; cursor: pointer;
+  transition: background .16s, box-shadow .16s, transform .16s;
+}
+body.admin .btn:hover { background: #faeadb; box-shadow: var(--shadow-soft); transform: translateY(-1px); }
+body.admin .btn.primary { background: var(--blue); border-color: transparent; color: #fff; font-weight: 600; }
+body.admin .btn.primary:hover { background: var(--blue-deep); }
+body.admin .btn.danger { border-color: rgba(192, 57, 43, .35); color: var(--bad); background: rgba(192, 57, 43, .08); }
+body.admin .btn.danger:hover { background: rgba(192, 57, 43, .16); }
+body.admin .btn.ghost { background: #fff; color: var(--ink-2); border-color: var(--line-2); }
+body.admin .btn.ghost:hover { background: var(--surface-soft); color: var(--ink); }
+body.admin .btn.small { padding: 6px 12px; font-size: 12.5px; }
+
+/* ── top bar + tabs ──────────────────────────────────────── */
+.admin-top {
+  background: rgba(255, 255, 255, .86);
+  border-bottom: 1px solid var(--line-soft);
+}
+.admin-top .brand .mark { color: var(--blue); filter: none; }
+.admin-top .brand .title b { color: var(--ink); text-shadow: none; letter-spacing: .12em; }
+.admin-top .brand .title i { color: var(--blue); }
+.admin-top .brand .title span { color: var(--ink-3); }
+.admin-top .host-chip {
+  color: var(--blue-deep); border-color: var(--blue-line); background: var(--blue-soft);
+}
+.admin-top .who { font-size: 12.5px; color: var(--ink-3); }
+.ghost-btn.light {
+  border: 1px solid var(--line-2); background: #fff; color: var(--ink-2);
+  border-radius: 999px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  transition: background .16s, color .16s, box-shadow .16s;
+}
+.ghost-btn.light:hover { background: var(--blue-soft); color: var(--blue-deep); box-shadow: var(--shadow-soft); }
+
+.tabs {
+  display: flex; gap: 4px; overflow-x: auto; padding: 10px clamp(12px, 3vw, 30px) 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, .55);
+  position: sticky; top: var(--topbar-h); z-index: 40;
+}
+.tab {
+  border: 1px solid transparent; border-bottom: none;
+  background: transparent; color: var(--ink-3);
+  padding: 9px 16px; border-radius: 10px 10px 0 0; cursor: pointer;
+  font-size: 13.5px; white-space: nowrap; transition: color .16s, background .16s;
+}
+.tab:hover { color: var(--blue-deep); background: rgba(255, 255, 255, .7); }
+.tab.active {
+  color: var(--blue-deep); background: #fff; border-color: var(--line-soft);
+  box-shadow: 0 -2px 0 var(--blue) inset; font-weight: 600;
+}
+
+/* ── layout ──────────────────────────────────────────────── */
+.console-main { padding: 18px clamp(12px, 3vw, 30px) 0; }
+.stage-panel { display: none; flex-direction: column; gap: 16px; }
+.stage-panel.active { display: flex; }
+
+.card {
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 14px; box-shadow: var(--shadow-soft); overflow: hidden;
+}
+.card-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 13px 18px; border-bottom: 1px solid var(--line-soft);
+  background: linear-gradient(180deg, #fffdfb, var(--surface-soft));
+}
+.card-head h2 { font-size: 14px; color: var(--ink); font-weight: 600; }
+.card-head .note { font-size: 12px; color: var(--ink-3); }
+.head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.hint {
+  margin: 0; padding: 12px 18px; font-size: 12.5px; color: var(--ink-3);
+  background: var(--surface-soft); border-bottom: 1px solid var(--line-soft);
+  line-height: 1.7;
+}
+.grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+@media (max-width: 1080px) { .grid-2 { grid-template-columns: 1fr; } }
+
+.cards {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+.metric {
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 13px; box-shadow: var(--shadow-soft); padding: 14px 16px;
+}
+.metric .m-label { font-size: 11.5px; color: var(--ink-3); letter-spacing: .1em; display: block; margin-bottom: 6px; }
+.metric .m-value { font-size: 22px; font-weight: 600; color: var(--ink); font-family: var(--mono, monospace); }
+.metric .m-sub { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+.metric .m-value.bad { color: var(--bad); }
+.metric .m-value.ok { color: var(--ok); }
+
+/* ── tables ──────────────────────────────────────────────── */
+.table-wrap { max-height: 420px; overflow: auto; }
+.table-wrap.tall { max-height: 62vh; }
+table.data.light { font-size: 12.5px; width: 100%; border-collapse: collapse; }
+table.data.light th {
+  position: sticky; top: 0; z-index: 2; text-align: left;
+  font-weight: 500; font-size: 11.5px; letter-spacing: .08em; color: var(--ink-3);
+  padding: 10px 14px; background: var(--surface-soft);
+  border-bottom: 1px solid var(--line-soft);
+}
+table.data.light td {
+  padding: 9px 14px; border-bottom: 1px solid #f7f2ec;
+  color: var(--ink-2); vertical-align: middle;
+}
+table.data.light tbody tr:hover td { background: #fbf6f0; }
+table.data.light td.mono, table.data.light td.ip { font-family: var(--mono, monospace); color: var(--ink); }
+table.data.light td.path { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.data.light .empty { color: var(--ink-3); text-align: center; }
+
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11.5px; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid transparent;
+}
+.badge.on { color: var(--ok); background: rgba(47, 143, 99, .10); border-color: rgba(47, 143, 99, .25); }
+.badge.off { color: var(--bad); background: rgba(192, 57, 43, .10); border-color: rgba(192, 57, 43, .25); }
+.badge.warn { color: var(--warn); background: rgba(168, 118, 26, .12); border-color: rgba(168, 118, 26, .30); }
+.badge.info { color: var(--blue-deep); background: var(--blue-soft); border-color: var(--blue-line); }
+
+.switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch span {
+  position: absolute; inset: 0; cursor: pointer; border-radius: 999px;
+  background: #ddd2c6; transition: background .2s;
+}
+.switch span::before {
+  content: ''; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px;
+  background: #fff; border-radius: 50%; transition: transform .2s;
+  box-shadow: 0 1px 3px rgba(96, 74, 50, .25);
+}
+.switch input:checked + span { background: var(--ok); }
+.switch input:checked + span::before { transform: translateX(20px); }
+
+.diag {
+  margin: 0; padding: 14px 18px; font-family: var(--mono, monospace);
+  font-size: 11.5px; line-height: 1.7; color: var(--ink-2);
+  background: #fdfaf7; max-height: 340px; overflow: auto; white-space: pre-wrap;
+  word-break: break-word;
+}
+.diag.small { max-height: 220px; font-size: 11px; }
+.nginx-result {
+  padding: 12px 18px; font-family: var(--mono, monospace); font-size: 11.5px;
+  border-top: 1px solid var(--line-soft); white-space: pre-wrap;
+  background: #fdfaf7; color: var(--ink-2);
+}
+.nginx-result.bad { background: rgba(192, 57, 43, .06); color: var(--bad); }
+
+/* ── quick links ─────────────────────────────────────────── */
+.panel-grid {
+  display: grid; gap: 14px; padding: 16px 18px;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+}
+.panel-link {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 15px 16px; border-radius: 13px;
+  border: 1px solid var(--line-soft); background: var(--surface);
+  box-shadow: var(--shadow-soft); transition: box-shadow .18s, transform .18s, border-color .18s;
+}
+.panel-link:hover {
+  box-shadow: var(--shadow-lift); transform: translateY(-2px);
+  border-color: var(--blue-line);
+}
+.panel-link .pl-top { display: flex; align-items: center; gap: 9px; }
+.panel-link .pl-name { font-size: 14px; color: var(--ink); font-weight: 600; }
+.panel-link .pl-desc { font-size: 12px; color: var(--ink-3); }
+.panel-link .pl-url {
+  font-family: var(--mono, monospace); font-size: 11px; color: var(--blue-deep);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.panel-link .pl-group {
+  font-size: 10.5px; color: var(--blue-deep); background: var(--blue-soft);
+  border-radius: 999px; padding: 1px 8px; margin-left: auto;
+}
+
+/* ── file manager ────────────────────────────────────────── */
+.file-card { display: flex; flex-direction: column; min-height: 66vh; }
+.fm-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 12px 16px; border-bottom: 1px solid var(--line-soft);
+  background: var(--surface-soft);
+}
+.fm-path, .fm-search {
+  font: inherit; font-size: 13px; padding: 7px 11px; border-radius: 9px;
+  border: 1px solid var(--line-2); background: #fff; color: var(--ink);
+  font-family: var(--mono, monospace);
+}
+.fm-path { flex: 1 1 260px; min-width: 180px; }
+.fm-search { flex: 0 1 220px; }
+.fm-path:focus, .fm-search:focus {
+  outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(210, 118, 46, .16);
+}
+.fm-check { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-3); }
+.fm-progress { position: relative; height: 22px; background: #f7f2ec; border-bottom: 1px solid var(--line-soft); }
+.fm-progress i { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--blue); opacity: .25; transition: width .2s; }
+.fm-progress span { position: relative; font-size: 11.5px; color: var(--blue-deep); padding: 3px 14px; display: block; }
+
+.fm-body { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); flex: 1; min-height: 0; }
+@media (max-width: 1080px) { .fm-body { grid-template-columns: 1fr; } }
+.fm-list { overflow: auto; max-height: 64vh; border-right: 1px solid var(--line-soft); }
+.fm-row {
+  display: grid; grid-template-columns: 26px minmax(0, 1fr) 90px 128px 92px;
+  gap: 8px; align-items: center; padding: 7px 14px; font-size: 12.5px;
+  border-bottom: 1px solid #f6f0e9; cursor: pointer;
+}
+.fm-row:hover { background: #fbf6f0; }
+.fm-row.sel { background: var(--blue-soft); }
+.fm-row.dir .fm-name { color: var(--blue-deep); font-weight: 500; }
+.fm-row .fm-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+.fm-row .fm-size, .fm-row .fm-time, .fm-row .fm-mode {
+  font-family: var(--mono, monospace); font-size: 11.5px; color: var(--ink-3);
+  text-align: right;
+}
+.fm-row .fm-mode { text-align: right; }
+.fm-icon { text-align: center; }
+.fm-empty { padding: 26px; text-align: center; color: var(--ink-3); font-size: 13px; }
+
+.fm-editor { display: flex; flex-direction: column; min-height: 0; }
+.fm-editor-head {
+  display: flex; align-items: center; gap: 12px; padding: 11px 16px;
+  border-bottom: 1px solid var(--line-soft); background: var(--surface-soft);
+  flex-wrap: wrap;
+}
+.fm-editor-head b { font-size: 13px; color: var(--ink); font-family: var(--mono, monospace); }
+.fm-editor-head .head-actions { margin-left: auto; }
+#fm-content-box {
+  flex: 1; min-height: 320px; max-height: 56vh; resize: vertical;
+  border: none; border-bottom: 1px solid var(--line-soft);
+  padding: 14px 16px; font-family: var(--mono, monospace); font-size: 12.5px;
+  line-height: 1.65; color: var(--ink); background: #fffdfb;
+}
+#fm-content-box:focus { outline: none; background: #fff; }
+.fm-foot {
+  display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+  padding: 10px 16px; border-top: 1px solid var(--line-soft);
+  font-size: 11.5px; color: var(--ink-3); font-family: var(--mono, monospace);
+  background: var(--surface-soft);
+}
+
+.admin-foot { border-top: 1px solid var(--line-soft); margin-top: 22px; color: var(--ink-3); }
+
+@media (max-width: 640px) {
+  .fm-row { grid-template-columns: 24px minmax(0, 1fr) 74px 88px; }
+  .fm-row .fm-mode { display: none; }
+  .tabs { top: 0; }
+}
+
+/* ── 移动端适配 ──────────────────────────────────────────────
+   手机上的问题不是"字太大"，是顶栏被写成了固定高度且不换行：主机名可能
+   很长（punycode 域名尤其），不可截断时会把同一行的其它元素挤成逐字
+   竖排。下面按"能换行、能截断、能隐藏次要信息"三条来处理。 */
+@media (max-width: 860px) {
+  .admin-top { height: auto; min-height: var(--topbar-h); flex-wrap: wrap; padding: 8px 12px; gap: 8px; }
+  .admin-top .brand { flex: 1 1 auto; min-width: 0; gap: 8px; }
+  .admin-top .brand .title span { display: none; }          /* 「管理控制台」在窄屏是多余的 */
+  .admin-top .brand .title i { display: none; }
+  .admin-top .brand .mark svg { width: 22px; height: 22px; }
+  /* 主机名截断，绝不允许它把布局顶开：显示名可能是中文域名，也可能是一长
+     串 punycode，两种长度都得放得下 */
+  .admin-top .host-chip {
+    flex: 0 1 auto; min-width: 0; max-width: 48vw;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .admin-top .topright { flex: 0 0 auto; gap: 8px; }
+  .admin-top .who { display: none; }                        /* 「管理员」信息量最低，先让位 */
+  .admin-top .ghost-btn.light { padding: 6px 12px; font-size: 12.5px; }
+
+  .console-main { padding: 12px; }
+  /* 指标卡：窄屏两列会把大号数字压扁，直接单列 */
+  .cards { grid-template-columns: 1fr; gap: 10px; }
+  .metric { padding: 12px 14px; }
+  /* 必须写成 .metric .m-value：桌面端就是这个名字，单类选择器会被它盖住 */
+  .metric .m-value { font-size: 26px; }
+  .grid-2 { gap: 12px; }
+  /* 表格自己横滚，不要撑破页面 */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .data { min-width: 520px; }
+  .panel-head { padding: 10px 12px; }
+  .card { padding: 12px; }
+}
+
+@media (max-width: 420px) {
+  .admin-top .host-chip { max-width: 44vw; font-size: 11.5px; }
+  .metric .m-value { font-size: 23px; }
+  .tabs { gap: 2px; }
+  .tab { padding: 7px 10px; font-size: 13px; }
+}
+
+
+/* ── 中和浏览器的自动填充底色 ────────────────────────────────
+   浏览器在自动填充时会用自带的底色覆盖输入框，深色主题下看起来就像一层
+   黑布盖住了输入框，文字也看不清。这个底色无法直接改，只能用足够大的
+   内阴影盖住它，并把文字颜色重新声明一次。 */
+.gate-card input:-webkit-autofill,
+.gate-card input:-webkit-autofill:hover,
+.gate-card input:-webkit-autofill:focus,
+.gate-card input:-webkit-autofill:active {
+  -webkit-text-fill-color: var(--ink);
+  -webkit-box-shadow: 0 0 0 1000px #fff inset;
+  box-shadow: 0 0 0 1000px #fff inset;
+  caret-color: var(--ink);
+  transition: background-color 5000s ease-in-out 0s;
+}
+/* 密码管理器的图标/下拉建议同样遮挡内容，这里让输入框自己控制绘制。 */
+.gate-card input::-webkit-credentials-auto-fill-button,
+.gate-card input::-webkit-strong-password-auto-fill-button {
+  visibility: hidden;
+  display: none !important;
+  pointer-events: none;
+}
+.gate-card input::-ms-reveal, .gate-card input::-ms-clear { display: none; }
+
+
+/* ── login gate: no overlay, no filter, no darkening ─────────
+   显式声明，不依赖"删掉某条规则"。这一页只应是一张白卡片浮在浅色渐变上：
+   任何全屏蒙层、模糊、变暗都会让输入框看不清，而登录页正是最不该那样做的
+   地方。把意图写下来，比依赖"不存在某条规则"更可靠。 */
+.gate::before, .gate::after { content: none !important; display: none !important; }
+.gate {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  filter: none !important;
+  background-color: #fdfaf6;
+}
+.gate-card {
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+  filter: none !important;
+  background-color: #fff;
+}

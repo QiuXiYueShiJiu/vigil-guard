@@ -1,0 +1,245 @@
+/* ──────────────────────────────────────────────────────────────
+   vigil console · base
+
+   Light by default. This is a dashboard somebody leaves open on a
+   second monitor all day, and a black page with neon on it is hard to
+   read in a lit room. Both faces share the same tokens so a component
+   never has to know which page it is on.
+   ────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+
+:root {
+  /* Warm neutrals. The page is a lit-room dashboard: paper-white surface,
+     a hint of orange in the greys, and one warm accent. Everything that is
+     not chrome is grey so the two data colours (green visit, red attack)
+     are the only saturated things on screen. */
+  --bg: #f7f3ed;
+  --bg-2: #fbf8f4;
+  --surface: #ffffff;
+  --surface-soft: #faf6f1;
+  --surface-sunk: #f3eee7;
+  --line: #ebe3d9;
+  --line-strong: #dbd0c2;
+  --text: #2f2a25;
+  --text-2: #615751;
+  --muted: #948a7f;
+  --accent: #d2762e;
+  --accent-soft: #fdf1e4;
+  --accent-line: #f2dcc4;
+  --ok: #1f7a4d;
+  --ok-soft: #e9f5ef;
+  --danger: #c0392b;
+  --danger-soft: #fceeec;
+  --warn: #a8761a;
+  --warn-soft: #fbf1de;
+  --radius: 12px;
+  --radius-sm: 9px;
+  --shadow: 0 1px 2px rgba(31, 66, 99, .05), 0 4px 14px rgba(31, 66, 99, .06);
+  --shadow-lift: 0 2px 6px rgba(31, 66, 99, .07), 0 14px 30px rgba(31, 66, 99, .1);
+  --mono: "JetBrains Mono", "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+  --sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+  --topbar-h: 58px;
+}
+
+html, body { min-height: 100%; }
+body {
+  margin: 0;
+  font-family: var(--sans);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body.home {
+  background:
+    radial-gradient(1100px 540px at 50% -8%, #fbe8d4 0%, rgba(247, 243, 237, 0) 64%),
+    radial-gradient(860px 440px at 92% 2%, #f6ece0 0%, rgba(250, 247, 243, 0) 60%),
+    linear-gradient(180deg, #f8f4ee 0%, #faf7f3 42%, #fcfaf7 100%);
+  background-attachment: fixed;
+}
+
+a { color: inherit; text-decoration: none; }
+button { font: inherit; color: inherit; }
+h1, h2, h3, h4 { margin: 0; font-weight: 600; }
+table { border-collapse: collapse; width: 100%; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #ddd2c4; border-radius: 6px; border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #c9bba9; background-clip: padding-box; }
+
+/* ── top bar ─────────────────────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 60;
+  height: var(--topbar-h);
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 18px; padding: 0 clamp(14px, 3vw, 28px);
+  background: rgba(255, 255, 255, .88);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(12px) saturate(150%);
+}
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand .mark { color: var(--accent); display: flex; }
+.brand .title { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+.brand .title b {
+  font-size: 16px; letter-spacing: .14em; color: var(--text); font-weight: 700;
+}
+.brand .title span { color: var(--text-2); font-size: 13px; white-space: nowrap; }
+.topright { display: flex; align-items: center; gap: 14px; }
+
+.live { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); }
+.live .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(31, 122, 77, .14);
+  animation: breathe 2.6s ease-in-out infinite;
+}
+.live.offline .dot { background: var(--danger); box-shadow: 0 0 0 3px rgba(194, 38, 58, .14); animation: none; }
+@keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+.clock { font-family: var(--mono); font-size: 12.5px; color: var(--text-2); }
+.ghost-btn {
+  border: 1px solid var(--line-strong); border-radius: 999px;
+  padding: 6px 14px; font-size: 12.5px; color: var(--accent);
+  background: #fff; cursor: pointer;
+  transition: background .16s, border-color .16s, box-shadow .16s;
+  white-space: nowrap;
+}
+.ghost-btn:hover { background: var(--accent-soft); border-color: var(--accent-line); box-shadow: var(--shadow); }
+
+/* ── panels ──────────────────────────────────────────────── */
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 11px 16px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #fff, var(--surface-soft));
+}
+.panel-head.tight { border-top: 1px solid var(--line); }
+.panel-head h2 {
+  font-size: 13.5px; color: var(--text); display: flex; align-items: baseline;
+  gap: 10px; flex-wrap: wrap;
+}
+.panel-head .sub { font-size: 11.5px; color: var(--muted); font-weight: 400; }
+.note { font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+
+/* ── generic bits ────────────────────────────────────────── */
+.divider { height: 1px; background: var(--line); margin: 10px 14px; }
+.empty { color: var(--muted); font-size: 12.5px; text-align: center; padding: 18px 8px; }
+
+.btn {
+  border: 1px solid var(--accent-line); background: var(--accent-soft);
+  color: var(--accent); border-radius: var(--radius-sm);
+  padding: 7px 14px; font-size: 13px; cursor: pointer;
+  transition: background .16s, box-shadow .16s;
+}
+.btn:hover { background: #faeadb; box-shadow: var(--shadow); }
+.btn.primary { background: var(--accent); border-color: transparent; color: #fff; font-weight: 600; }
+.btn.primary:hover { background: #b8631f; }
+.btn.danger { border-color: rgba(194, 38, 58, .3); color: var(--danger); background: var(--danger-soft); }
+.btn.danger:hover { background: #f8dcd8; }
+.btn.ghost { background: #fff; color: var(--text-2); border-color: var(--line-strong); }
+.btn.ghost:hover { background: var(--surface-soft); color: var(--text); }
+.btn.small { padding: 5px 11px; font-size: 12.5px; }
+
+.chip {
+  border: 1px solid var(--line-strong); background: #fff; color: var(--text-2);
+  border-radius: 999px; padding: 4px 12px; font-size: 12px; cursor: pointer;
+  transition: all .15s; white-space: nowrap;
+}
+.chip:hover { color: var(--accent); border-color: var(--accent-line); background: var(--accent-soft); }
+.chip.active { color: #fff; background: var(--accent); border-color: transparent; }
+.chip.icon { padding: 4px 10px; font-size: 13px; line-height: 1.2; }
+
+.bar { height: 6px; border-radius: 4px; background: var(--surface-sunk); overflow: hidden; margin: 8px 0 6px; }
+.bar i {
+  display: block; height: 100%; width: 0%;
+  background: linear-gradient(90deg, #e6a468, var(--accent));
+  border-radius: 4px; transition: width .5s ease, background .4s;
+}
+.bar i.warn { background: linear-gradient(90deg, #e0a63c, var(--warn)); }
+.bar i.danger { background: linear-gradient(90deg, #e2606e, var(--danger)); }
+
+/* ── toast + modal ───────────────────────────────────────── */
+.toast-host {
+  position: fixed; right: 18px; bottom: 18px; z-index: 10000;
+  display: flex; flex-direction: column; gap: 9px; align-items: flex-end;
+}
+.toast {
+  padding: 11px 16px; border-radius: var(--radius-sm); font-size: 13px;
+  background: #fff; color: var(--text);
+  border: 1px solid var(--line-strong); box-shadow: var(--shadow-lift);
+  opacity: 0; transform: translateY(8px); transition: opacity .22s, transform .22s;
+  max-width: min(420px, 84vw);
+}
+.toast.in { opacity: 1; transform: none; }
+.toast-error { border-color: rgba(192, 57, 43, .45); background: var(--danger-soft); color: #7d2419; }
+.toast-ok { border-color: rgba(31, 122, 77, .4); background: var(--ok-soft); color: #14522f; }
+
+/* `hidden` must win. The rule below sets display:flex, and a class selector
+   beats the browser's built-in `[hidden] { display: none }`, so the overlay
+   stayed on screen at z-index 10001 -- a full-viewport blur and dim over every
+   page, including the login form. It looked exactly like a "filter" that could
+   not be found in the CSS, because the culprit was a rule that was working as
+   written. Anything hidden by attribute now disappears, whatever else styles
+   it. */
+[hidden] { display: none !important; }
+
+.modal-host {
+  position: fixed; inset: 0; z-index: 10001; display: flex;
+  align-items: center; justify-content: center; padding: 20px;
+  background: rgba(74, 58, 42, .18); backdrop-filter: blur(2px) saturate(.96);
+}
+.modal {
+  width: min(520px, 92vw); max-height: 86vh; overflow: auto;
+  background: #fff; border: 1px solid var(--line-strong);
+  border-radius: var(--radius); padding: 20px 22px;
+  box-shadow: 0 2px 8px rgba(74, 56, 38, .08), 0 26px 60px rgba(74, 56, 38, .16);
+  opacity: 0; transform: translateY(10px); transition: opacity .2s, transform .2s;
+}
+.modal.in { opacity: 1; transform: none; }
+.modal h3 { font-size: 16px; margin-bottom: 10px; color: var(--text); }
+.modal p { color: var(--text-2); font-size: 13.5px; line-height: 1.65; margin: 0 0 12px; }
+.modal-detail {
+  font-family: var(--mono); font-size: 11.5px; color: var(--text-2);
+  background: var(--surface-sunk); border-radius: 8px; padding: 10px 12px;
+  max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+  border: 1px solid var(--line); margin: 0 0 14px;
+}
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* ── footer ──────────────────────────────────────────────── */
+.foot {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 20px clamp(14px, 3vw, 28px) 30px;
+  color: var(--muted); font-size: 11.5px; font-family: var(--mono);
+}
+.dot-sep { opacity: .5; }
+
+/* ── self-check banner ───────────────────────────────────── */
+.vigil-warn {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10002;
+  padding: 11px 18px; font-size: 13px; line-height: 1.55;
+  background: #7f1d28; color: #ffe3e6;
+  border-top: 1px solid rgba(255, 255, 255, .25);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, .25);
+  font-family: var(--mono); word-break: break-word;
+}
+.vigil-warn code { background: rgba(255, 255, 255, .14); padding: 1px 6px; border-radius: 5px; }
+
+@media (max-width: 720px) {
+  .brand .title span { display: none; }
+  .clock { display: none; }
+  .toast-host { left: 14px; right: 14px; align-items: stretch; }
+}

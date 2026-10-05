@@ -1,0 +1,44 @@
+{
+  "_comment": [
+    "内置管理后台（dashboard/）的配置模板。复制到 dashboard/config.json 后按",
+    "这台机器的情况改；config.json 已被 .gitignore 忽略，不会进仓库。",
+    "**不要**把真实域名/路径写回仓库里的任何文件 —— 发布关卡会拒绝。",
+    "这些键会被 backend/settings.py 的 DEFAULTS 覆盖合并；下面只列了最需要",
+    "改的几个，其余可调项见 backend/settings.py 的 DEFAULTS。"
+  ],
+
+  "public_host": "status.example.com",
+  "display_name": "我的状态页",
+  "webroot": "/www/wwwroot/status.example.com",
+
+  "_comment_extra_hosts": [
+    "除 public_host 及其子域外，控制台还接受哪些 Host（顶点域名、别名、",
+    "同一台机器上的其它站点）。仅在反代之后才可达。"
+  ],
+  "extra_hosts": [],
+
+  "_comment_coords": [
+    "地图画线的终点：这台机器的经纬度。没有默认值，必须自己填 —— 一台机器",
+    "的坐标就是这类仓库不该带的信息。不填会画到几内亚湾。"
+  ],
+  "server_lat": 0.0,
+  "server_lon": 0.0,
+
+  "_comment_panels": [
+    "管理页的「各后台快捷入口」。url 用 / 开头表示本站内路径。",
+    "下面是占位示例，换成自己的。"
+  ],
+  "panels": [
+    {"id": "vigil", "name": "Vigil 防护系统", "desc": "实时风控与封禁台账",
+     "url": "/", "group": "应用"},
+    {"id": "panel", "name": "面板", "desc": "服务器运维与站点管理",
+     "url": "https://panel.example.com/", "group": "系统"}
+  ],
+
+  "_comment_local_services": [
+    "管理页的「常用本地服务」表（仅本机可达）。空列表会显示成「未配置」。"
+  ],
+  "local_services": [
+    {"name": "MySQL", "url": "127.0.0.1:3306", "note": "数据库，仅本机"}
+  ]
+}

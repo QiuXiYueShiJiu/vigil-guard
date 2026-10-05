@@ -26,6 +26,35 @@ sudo vigil status          # 现在是否一切正常
 `/usr/local/bin/vigil` 启动器、把 systemd 单元装上。它**不**碰 nginx、不碰面板、
 不改防火墙 —— 那些都要你显式跑 `vigil gate install` / `vigil threat enable`。
 
+## 内置管理后台（可选，`dashboard/`）
+
+仓库自带一个**完整的管理后台**（实时态势地图 + 管理控制台）。
+**`install.sh` 不会装它** —— 它要全盘文件权限和自己的 vhost，装它应该是一次
+明确的决定：
+
+```sh
+cp dashboard/config.example.json dashboard/config.json   # 填 public_host 与坐标
+sudo bash dashboard/deploy/install.sh
+```
+
+`public_host` 还是模板里的占位值时脚本会拒绝安装；域名、webroot、显示名与
+地图坐标全部来自 `dashboard/config.json`，源码里没有真实值。
+
+它动的东西：
+
+| 路径 | 内容 |
+|---|---|
+| `/etc/systemd/system/vigil-dashboard.service` | 独立进程，默认只监听 `127.0.0.1:9310` |
+| `<config 里的 webroot>` | 静态页面与内容哈希资源（默认 `/www/wwwroot/<public_host>`） |
+| `/var/lib/vigil-dashboard` | 会话、审计日志、控制台口令派生值 |
+| `/www/server/nginx/conf/vigil-dashboard-sites/` | 站点开关片段（它自己的目录） |
+| `<面板 vhost 目录>/<public_host>.conf` 等 | 反代站点、封闭名单、证书校验目录 |
+| `/usr/local/bin/vigil-cert-sync` | 证书同步钩子（**已存在则不覆盖**） |
+
+它和 `vigil web` 那个最小状态页是两回事，分工见 [WEB.md](WEB.md)。
+没有专门的卸载命令：删掉上面这些文件与服务即可 —— 脚本全程只按自己的命名
+写文件，不会碰别人的 vhost。
+
 ## 升级
 
 ```sh

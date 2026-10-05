@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="theme-color" content="#f8f1e8">
+<title>Vigil · 服务器实时态势</title>
+<meta name="description" content="Vigil 服务器实时访问态势、防护状态与系统资源监控">
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/base.css">
+<link rel="stylesheet" href="/assets/home.css">
+</head>
+<body class="home">
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true">
+      <svg viewBox="0 0 32 32" width="28" height="28">
+        <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".5"/>
+        <ellipse cx="16" cy="16" rx="13" ry="5.4" fill="none" stroke="currentColor" stroke-width="1.1" opacity=".35"/>
+        <path d="M16 3v26" stroke="currentColor" stroke-width="0.9" opacity=".22"/>
+        <circle cx="16" cy="16" r="3.2" fill="currentColor"/>
+      </svg>
+    </span>
+    <span class="title"><b>VIGIL</b><span>服务器实时态势</span></span>
+  </div>
+  <div class="topright">
+    <span class="live" id="live-indicator"><i class="dot"></i><span id="live-text">连接中…</span></span>
+    <span class="clock" id="clock">--:--:--</span>
+    <a class="ghost-btn" href="/admin.html" id="admin-entry">管理入口</a>
+  </div>
+</header>
+
+<main class="stage">
+
+  <!-- ── 地图：置顶、平面 ─────────────────────────────────── -->
+  <!-- ── 地图：独占一栏，画布上不压任何常驻信息 ─────────────── -->
+  <section class="map-section" id="map-section">
+    <div class="map-bar">
+      <div class="map-title">
+        <b>全球访问态势</b>
+        <span id="map-sub">数据源：nginx 访问日志 + vigil 实时风控</span>
+      </div>
+      <div class="map-tools">
+        <button class="chip" data-view="world">全球</button>
+        <button class="chip" data-view="asia">亚太</button>
+        <button class="chip" data-view="europe">欧洲</button>
+        <button class="chip" data-view="americas">美洲</button>
+        <span class="tool-sep"></span>
+        <button class="chip icon" id="zoom-in" title="放大">＋</button>
+        <button class="chip icon" id="zoom-out" title="缩小">－</button>
+        <button class="chip icon" id="map-fit" title="整幅世界">⤢</button>
+        <button class="chip" id="map-pause" title="暂停 / 继续绘制">暂停</button>
+      </div>
+    </div>
+    <div class="map-wrap">
+      <canvas id="world-canvas" aria-label="实时访问地图"></canvas>
+      <div class="map-loading" id="map-loading"><i></i><span>地图数据加载中…</span></div>
+    </div>
+    <!-- 图例与读数在地图下方，不遮挡地图 -->
+    <div class="map-foot">
+      <div class="lg-row"><i class="sw sw-0"></i><span>正常访问</span><b id="cnt-0">0</b></div>
+      <div class="lg-row"><i class="sw sw-1"></i><span>攻击</span><b id="cnt-1">0</b></div>
+      <div class="lg-row"><i class="sw sw-2"></i><span>高压攻击</span><b id="cnt-2">0</b></div>
+      <span class="tool-sep"></span>
+      <div class="lg-row small"><span>在途</span><b id="cnt-live">0</b></div>
+      <div class="lg-row small"><span>缩放</span><b id="cnt-zoom">—</b></div>
+      <span class="tool-sep"></span>
+      <div class="ro" id="readout">
+        <b class="ro-title" id="ro-title">最近动态</b>
+        <span class="ro-body" id="ro-body">拖动平移 · 滚轮或双指缩放 · 点按查看来源</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── KPI ──────────────────────────────────────────────── -->
+  <section class="kpis">
+    <div class="kpi"><span class="k-label">本机</span>
+      <b class="k-value" id="kpi-host">—</b><span class="k-sub" id="kpi-loc">—</span></div>
+    <div class="kpi"><span class="k-label">外网请求</span>
+      <b class="k-value" id="kpi-total">—</b><span class="k-sub" id="kpi-rpm">— / 分钟</span></div>
+    <div class="kpi"><span class="k-label">实时封禁</span>
+      <b class="k-value danger" id="kpi-bans">—</b><span class="k-sub" id="kpi-bans-sub">累计 —</span></div>
+    <div class="kpi"><span class="k-label">防护姿态</span>
+      <b class="k-value" id="kpi-posture">—</b><span class="k-sub" id="kpi-posture-sub">vigil 风控</span></div>
+    <div class="kpi"><span class="k-label">系统负载</span>
+      <b class="k-value" id="kpi-load">—</b><span class="k-sub" id="kpi-uptime">—</span></div>
+    <div class="kpi"><span class="k-label">上地图事件</span>
+      <b class="k-value" id="kpi-epm">—</b><span class="k-sub" id="kpi-sub">条 / 分钟（不含后台轮询）</span></div>
+  </section>
+
+  <!-- ── 资源 + 事件流 + 攻击 ─────────────────────────────── -->
+  <section class="grid-3">
+    <div class="panel">
+      <div class="panel-head"><h2>系统资源</h2><span class="note" id="res-note">—</span></div>
+      <div class="res-block">
+        <div class="res-head"><span>CPU</span><b id="cpu-pct">—</b></div>
+        <canvas class="spark" id="cpu-spark"></canvas>
+        <div class="res-foot"><span id="cpu-model">—</span><span id="cpu-cores">—</span></div>
+        <div class="res-meta"><span>负载 <b id="cpu-load">—</b></span><span>温度 <b id="cpu-temp">—</b></span></div>
+      </div>
+      <div class="res-block">
+        <div class="res-head"><span>内存</span><b id="mem-pct">—</b></div>
+        <div class="bar"><i id="mem-bar"></i></div>
+        <div class="res-foot"><span id="mem-used">—</span><span id="mem-total">—</span></div>
+        <div class="res-meta"><span>缓存 <b id="mem-cached">—</b></span><span>交换 <b id="mem-swap">—</b></span></div>
+      </div>
+      <div class="res-block">
+        <div class="res-head"><span>硬盘</span><b id="disk-pct">—</b></div>
+        <div class="bar"><i id="disk-bar"></i></div>
+        <div class="res-foot"><span id="disk-used">—</span><span id="disk-total">—</span></div>
+        <div class="res-meta"><span>读 <b id="disk-read">—</b></span><span>写 <b id="disk-write">—</b></span></div>
+      </div>
+      <div class="res-block">
+        <div class="res-head"><span>网络</span><b id="net-total">—</b></div>
+        <canvas class="spark" id="net-spark"></canvas>
+        <div class="res-foot"><span>↓ <b id="net-rx">—</b></span><span>↑ <b id="net-tx">—</b></span></div>
+        <div class="res-meta"><span id="net-if">—</span><span id="net-uptime">—</span></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>实时事件流</h2><span class="note" id="stream-note">按到达时间倒序</span></div>
+      <div class="stream" id="stream"></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h2>本次访问期间的新攻击</h2><span class="note" id="attack-note">—</span></div>
+      <div class="table-wrap">
+        <table class="data" id="attack-table">
+          <thead><tr><th>来源</th><th>位置</th><th>判定</th><th>时间</th></tr></thead>
+          <tbody><tr class="empty"><td colspan="4">页面打开后暂未出现新攻击</td></tr></tbody>
+        </table>
+      </div>
+      <!-- 打开页面时账本里已经生效的封禁。单独成块，因为它不是"刚刚发生"，
+           混在上面的列表里会让人每次刷新都以为又被打了一次。 -->
+      <div class="subhead">
+        <b>打开页面时已在生效的封禁</b>
+        <span class="note" id="existing-note">—</span>
+      </div>
+      <div class="table-wrap short">
+        <table class="data" id="existing-table">
+          <thead><tr><th>来源</th><th>位置</th><th>判定</th><th>到期</th></tr></thead>
+          <tbody><tr class="empty"><td colspan="4">账本中没有生效封禁</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 趋势 + 分布 + 进程 ───────────────────────────────── -->
+  <section class="grid-3">
+    <div class="panel">
+      <div class="panel-head"><h2>请求量（近 12 分钟）</h2><span class="note" id="trend-note">—</span></div>
+      <canvas class="trend" id="trend-canvas"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>来源分布</h2><span class="note" id="dist-note">—</span></div>
+      <div class="dist" id="countries"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h2>占用最高的进程</h2><span class="note" id="guard-note">—</span></div>
+      <div class="mini-list" id="procs"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>Vigil 控制台</span><span class="dot-sep">·</span>
+  <span>实时访问态势</span><span class="dot-sep">·</span>
+  <span>地图：Natural Earth（中国官方立场边界）</span><span class="dot-sep">·</span>
+  <span>GeoIP：GeoLite2 离线库</span><span class="dot-sep">·</span>
+  <span id="foot-status">初始化中…</span>
+</footer>
+
+<script type="module" src="/assets/home.js"></script>
+<script type="module">
+  import { installSelfCheck } from '/assets/selfcheck.js';
+  installSelfCheck('home');
+</script>
+</body>
+</html>

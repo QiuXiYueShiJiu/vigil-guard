@@ -1,0 +1,230 @@
+/* ──────────────────────────────────────────────────────────────
+   vigil console · home page
+   Map first, then numbers. Light theme, generous spacing.
+   ────────────────────────────────────────────────────────────── */
+
+.stage {
+  padding: 16px clamp(12px, 2.4vw, 26px) 0;
+  display: flex; flex-direction: column; gap: 14px;
+  max-width: 1760px; margin: 0 auto;
+}
+
+/* ── KPI strip ───────────────────────────────────────────── */
+.kpis {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+}
+.kpi {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: var(--shadow);
+  padding: 11px 15px 12px; position: relative; overflow: hidden;
+}
+.kpi::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--accent); opacity: .85;
+}
+.k-label { display: block; font-size: 11px; color: var(--muted); letter-spacing: .1em; margin-bottom: 4px; }
+.k-value {
+  display: block; font-family: var(--mono); font-size: 19px; font-weight: 600;
+  color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.k-value.danger { color: var(--danger); }
+.k-value.amber { color: var(--warn); }
+.k-sub { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; font-family: var(--mono); }
+
+/* ── grids ───────────────────────────────────────────────── */
+.grid-3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 1240px) { .grid-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 880px) { .grid-3 { grid-template-columns: 1fr; } }
+
+/* ── resource blocks ─────────────────────────────────────── */
+.res-block { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.res-block:last-child { border-bottom: none; }
+.res-head { display: flex; align-items: baseline; justify-content: space-between; }
+.res-head span { font-size: 11.5px; color: var(--muted); letter-spacing: .1em; }
+.res-head b { font-family: var(--mono); font-size: 18px; color: var(--text); font-weight: 600; }
+.spark { width: 100%; height: 30px; display: block; margin: 5px 0 3px; }
+.res-foot {
+  display: flex; justify-content: space-between; gap: 10px;
+  font-size: 11px; color: var(--muted); font-family: var(--mono);
+  white-space: nowrap; overflow: hidden;
+}
+.res-meta {
+  display: flex; justify-content: space-between; gap: 10px; margin-top: 6px;
+  font-size: 11px; color: var(--muted);
+}
+.res-meta b { color: var(--text-2); font-weight: 600; font-family: var(--mono); }
+
+/* ── event stream ────────────────────────────────────────── */
+.stream {
+  height: 430px; overflow: auto; padding: 4px 6px 8px;
+  font-size: 12px; font-family: var(--mono);
+}
+.ev {
+  display: grid; grid-template-columns: 54px 16px minmax(0, 1fr) auto;
+  gap: 7px; align-items: center; padding: 5px 8px; border-radius: 7px;
+  animation: evIn .3s ease;
+}
+@keyframes evIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+.ev:hover { background: var(--surface-soft); }
+.ev.lv1 { background: rgba(208, 64, 48, .07); }
+.ev.lv2 { background: rgba(132, 30, 24, .10); }
+.ev-time { color: var(--muted); }
+.ev-flag { text-align: center; font-size: 12px; }
+.ev-main { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.ev-ip { color: var(--text); }
+.ev-path { color: #96703f; }
+.ev-right { display: flex; align-items: center; gap: 6px; }
+.ev-status { color: var(--muted); }
+.ev-status.bad { color: var(--danger); font-weight: 600; }
+.ev-status.warn { color: var(--warn); }
+.ev-badge { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
+.ev-badge.red { color: #fff; background: var(--danger); }
+.ev-badge.black { color: #fff; background: #7a1c14; }
+
+/* ── tables ──────────────────────────────────────────────── */
+.table-wrap { max-height: 430px; overflow: auto; }
+table.data { font-size: 12.5px; }
+table.data th {
+  position: sticky; top: 0; z-index: 2; text-align: left;
+  font-weight: 500; font-size: 11.5px; letter-spacing: .06em; color: var(--muted);
+  padding: 9px 14px; background: var(--surface-soft);
+  border-bottom: 1px solid var(--line);
+}
+table.data td {
+  padding: 8px 14px; border-bottom: 1px solid #f4efe8;
+  color: var(--text-2); vertical-align: middle;
+}
+table.data tr:hover td { background: var(--surface-soft); }
+table.data td.ip { font-family: var(--mono); color: var(--text); }
+table.data td.reason { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+table.data td.time { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+.flag-cell { font-size: 13px; }
+
+/* ── distributions ───────────────────────────────────────── */
+.dist { padding: 10px 16px 13px; display: flex; flex-direction: column; gap: 7px; max-height: 240px; overflow: auto; }
+.dist.compact { max-height: 170px; }
+.dist-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; gap: 9px; align-items: center; font-size: 12.5px; }
+.dist-name { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dist-bar { height: 4px; border-radius: 3px; background: var(--surface-sunk); overflow: hidden; margin-top: 4px; }
+.dist-bar i { display: block; height: 100%; background: linear-gradient(90deg, #e6b98a, var(--accent)); }
+.dist-row b { font-family: var(--mono); color: var(--text); font-weight: 600; }
+
+/* ── trend + lists ───────────────────────────────────────── */
+.trend { width: 100%; height: 240px; display: block; padding: 6px 2px 0; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 12px 16px 16px; }
+@media (max-width: 640px) { .split { grid-template-columns: 1fr; } }
+.split h4 { font-size: 11.5px; color: var(--muted); letter-spacing: .08em; font-weight: 500; margin-bottom: 8px; }
+.mini-list { display: flex; flex-direction: column; gap: 5px; font-size: 12px; font-family: var(--mono); }
+.mini-row { display: grid; grid-template-columns: minmax(0, 1fr) 52px 54px; gap: 8px; align-items: center; }
+.mini-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-2); }
+.mini-row .v { text-align: right; color: var(--text); }
+.mini-row .v.hot { color: var(--warn); }
+.mini-row .m { text-align: right; color: var(--muted); }
+
+@media (max-width: 720px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stream, .table-wrap { height: 340px; max-height: 340px; }
+  /* 顶栏与地图栏在手机上的收拢：主页顶栏同样是固定高度且单行不换行，
+     长文案会把同排元素挤变形。 */
+  .topbar { height: auto; min-height: var(--topbar-h); flex-wrap: wrap; padding: 8px 12px; gap: 8px; }
+  .topbar .brand { min-width: 0; }
+  .topbar .brand .title span { display: none; }
+  .topbar .topright { flex: 0 0 auto; gap: 8px; }
+  .topbar .clock { font-size: 12.5px; }
+  .map-bar { gap: 10px; }
+  .map-title { flex-wrap: wrap; }
+  .map-title span { font-size: 11.5px; }
+  .map-tools { gap: 5px; }
+  .chip { padding: 5px 10px; font-size: 12.5px; }
+}
+
+@media (max-width: 420px) {
+  .topbar .clock { display: none; }          /* 手机上时钟信息量最低 */
+  .map-title span { display: none; }
+}
+
+
+/* ── 地图栏：独占一行，画布上不压任何常驻信息 ─────────────────── */
+.map-section {
+  padding: 0;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  box-shadow: var(--shadow-lift);
+}
+.map-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 14px; flex-wrap: wrap;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  background: linear-gradient(180deg, #fdfaf6, #fbf6ef);
+}
+.map-title { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+.map-title b { font-size: 14px; color: var(--text); letter-spacing: .02em; }
+.map-title span { font-size: 12px; color: var(--muted); }
+.map-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tool-sep { width: 1px; height: 16px; background: var(--line-strong); margin: 0 3px; }
+
+/* 地图本体：高度跟视口走，保证整幅可见 */
+.map-wrap {
+  position: relative;
+  width: 100%;
+  height: clamp(320px, 62vh, 720px);
+  background: #fdf8f2;
+  /* 手势已停用（见 map.js 的 GESTURES_ENABLED），触摸必须交还给浏览器 —— 
+     留着 none 会把手势关掉之后**连页面滚动都拖不动**，比原来更糟。 */
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
+}
+.map-wrap canvas { display: block; width: 100%; height: 100%; cursor: default; touch-action: pan-x pan-y; }
+.map-wrap canvas:active { cursor: grabbing; }
+.map-loading {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  gap: 10px; font-size: 13px; color: var(--muted);
+  background: rgba(253, 248, 242, .82);
+}
+.map-loading.gone { display: none; }
+
+/* 图例与读数：地图下方一条，不遮挡地图 */
+.map-foot {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding: 9px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-soft);
+  font-size: 12px; color: var(--text-2);
+}
+.map-foot .lg-row { display: flex; align-items: center; gap: 7px; }
+.map-foot .lg-row b { font-variant-numeric: tabular-nums; color: var(--text); font-weight: 600; }
+.map-foot .lg-row.small { color: var(--muted); }
+.map-foot .sw { width: 16px; height: 2.5px; border-radius: 2px; display: inline-block; }
+.map-foot .sw-0 { background: rgb(58,122,82); }
+.map-foot .sw-1 { background: rgb(208,64,48); }
+.map-foot .sw-2 { background: rgb(132,30,24); }
+.map-foot .ro { margin-left: auto; display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.map-foot .ro-title { font-size: 11px; color: var(--muted); font-weight: 500; white-space: nowrap; }
+.map-foot .ro-body {
+  color: var(--text-2); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46ch;
+}
+
+@media (max-width: 720px) {
+  .map-wrap { height: clamp(260px, 46vh, 420px); }
+  .map-foot { gap: 12px; }
+  .map-foot .ro { margin-left: 0; width: 100%; }
+  .map-foot .ro-body { max-width: 100%; }
+  .map-bar { padding: 9px 11px; }
+}
+
+
+/* 「已在生效的封禁」小标题：视觉上从主列表里退一步 */
+.subhead {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; padding: 10px 14px 6px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.subhead b { font-size: 12.5px; color: var(--text-2); font-weight: 500; }
+.subhead .note { font-size: 11.5px; color: var(--muted); }
+.table-wrap.short { max-height: 190px; }

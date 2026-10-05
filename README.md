@@ -7,6 +7,7 @@
 检测、封禁、告警、诱饵、自修正 —— 一个不依赖第三方库、可以在锁死网络的机器上跑起来的守护程序。
 
 [![CI](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/badge/version-3.2.0-6fa8d6.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-6fa8d6.svg)](LICENSE)
 
 <img src="assets/arch.svg" alt="架构与数据流" width="820">
@@ -74,9 +75,44 @@ vigil 快速设置 / 一次问答，把管理页面配好
 | **登录闸门** | 给面板或自建登录页前置人机验证，支持多实例 | `vigil gate` |
 | **诱饵与诱导面** | 让扫描器自己撞上诱饵端点，并衡量诱导面是否真的被找到 | `vigil decoy` · `vigil lure` |
 | **状态与反馈页** | 实时状态 + 反馈入口；只监听本机、由已有 Web 服务反代 | `vigil web` |
+| **内置管理后台** | 实时态势地图 + 管理控制台（站点开关、文件管理、审计）；自配置、随包发布 | `dashboard/deploy/install.sh` |
 | **自修正** | 自监督训练 + 泛化验证 + 闭环回看；有边界、可回滚、改前发邮件 | `vigil evolve` |
 | **请求卫生 / 完整性 / 审计** | 请求行限制、程序自身完整性基线、内核级改动归因 | `vigil hygiene` · `vigil audit` |
 | **快速设置** | 一次问答配好管理页面、反代、凭据与测试邮件 | `vigil setup` |
+
+## 内置管理后台（v3.2.0 起，自配置）
+
+仓库自带一个**完整的管理后台**，装在 [`dashboard/`](dashboard/)，随包发布：
+
+- **实时态势主页**（游客免登录）：世界地图上的实时访问流星、攻击分级、
+  CPU / 内存 / 硬盘 / 网络与实时事件流；
+- **管理控制台**（需登录）：站点一键放行 / 关闭、后台快捷入口、全盘文件管理
+  （浏览 / 读写 / 上传 / 下载）、操作审计。
+
+```sh
+cd <vigil-guard 仓库>
+cp dashboard/config.example.json dashboard/config.json   # 填 public_host 与坐标
+sudo bash dashboard/deploy/install.sh                    # 幂等：代码+静态+systemd+nginx
+```
+
+**它是自配置的**：域名、webroot、显示名、地图坐标、后台入口列表全部来自
+`dashboard/config.json`，源码里一个真实域名都没有。`public_host` 还是占位值时
+安装脚本会**直接拒绝安装**，不会把一个连不上的站点发出去。细节见
+[`dashboard/README.md`](dashboard/README.md)。
+
+### 和 `vigil web` 的分工
+
+| | `vigil web`（自带状态页） | `dashboard/`（内置管理后台） |
+|---|---|---|
+| 定位 | 最小状态与反馈页 | 完整控制台：态势地图 + 站点开关 + 文件管理 + 审计 |
+| 进程 | vigil 自己起 `vigil-web.service`（默认 9177） | 独立进程 `vigil-dashboard.service`（默认 9310） |
+| 部署 | `sudo vigil setup` / `vigil web install --domain ...` | `dashboard/deploy/install.sh`（读 `config.json`） |
+| 依赖 | 无，只用标准库 | 无，只用标准库；GeoIP 复用面板自带 mmdb |
+| 对外 | 都由本机已有 Web 服务反代 | 同上 |
+| 关系 | 二者**互不依赖、互不覆盖**：端口、systemd 单元、vhost 各自独立 | 可以只装其中一个 |
+
+只想知道「机器还好吗」，装 `vigil web` 就够；要一个能看、能管的后台，
+再装 `dashboard/`。两个页面也可以同时开着，它们的配置与凭据彼此独立。
 
 ## 自修正：它凭什么被允许改自己
 
@@ -159,7 +195,8 @@ scripts/release-check.sh          # 语法 → 全套测试 → 源码审计 →
 | [docs/INSTALL.md](docs/INSTALL.md) | 安装与升级 |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 配置项与自修正开关 |
 | [docs/EVOLVE.md](docs/EVOLVE.md) | 自修正：边界、自监督、泛化验证 |
-| [docs/WEB.md](docs/WEB.md) | 状态页：交互逻辑与安全取舍 |
+| [docs/WEB.md](docs/WEB.md) | 状态页与内置管理后台：分工、交互逻辑与安全取舍 |
+| [dashboard/README.md](dashboard/README.md) | 内置管理后台：部署、配置项与安全边界 |
 | [docs/GATE.md](docs/GATE.md) | 登录闸门 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块结构 |
 | [docs/FAQ.md](docs/FAQ.md) | 常见问题 |

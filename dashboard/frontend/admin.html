@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
+<meta name="theme-color" content="#f8f1e8">
+<title>Vigil 管理控制台</title>
+<link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/assets/base.css">
+<link rel="stylesheet" href="/assets/admin.css">
+</head>
+<body class="admin">
+
+<!-- ── 未登录：登录层 ─────────────────────────────────────── -->
+<section class="gate" id="gate">
+  <div class="gate-card">
+    <div class="gate-mark" aria-hidden="true">
+      <svg viewBox="0 0 48 48" width="52" height="52">
+        <path d="M24 4 41 11v13c0 10-7 17-17 20C14 41 7 34 7 24V11z"
+              fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M16 24.5 22 30l11-11" fill="none" stroke="currentColor"
+              stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>Vigil 管理控制台</h1>
+    <p class="gate-sub">受保护区域</p>
+    <!-- 本页不透露任何凭据信息：不预填账号、不用可识别的占位符、不让浏览器
+         记住或建议账号、也不说明密码的校验方式。注释同样会被发送到浏览器，
+         所以这里也不写具体来源。 -->
+    <form id="login-form" autocomplete="off">
+      <label>
+        <span>账号</span>
+        <!-- A decoy, deliberately. The account is not "admin"; showing a
+             plausible wrong one costs a guesser a wasted attempt per try and
+             tells them nothing true about this console. -->
+        <input id="login-account" name="account" type="text"
+               autocomplete="off" autocapitalize="off" autocorrect="off"
+               spellcheck="false" placeholder="admin" required>
+      </label>
+      <label>
+        <span>密码</span>
+        <input id="login-password" name="password" type="password"
+               autocomplete="new-password" placeholder="密码" required>
+      </label>
+      <button class="btn primary wide" id="login-submit" type="submit">进入控制台</button>
+      <p class="gate-error" id="login-error" hidden></p>
+    </form>
+    <a class="gate-back" href="/">← 返回实时态势主页</a>
+  </div>
+</section>
+
+<!-- ── 已登录：控制台 ─────────────────────────────────────── -->
+<div id="console" hidden>
+  <div class="sky" aria-hidden="true"></div>
+
+  <header class="topbar admin-top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="28" height="28">
+          <path d="M16 3 27 8v9c0 7-4.6 11.7-11 13.5C9.6 28.7 5 24 5 17V8z"
+                fill="none" stroke="currentColor" stroke-width="1.6"/>
+          <path d="M10.5 16.5 14.5 20.5 22 12" fill="none" stroke="currentColor"
+                stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </span>
+      <span class="title"><b>Vigil</b><i>·</i><span>管理控制台</span></span>
+      <span class="host-chip" id="admin-host">—</span>
+    </div>
+    <div class="topright">
+      <span class="who" id="who">管理员</span>
+      <a class="ghost-btn light" href="/">实时态势</a>
+      <button class="ghost-btn light" id="logout-btn">退出登录</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="overview">总览</button>
+    <button class="tab" data-tab="sites">站点开关</button>
+    <button class="tab" data-tab="files">文件管理</button>
+    <button class="tab" data-tab="links">后台入口</button>
+    <button class="tab" data-tab="audit">操作审计</button>
+    <button class="tab" data-tab="system">系统信息</button>
+  </nav>
+
+  <main class="console-main">
+    <!-- 总览 -->
+    <section class="stage-panel active" data-stage="overview">
+      <div class="cards" id="overview-cards"></div>
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>受管站点</h2><span class="note" id="ov-sites-note">—</span></div>
+          <div class="table-wrap"><table class="data light" id="ov-sites">
+            <thead><tr><th>站点</th><th>状态</th><th>根目录</th><th>开关</th></tr></thead>
+            <tbody><tr class="empty"><td colspan="4">载入中…</td></tr></tbody>
+          </table></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>近期封禁</h2><span class="note" id="ov-bans-note">—</span></div>
+          <div class="table-wrap"><table class="data light" id="ov-bans">
+            <thead><tr><th>来源</th><th>位置</th><th>判定</th><th>到期</th></tr></thead>
+            <tbody><tr class="empty"><td colspan="4">载入中…</td></tr></tbody>
+          </table></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>运行自检</h2><span class="note" id="diag-note">—</span></div>
+        <pre class="diag" id="diag">载入中…</pre>
+      </div>
+    </section>
+
+    <!-- 站点开关 -->
+    <section class="stage-panel" data-stage="sites">
+      <div class="card">
+        <div class="card-head">
+          <h2>站点快速放行 / 关闭</h2>
+          <div class="head-actions">
+            <button class="btn small" id="sites-refresh">刷新</button>
+            <button class="btn small ghost" id="nginx-test">校验 nginx 配置</button>
+          </div>
+        </div>
+        <p class="hint">
+          关闭站点会写入一份 <code>deny all;</code> 片段并重载 nginx；放行则清空该片段。
+          每次修改都会先跑 <code>nginx -t</code>，校验不通过自动回滚，不会把 nginx 弄成起不来的状态。
+        </p>
+        <div class="table-wrap tall"><table class="data light" id="sites-table">
+          <thead><tr><th>站点</th><th>状态</th><th>协议</th><th>根目录</th><th>日志</th><th>操作</th></tr></thead>
+          <tbody><tr class="empty"><td colspan="6">载入中…</td></tr></tbody>
+        </table></div>
+        <div class="nginx-result" id="nginx-result" hidden></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>vigil 全局封禁清单</h2><span class="note" id="deny-note">—</span></div>
+        <pre class="diag small" id="deny-list">载入中…</pre>
+      </div>
+    </section>
+
+    <!-- 文件管理 -->
+    <section class="stage-panel" data-stage="files">
+      <div class="card file-card">
+        <div class="fm-bar">
+          <button class="btn small ghost" id="fm-up" title="上一级">↑</button>
+          <button class="btn small ghost" id="fm-home" title="根目录">/</button>
+          <input id="fm-path" class="fm-path" type="text" spellcheck="false" value="/">
+          <button class="btn small" id="fm-go">前往</button>
+          <button class="btn small ghost" id="fm-refresh">刷新</button>
+          <input id="fm-search" class="fm-search" type="search" placeholder="在当前目录搜索：文件名，回车确认">
+          <label class="fm-check"><input type="checkbox" id="fm-content"> 搜内容</label>
+          <label class="fm-check"><input type="checkbox" id="fm-hidden" checked> 显示隐藏</label>
+          <button class="btn small" id="fm-mkdir">新建目录</button>
+          <button class="btn small" id="fm-newfile">新建文件</button>
+          <button class="btn small" id="fm-upload-btn">上传</button>
+          <input type="file" id="fm-upload" multiple hidden>
+          <button class="btn small danger" id="fm-delete">删除选中</button>
+        </div>
+        <div class="fm-progress" id="fm-progress" hidden><i></i><span></span></div>
+        <div class="fm-body">
+          <div class="fm-list" id="fm-list"></div>
+          <div class="fm-editor" id="fm-editor" hidden>
+            <div class="fm-editor-head">
+              <b id="fm-file-name">—</b>
+              <span class="note" id="fm-file-meta"></span>
+              <div class="head-actions">
+                <button class="btn small" id="fm-save">保存</button>
+                <button class="btn small ghost" id="fm-download">下载</button>
+                <button class="btn small ghost" id="fm-close">关闭</button>
+              </div>
+            </div>
+            <textarea id="fm-content-box" spellcheck="false" placeholder="选择左侧文件以查看或编辑"></textarea>
+            <p class="hint" id="fm-editor-hint">
+              保存前会自动在同目录留一份 <code>.vigilbak.*</code> 备份（最多 5 份）。
+              二进制文件只做只读预览。
+            </p>
+          </div>
+        </div>
+        <div class="fm-foot">
+          <span id="fm-stat">—</span>
+          <span id="fm-disk">—</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- 后台入口 -->
+    <section class="stage-panel" data-stage="links">
+      <div class="card">
+        <div class="card-head"><h2>各后台快捷入口</h2><span class="note">新窗口打开</span></div>
+        <div class="panel-grid" id="panel-grid"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>常用本地服务</h2><span class="note">仅本机可达</span></div>
+        <div class="table-wrap"><table class="data light" id="services-table">
+          <thead><tr><th>服务</th><th>地址</th><th>说明</th></tr></thead>
+          <!-- 由后台的 `local_services` 配置渲染（/api/v1/services）。
+               不写死在页面里：每个部署的本机服务都不一样，写死一份就等于
+               把某一台机器的样子发布出去。 -->
+          <tbody id="services-body"></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- 审计 -->
+    <section class="stage-panel" data-stage="audit">
+      <div class="card">
+        <div class="card-head">
+          <h2>操作审计</h2>
+          <div class="head-actions">
+            <span class="note" id="audit-file">—</span>
+            <button class="btn small ghost" id="audit-refresh">刷新</button>
+          </div>
+        </div>
+        <div class="table-wrap tall"><table class="data light" id="audit-table">
+          <thead><tr><th>时间</th><th>动作</th><th>对象</th><th>来源 IP</th><th>结果</th><th>说明</th></tr></thead>
+          <tbody><tr class="empty"><td colspan="6">载入中…</td></tr></tbody>
+        </table></div>
+      </div>
+    </section>
+
+    <!-- 系统信息 -->
+    <section class="stage-panel" data-stage="system">
+      <div class="card">
+        <div class="card-head"><h2>服务配置与自检</h2>
+          <div class="head-actions"><button class="btn small ghost" id="diag-refresh">刷新</button></div>
+        </div>
+        <pre class="diag" id="diag-full">载入中…</pre>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>资源快照</h2><span class="note" id="sys-note">—</span></div>
+        <div class="cards" id="sys-cards"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot admin-foot">
+    <span>Vigil 控制台</span><span class="dot-sep">·</span>
+    <span>所有写操作都会记入 <code>audit.jsonl</code></span><span class="dot-sep">·</span>
+    <span id="foot-note">—</span>
+  </footer>
+</div>
+
+<div class="modal-host" id="modal-host" hidden></div>
+<script type="module" src="/assets/admin.js"></script>
+<script type="module">
+  import {{ installSelfCheck }} from '/assets/selfcheck.js';
+  installSelfCheck('admin');
+</script>
+</body>
+</html>
