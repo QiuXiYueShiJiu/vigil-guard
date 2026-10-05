@@ -5831,6 +5831,7 @@ class TestWhitelistTakesEffectWithoutARestart(unittest.TestCase):
         ip = "27.221.187.226"
         self.assertFalse(self.d.whitelist.allowed(ip))
         self.cfg.set("threat.whitelist", [ip])
+        self.cfg.save()          # 重载是从磁盘读的，必须先落盘
         self.t.request_whitelist_reload()
         self.d.apply_unban_requests()
         self.assertTrue(self.d.whitelist.allowed(ip),

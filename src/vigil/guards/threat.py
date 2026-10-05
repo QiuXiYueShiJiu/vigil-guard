@@ -3016,12 +3016,18 @@ class ThreatDaemon:
         outage: config says whitelisted, ipset says banned, all pages time out.
         """
         from ..core.config import load as _load_cfg
+        entries = None
+        # 从**本守护进程自己的配置文件**重读，而不是全局默认路径 —— 否则在一个
+        # 用临时配置构造的实例上，重载会去读真实主机的配置（测试里就因此出过
+        # 「单独跑通过、整套跑失败」的假象：真实配置恰好含那个地址）。
         try:
-            cfg = _load_cfg()
-            entries = list((cfg or {}).get("threat.whitelist", []) or [])
+            path = getattr(self.cfg, "path", None)
+            fresh = _load_cfg(path) if path else _load_cfg()
+            entries = list((fresh or {}).get("threat.whitelist", []) or [])
         except Exception as e:                                     # noqa: BLE001
-            self.log.warn("重读白名单失败：%s" % e)
-            return 0
+            self.log.warn("重读白名单失败，改用进程内配置：%s" % e)
+        if entries is None:
+            entries = list(self.cfg.get("threat.whitelist", []) or [])
         self.whitelist.reload(entries)
         return len(entries)
 
