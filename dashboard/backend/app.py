@@ -546,7 +546,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         account = str(body.get("account") or "").strip()
         password = str(body.get("password") or "")
-        if account != "\u79cb\u5915\u6708\u62fe\u65e7" "0926":
+        # The account name is configuration (`console_account`), never a
+        # literal in this file. It used to be the operator's own site name,
+        # written as a \u escape so a plain grep would not see it -- the same
+        # disclosure with a different spelling, and exactly what the release
+        # audit exists to prevent.
+        if not settings.settings.console_account \
+                or account != str(settings.settings.console_account):
             auth.auth.note_failure(ip)
             audit.record("login", actor=account, ip=ip, ok=False,
                          detail="账号不匹配")

@@ -95,9 +95,9 @@ cp dashboard/config.example.json dashboard/config.json   # 填 public_host 与�
 sudo bash dashboard/deploy/install.sh                    # 幂等：代码+静态+systemd+nginx
 ```
 
-**它是自配置的**：域名、webroot、显示名、地图坐标、后台入口列表全部来自
-`dashboard/config.json`，源码里一个真实域名都没有。`public_host` 还是占位值时
-安装脚本会**直接拒绝安装**，不会把一个连不上的站点发出去。细节见
+**它是自配置的**：域名、webroot、显示名、地图坐标、控制台登录账号、后台入口
+列表全部来自 `dashboard/config.json`，源码里一个真实域名都没有。`public_host`
+还是占位值时安装脚本会**直接拒绝安装**，不会把一个连不上的站点发出去。细节见
 [`dashboard/README.md`](dashboard/README.md)。
 
 ### 和 `vigil web` 的分工

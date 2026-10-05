@@ -29,7 +29,13 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-ACCOUNT = "\u79cb\u5915\u6708\u62fe\u65e7" "0926"
+from backend import settings  # noqa: E402
+
+# The account is whatever this deployment configured -- never a literal in the
+# repository (it used to be the operator's own site name). An env override is
+# there for testing a service with a different config file.
+ACCOUNT = os.environ.get("VIGIL_DASH_TEST_ACCOUNT",
+                         str(settings.settings.console_account))
 TEST_PASSWORD = "Vigil-Console-Selftest-2026"
 LANCZOS = "\u4e2d\u6587\u6d4b\u8bd5\u5185\u5bb9 line2"
 

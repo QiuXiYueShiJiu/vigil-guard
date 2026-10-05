@@ -11,6 +11,13 @@
   "display_name": "我的状态页",
   "webroot": "/www/wwwroot/status.example.com",
 
+  "_comment_console_account": [
+    "登录控制台时用的账号名（口令另外用 vigil-dash set-password 设置）。",
+    "它以前是站点名本身，写成了 \\u 转义 —— 换个拼法还是同一份泄露，所以现在",
+    "是配置项。故意不叫 admin：登录页显示的是诱饵占位符，猜常见名字的人该猜错。"
+  ],
+  "console_account": "vigil",
+
   "_comment_extra_hosts": [
     "除 public_host 及其子域外，控制台还接受哪些 Host（顶点域名、别名、",
     "同一台机器上的其它站点）。仅在反代之后才可达。"

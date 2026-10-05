@@ -134,6 +134,13 @@ DEFAULTS: dict = {
     #: fact this repository does not carry.
     "server_lat": 0.0,
     "server_lon": 0.0,
+    #: The account name the console expects, checked before the password.
+    #: Configuration, not a literal: it used to be the operator's own site
+    #: name written as a \u escape, which is the same disclosure in a
+    #: different spelling. Deliberately not "admin" -- the login page shows a
+    #: decoy placeholder, and a guesser who tries the obvious name should be
+    #: wrong.
+    "console_account": "vigil",
 
     # ── quick links rendered by the management page ────────────────────
     # ``local`` entries are only reachable through the panel's gateway, so

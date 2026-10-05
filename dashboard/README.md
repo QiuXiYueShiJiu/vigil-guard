@@ -63,13 +63,19 @@ sudo bash dashboard/deploy/install.sh --host status.example.com --site-name "状
 | 实时态势主页 | `https://<public_host>/` | 游客免登录 |
 | 管理控制台 | `https://<public_host>/admin.html` | 管理员登录 |
 
-**登录账号与密码都不在源码里，也没有默认值。** 服务端只保存 PBKDF2 派生值
-（`/var/lib/vigil-dashboard/dashboard-password.json`，0600）：
+**登录账号与口令都不在源码里。** 账号来自配置 `console_account`（默认
+`vigil`，故意不叫 `admin` —— 登录页显示的是诱饵占位符，猜常见名字的人该猜错）；
+口令用 `vigil-dash set-password` 设置，服务端只保存摘要
+（`/var/lib/vigil-dashboard/dashboard-password.json`，0600；默认 SHA-256，
+`--algo crypt` 可换成加盐的 crypt 哈希）：
 
 ```bash
-vigil-dash set-password          # 交互式输入
-vigil-dash clear-password        # 回到「没有账号，谁都进不去」的状态
+vigil-dash set-password          # 交互式输入；这是唯一有效的凭据
+vigil-dash clear-password        # 删除口令 —— 之后控制台谁都进不去
 ```
+
+**服务器的 root 密码不会被接受**（早期版本会，那等于给登录页开了第二扇门，
+所以去掉了）。忘记口令就重新 `set-password`，不需要知道旧的。
 
 ## 2. 结构
 

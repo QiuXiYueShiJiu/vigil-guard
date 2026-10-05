@@ -2,8 +2,8 @@
 """Operator CLI for the vigil console.
 
     vigil-dash status              what the service thinks of itself
-    vigil-dash set-password        set a console-only password (root not needed)
-    vigil-dash clear-password      go back to "password follows root"
+    vigil-dash set-password        set the console password (root is not consulted)
+    vigil-dash clear-password      remove it -- after that nobody can sign in
     vigil-dash sessions            how many browser sessions are open
     vigil-dash kick                sign every browser out
     vigil-dash sites               list sites and their switch state
@@ -38,10 +38,10 @@ def cmd_status(_args) -> int:
     # Opening is lazy, so touching `available` is what resolves the path.
     geo.geo.available
     print("GeoIP           %s" % (geo.geo.path or "未找到（离线定位不可用）"))
-    print("控制台密码      %s" % ("独立设置（%s）"
+    print("控制台密码      %s" % ("已设置（%s）"
                                   % settings.PASSWORD_FILE
                                   if auth.auth.dashboard_password_set()
-                                  else "跟随 root（/etc/shadow）"))
+                                  else "未设置 —— 现在没有任何口令可以登录"))
     print("活跃会话        %d" % auth.auth.session_count())
     print("威胁账本        封禁 %d / 累计 %d / 事件 %d"
           % (snapshot["live_bans"], snapshot["bans_total"], snapshot["events"]))
@@ -71,14 +71,16 @@ def cmd_set_password(args) -> int:
         return 1
     auth.auth.set_dashboard_password(password, method=args.algo)
     auth.auth.destroy_all()
-    print("已设置控制台独立密码（%s），所有会话已注销。" % args.algo)
-    print("root 密码仍然可以直接登录；要恢复“跟随 root”，执行 vigil-dash clear-password")
+    print("已设置控制台密码（%s），所有会话已注销。" % args.algo)
+    print("这是唯一有效的凭据：root 密码不会被接受。删除用 vigil-dash clear-password"
+          "（删除后控制台谁都进不去）。")
     return 0
 
 
 def cmd_clear_password(_args) -> int:
     auth.auth.clear_dashboard_password()
-    print("已删除独立密码，控制台密码重新跟随 root（/etc/shadow）。")
+    print("已删除控制台密码。现在没有任何口令可以登录，"
+          "请用 vigil-dash set-password 重新设置。")
     return 0
 
 
@@ -390,7 +392,7 @@ def main() -> int:
     sp = sub.add_parser("unlock", help="清除登录限速（忘记失败次数）")
     sp.add_argument("ip", nargs="?", default="", help="只清除某个来源，省略则全部")
     sp.set_defaults(func=cmd_unlock)
-    sub.add_parser("clear-password", help="恢复为跟随 root 密码").set_defaults(
+    sub.add_parser("clear-password", help="删除控制台密码（之后无人可登录）").set_defaults(
         func=cmd_clear_password)
     sub.add_parser("sites", help="列出站点与开关状态").set_defaults(func=cmd_sites)
 
