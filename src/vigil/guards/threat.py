@@ -327,8 +327,16 @@ class Settings:
             self._rf(["threat.http.burst_threshold"], 100), 100, minimum=1)
         self.http_burst_window = _int(
             self._rf(["threat.http.burst_window"], 60), 60, minimum=1)
-        self.http_flood_threshold = _int(
-            self._rf(["threat.http.flood_threshold"], 500), 500, minimum=1)
+        _flood = self._rf(["threat.http.flood_threshold"], 1200)
+        # M13：旧版本的默认值会被 save() 写进 config.json，于是「改默认值」这类
+        # 修复对已装好的机器**永远不生效**（实测线上仍是 500，而新默认是 1200）。
+        # 值恰好等于旧默认值时，按「从未被显式设置」处理，迁移到新默认。
+        try:
+            if int(_flood) == 500:
+                _flood = 1200
+        except (TypeError, ValueError):
+            pass
+        self.http_flood_threshold = _int(_flood, 1200, minimum=1)
         self.http_flood_window = _int(
             self._rf(["threat.http.flood_window"], 60), 60, minimum=1)
 
@@ -398,6 +406,16 @@ class Settings:
             self._r("threat.instant_ban_seconds", derived_instant,
                     in_schema=False),
             derived_instant, minimum=1))
+        # 两次「升级」之间至少间隔这么久；同一轮突发只算一次违规。
+        self.escalation_interval = _int(
+            self._r("threat.escalation_interval", 600, in_schema=False), 600,
+            minimum=0)
+        # 浏览器形状豁免：若窗口内的请求几乎都被正常服务、且路径分散，
+        # 那是人在用管理台，不是攻击。见 _looks_like_browsing()。
+        self.browser_exempt = bool(
+            self._r("threat.http.browser_exempt", True, in_schema=False))
+        self.flood_floor = _int(
+            self._r("threat.http.flood_floor", 600), 600, minimum=1)
         self.offense_decay = _int(
             self._r("threat.offense_decay", 86400, in_schema=False), 86400,
             minimum=60)
@@ -571,7 +589,17 @@ class Whitelist:
         self.reload(entries)
 
     def reload(self, entries=None) -> None:
-        entries = list(entries or [])
+        """Replace the entries. ``None`` means "re-read from the caller's
+        source", which for a bare call is impossible -- so it **keeps** what is
+        already loaded rather than clearing it.
+
+        Clearing on a no-argument call is a footgun with teeth: a reload path
+        that forgets to pass the list silently disables the entire whitelist,
+        and the symptom is "I added myself to the whitelist and got banned".
+        """
+        if entries is None:
+            return
+        entries = list(entries)
         v4, v6, ips, bad = [], [], set(), []
         for item in entries:
             text = str(item).strip()
@@ -1013,6 +1041,9 @@ LOG_OFFSETS = paths.STATE_STATE / "log-offsets.json"
 #: somewhere a restart wipes.
 UNBAN_REQUESTS = paths.STATE_STATE / "unban-requests.jsonl"
 
+#: 从「原因」文本里取出开头的地址，用于按来源给姿态喂食去重。
+_IP_LEAD = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{6,})\b")
+
 #: How often the daemon drains CLI unban requests. Deliberately far shorter
 #: than the housekeeping cycle: an unban is an operator instruction, and one
 #: that visibly works and then silently comes back is worse than one that
@@ -1369,10 +1400,12 @@ class ThreatState:
     """
 
     def __init__(self, path, decay: int, max_ips: int, log=None,
-                 persist: bool = True):
+                 persist: bool = True, escalation_interval: int = 600):
         self.path = Path(path)
         self.decay = max(60, int(decay))
         self.max_ips = max(100, int(max_ips))
+        # 两次「升级」之间的最小间隔；同一轮突发只算一次违规（见 note_offense）
+        self.escalation_interval = max(0, int(escalation_interval))
         self.log = log
         self.persist = persist
         self.lock = threading.RLock()
@@ -1428,13 +1461,31 @@ class ThreatState:
 
     # -- mutation ----------------------------------------------------------
     def note_offense(self, ip: str, now=None) -> int:
+        """Count one offence -- but not the same burst over and over.
+
+        The escalation ladder is meant to punish *repeat* behaviour over time.
+        Without a floor on how often an offence may be counted, one burst walks
+        the whole ladder on its own: every request that crosses the threshold
+        increments again, so a single second produces several "repeat" offences
+        and jumps straight to the maximum ban. Measured on a real host: a normal
+        admin console polling at ~4 req/s was counted as four offences at
+        05:45:16 and banned for seven days, for one burst. With no interval,
+        the word "repeat" means nothing.
+        """
         now = now or time.time()
         with self.lock:
             entry = self.offenses.get(ip)
             if not entry or now - entry.get("last", 0) > self.decay:
-                entry = {"count": 0, "last": now}
-            entry["count"] += 1
-            entry["last"] = now
+                # 新的一轮：第一次违规**一定**计数（早先写成 0，导致阶梯
+                # 永远从 0 起步 —— 那样既报错数，也让升级失效）。
+                entry = {"count": 1, "last": now}
+            elif now - entry.get("last", 0) >= self.escalation_interval:
+                entry["count"] += 1
+                entry["last"] = now
+            else:
+                # 同一轮突发：不加违规数，但把窗口往前推 —— 于是持续洪泛
+                # 始终停留为「一次事件」，这才符合「一轮」的语义。
+                entry["last"] = now
             self.offenses[ip] = entry
             return entry["count"]
 
@@ -1831,6 +1882,19 @@ _KIND_ORDER = ("BREACH", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE", "BAN",
                "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
 
 
+def _ban_title(events) -> str:
+    """「已自动封禁 N 个攻击源」，N 是独立来源数。
+
+    事件数大于来源数时补一句升级次数 —— 否则同一个 IP 的阶梯升级会被读成
+    「有四个攻击者」，而排查时这两个含义完全不同。
+    """
+    ips = {str(e.get("ip") or "") for e in (events or [])}
+    ips.discard("")
+    n, ev = len(ips), len(events or [])
+    extra = "（%d 次升级）" % ev if ev > n else ""
+    return "已自动封禁 %d 个攻击源%s" % (n, extra)
+
+
 class EventReporter:
     """Queue events from detector threads; send them from a dedicated thread.
 
@@ -1921,7 +1985,9 @@ class EventReporter:
             "BREACH": "疑似爆破成功，请立即核查",
             "BAN_FAIL": "封禁失败（未生效，需人工确认）",
             "DIST": "检测到分布式爆破攻击",
-            "BAN": "已自动封禁 %d 个攻击源" % len(groups.get("BAN", [])),
+            # 按**独立来源**计数。原来数的是事件条数，于是同一个 IP 被升级
+            # 四次就写成「已自动封禁 4 个攻击源」—— 实测误导过一次排查。
+            "BAN": _ban_title(groups.get("BAN", [])),
             "SSH": "SSH 登录事件 %d 条" % len(groups.get("SSH", [])),
             "OFFWHITELIST": "非白名单 IP 成功登录",
             "BREAKER": "风控熔断触发",
@@ -2158,9 +2224,16 @@ class ThreatDaemon:
             trigger=self.settings.posture_trigger,
             hold=self.settings.posture_hold,
             log=self.log)
+        #: 按来源的滚动请求视图：(ts, status, path)。用于区分「人在浏览」
+        #: 与「洪水」。有上限，免得被洪水撑爆内存。
+        self._browse = {}
+        self._browse_max = 400
+        #: 每个来源最近一次喂姿态的时间（见 _note_attack）
+        self._posture_fed = {}
         self.state = ThreatState(paths.THREAT_STATE, self.settings.offense_decay,
                                  self.settings.max_tracked_ips, self.log,
-                                 persist=not dry_run)
+                                 persist=not dry_run,
+                                 escalation_interval=self.settings.escalation_interval)
         self.enforcer = Enforcer(self.settings.ipset_set,
                                  self.settings.iptables_chain,
                                  self.settings.ipset_program,
@@ -2582,6 +2655,24 @@ class ThreatDaemon:
         """
         if not self.settings.posture_enabled:
             return
+        # 一次突发只能把姿态抬起一次。
+        #
+        # `ban()` 每调用一次就喂一次姿态，而一轮突发会让**同一个 IP** 在一秒内
+        # 产生几十次 ban()（实测单秒最多 56 条）→ 姿态被抬升 N/trigger 次
+        # （实测日志里的「高压防护 (15)」「(37)」），随后 thr() 把所有阈值打对折：
+        # ssh_max_failures 5→2、http_burst 100→50、exploit_low 10→5。结果是攻击者
+        # 在别处踩一次线，正常管理员**输错两次密码**就被封 —— 而且这个姿态又被
+        # 误判继续喂养，形成正反馈。
+        #
+        # 按来源去重（与 note_offense 同一处理思路）：同一地址在冷却期内只计一次。
+        _m = _IP_LEAD.search(why or "")
+        if _m:
+            _ip = _m.group(1)
+            _now = time.time()
+            _last = self._posture_fed.get(_ip, 0)
+            if _now - _last < self.settings.escalation_interval:
+                return
+            self._posture_fed[_ip] = _now
         try:
             raised = self.posture.note(weight)
         except (OSError, ValueError):
@@ -2720,6 +2811,12 @@ class ThreatDaemon:
                             return
                         break
 
+        # 记录滚动视图供洪泛判定区分形状（有上限，免得被洪水撑爆）
+        _rec = self._browse.setdefault(ip, [])
+        _rec.append((time.time(), status, request))
+        if len(_rec) > self._browse_max:
+            del _rec[:-self._browse_max]
+
         if status in SCAN_STATUS:
             # Defect #13: report the real class (5xx must not print as 4xx).
             cls = "%dxx" % (status // 100)
@@ -2741,13 +2838,63 @@ class ThreatDaemon:
             # 常规错误答复：记账供观察，但不作为封禁证据。见 SCAN_STATUS 与
             # ROUTINE_STATUS 上方关于这次误报的说明。
             self.bump_stat("http_routine_%dxx" % (status // 100))
+        # 收紧有个下限。管理台/监控页的正常轮询本来就有几 req/s（实测一个
+        # 管理页 60 秒内 259 次），把阈值压到那以下，等于「打开一个页面就算
+        # 攻击」—— 误伤对象恰好是最活跃的合法使用者。
         over, count = self.windows.bump(
             ip, "http_flood", self.settings.http_flood_window,
-            self.thr(self.settings.http_flood_threshold))
+            max(self.settings.flood_floor,
+                self.thr(self.settings.http_flood_threshold)))
         if over:
-            self.ban(ip, "请求洪泛（%d 次/%ds）"
-                     % (count, self.settings.http_flood_window),
-                     detector="http_flood")
+            # 越过阈值只是「量到了」，还不足以封禁 —— 先问一句：这是人在用
+            # 管理台，还是洪水？频次本身分不出来（管理台轮询也能到几 req/s），
+            # 但**构成**分得出来：浏览器几乎全部拿到 2xx、且路径很分散；
+            # 扫描与洪水则以错误为主、路径高度集中。
+            #
+            # 这是「宁可漏封也不误封」的落点：识别为浏览时**不封**，只记一条
+            # 观察。白名单只是第二层保障，第一层应当是判定本身不误伤。
+            if self._looks_like_browsing(ip):
+                if self.cooldowns.allow("browse:%s" % ip):
+                    self.audit("[观察] %s 请求较密但形态像正常浏览（%d 次/%ds），不封禁"
+                               % (ip, count, self.settings.http_flood_window))
+                self.bump_stat("flood_skipped_browsing")
+            else:
+                self.ban(ip, "请求洪泛（%d 次/%ds）"
+                         % (count, self.settings.http_flood_window),
+                         detector="http_flood")
+
+    def _looks_like_browsing(self, ip: str, request: str = "", status: int = 0) -> bool:
+        """窗口内的流量是否具备「人在用页面」的形状。
+
+        判据刻意保守（要求**同时**满足），因为这两条在真实浏览器上几乎必然
+        成立，而在扫描器/洪水上几乎必然不成立：
+
+        * 2xx 比例 ≥ 80% —— 一个正常客户端拿到的是内容，不是错误；
+        * 独立路径 ≥ 5 —— 页面加载天然分散在 HTML/CSS/JS/接口上。
+
+        任一条不满足就返回 False，交回原有的封禁逻辑 —— 漏封一个攻击者，
+        远比封掉一个正在看后台的人轻。
+        """
+        if not self.settings.browser_exempt:
+            return False
+        rec = self._browse.get(ip) or []
+        now = time.time()
+        win = max(1, int(self.settings.http_flood_window))
+        recent = [r for r in rec if now - r[0] <= win]
+        if len(recent) < 20:
+            return False                      # 样本太少，不做判断
+        ok = sum(1 for r in recent if 200 <= (r[1] or 0) < 400)
+        paths = {(r[2] or "").split("?")[0] for r in recent}
+        if ok / float(len(recent)) < 0.8:
+            return False
+        # 门槛是 2 而不是 5。原来写 5 恰好把**本次事故的形态**排除在外：
+        # 一个管理台前端只轮询两个接口（`/dsh-whale/wait.json` 与
+        # `last-turn.json`），路径多样性天然很低，于是"浏览豁免"够不着它 ——
+        # 那次能不出事，靠的是阈值数字，不是形状判断。真正要区分的不是
+        # "路径多不多"，而是"这些请求是不是被正常服务了"。
+        if len(paths) < 2:
+            return False
+        return True
 
     # -- threads -----------------------------------------------------------
     def save_log_offsets(self) -> None:
@@ -2860,6 +3007,24 @@ class ThreatDaemon:
             except Exception as exc:                       # noqa: BLE001
                 self.log.warn("解封监听异常：%s", exc)
 
+    def _reload_whitelist(self) -> int:
+        """Re-read ``threat.whitelist`` from disk and apply it to the live object.
+
+        The whitelist is built once at construction; nothing re-read it. So
+        `vigil threat whitelist add` wrote the config and the running daemon
+        went on banning that address -- which is exactly the shape of the
+        outage: config says whitelisted, ipset says banned, all pages time out.
+        """
+        from ..core.config import load as _load_cfg
+        try:
+            cfg = _load_cfg()
+            entries = list((cfg or {}).get("threat.whitelist", []) or [])
+        except Exception as e:                                     # noqa: BLE001
+            self.log.warn("重读白名单失败：%s" % e)
+            return 0
+        self.whitelist.reload(entries)
+        return len(entries)
+
     def apply_unban_requests(self) -> int:
         """Drain unban requests written by the CLI. Returns how many applied.
 
@@ -2888,6 +3053,19 @@ class ThreatDaemon:
             try:
                 req = json.loads(line)
             except ValueError:
+                continue
+            # 白名单重载请求。必须是**运行时**动作：本进程的白名单对象是构造
+            # 时建的，`vigil threat whitelist add` 改的是磁盘配置 —— 实测因此
+            # 出现过「配置里明明有白名单、ipset 里照样封着」。告警里教的恢复
+            # 步骤不能是一条不生效的路。
+            if req.get("whitelist_reload"):
+                try:
+                    n = self._reload_whitelist()
+                    self._purge_whitelisted_bans()
+                    self.audit("[白名单] 已按命令行请求重载（%d 条），并解除与之重叠的封禁" % n)
+                    applied += 1
+                except Exception as e:                             # noqa: BLE001
+                    self.log.warn("白名单重载失败：%s" % e)
                 continue
             ip = str(req.get("ip", "")).strip()
             if ip and self._valid_ip(ip):
@@ -2946,16 +3124,36 @@ class ThreatDaemon:
                 pass
 
     def _source_plan(self):
+        """One tail thread per **distinct file**.
+
+        Deduplicated by realpath, because the same access log is routinely
+        listed under more than one heading (a site's own `.log` and the panel's
+        aggregate `access.log` are often the same file). Untailed twice, every
+        request is counted twice, and every per-IP window threshold is
+        effectively halved -- silently, while the banner still reports exactly
+        the number of sources you configured.
+
+        Measured on a real host: the minute that produced a seven-day ban of the
+        operator's own address contained 146 requests in *each* of two log files
+        -- the same 146 requests.
+        """
         sources = self.settings.log_sources
-        plan = []
-        for path in sources.get("auth", []):
-            plan.append((path, self.handle_ssh, "auth"))
-        for path in sources.get("nginx_access", []):
-            plan.append((path, self.handle_http, "http"))
-        for path in sources.get("panel", []):
-            plan.append((path, self.handle_http, "panel"))
-        for path in sources.get("decoy", []):
-            plan.append((path, self.handle_decoy, "decoy"))
+        handlers = {"auth": self.handle_ssh, "nginx_access": self.handle_http,
+                    "panel": self.handle_http, "decoy": self.handle_decoy}
+        plan, seen = [], {}
+        for kind in ("auth", "nginx_access", "panel", "decoy"):
+            for path in sources.get(kind, []):
+                try:
+                    key = os.path.realpath(str(path))
+                except OSError:
+                    key = str(path)
+                if key in seen:
+                    self.log.warn(
+                        "日志源重复，已忽略第二个（否则计数翻倍）：%s —— 已由 %s 跟随"
+                        % (path, seen[key]))
+                    continue
+                seen[key] = kind
+                plan.append((path, handlers[kind], kind))
         return plan
 
     def run(self) -> int:
@@ -3486,3 +3684,22 @@ def unban(cfg, ip: str, log=None) -> tuple:
 
 if __name__ == "__main__":                              # pragma: no cover
     sys.exit(main())
+
+
+def request_whitelist_reload(log=None) -> bool:
+    """Ask a running daemon to re-read the whitelist and lift overlapping bans.
+
+    Called by `vigil threat whitelist add/remove`. Without this the operator
+    had to know to restart the service -- and the alert text told them to run
+    the command, not to restart anything. Measured on a real host: the config
+    listed the operator's address while the enforcement set kept blocking it.
+    """
+    try:
+        os.makedirs(os.path.dirname(str(UNBAN_REQUESTS)), exist_ok=True)
+        with open(str(UNBAN_REQUESTS), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"whitelist_reload": True,
+                                 "ts": time.time()}) + "\n")
+        return True
+    except OSError as e:
+        log and log.warn("写入白名单重载请求失败：%s" % e)
+        return False

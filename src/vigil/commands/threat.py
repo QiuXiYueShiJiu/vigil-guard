@@ -322,6 +322,15 @@ def cmd_whitelist(args) -> int:
 
     raise VigilError("未知操作: %s" % action)
 
+    # 让运行中的守护进程立刻重载白名单并解除重叠封禁 —— 不然「加了白名单却
+    # 还在被封」，运维会以为配置写错了。见 request_whitelist_reload 的注释。
+    try:
+        from ..guards.threat import request_whitelist_reload
+        if request_whitelist_reload():
+            ui.note("已通知运行中的守护进程重载白名单")
+    except Exception as e:                                         # noqa: BLE001
+        ui.warn("通知守护进程失败（重启服务后生效）：%s" % e)
+
 
 def _sync_fail2ban(cfg) -> None:
     """Optionally mirror the whitelist into fail2ban's ignoreip.

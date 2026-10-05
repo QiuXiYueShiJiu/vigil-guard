@@ -5708,6 +5708,199 @@ class TestWebStatusPage(unittest.TestCase):
         self.assertIn("noindex", body)
 
 
+class TestOneBurstIsOneOffence(unittest.TestCase):
+    """One incident must count as one incident.
+
+    Measured on a real host at 05:45:16: a normal admin console polling at
+    ~4 req/s crossed the flood threshold and was counted as **four offences in
+    the same second**, which walked the escalation ladder straight to the
+    seven-day rung. The operator's own IP was then banned and every page on the
+    box timed out. The ladder exists to punish *repeat* behaviour over time;
+    without a floor on how often an offence may be counted, "repeat" is
+    meaningless and one burst is enough to reach the top of it.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=_P(self.tmp.name) / "c.json",
+                                  secrets_path=_P(self.tmp.name) / "s.json")
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+
+    def test_a_burst_in_one_second_counts_once(self):
+        now = 1_800_000_000.0
+        counts = [self.d.state.note_offense("203.0.113.7", now=now + i * 0.1)
+                  for i in range(5)]
+        self.assertEqual([1, 1, 1, 1, 1], counts,
+                         "同一秒内的重复触发被算成了多次违规")
+
+    def test_the_first_offence_is_one_not_zero(self):
+        """It was 0 for a while, which both misreported and disabled the ladder."""
+        self.assertEqual(1, self.d.state.note_offense("203.0.113.7",
+                                                      now=1_800_000_000.0))
+
+    def test_repeat_behaviour_after_the_interval_still_escalates(self):
+        now = 1_800_000_000.0
+        self.d.state.note_offense("203.0.113.7", now=now)
+        interval = self.d.settings.escalation_interval
+        self.assertEqual(2, self.d.state.note_offense("203.0.113.7",
+                                                      now=now + interval + 1))
+        self.assertEqual(3, self.d.state.note_offense("203.0.113.7",
+                                                      now=now + 2 * interval + 2))
+
+    def test_a_sustained_flood_stays_at_one_offence(self):
+        """`last` moves forward even when the count does not, so a long flood
+        is one incident for as long as it lasts."""
+        now = 1_800_000_000.0
+        for i in range(200):
+            n = self.d.state.note_offense("203.0.113.7", now=now + i * 30)
+        self.assertEqual(1, n, "持续 100 分钟的洪泛被算成了多次违规")
+
+    def test_one_burst_can_no_longer_reach_the_recidivist_rung(self):
+        """The headline defect: four same-second offences used to reach the
+        longest ban in the ladder."""
+        first = self.d.ban_seconds_for("http_flood", 1, 1)
+        recidivist = self.d.ban_seconds_for(
+            "http_flood", self.d.settings.recidivist_bans, 1)
+        self.assertLess(first, recidivist)
+        self.assertLessEqual(first, 3600,
+                             "一次突发不该超过一小时，实际 %s 秒" % first)
+
+    def test_the_report_counts_sources_not_events(self):
+        same = [{"ip": "203.0.113.7"} for _ in range(4)]
+        self.assertIn("1 个攻击源", self.t._ban_title(same))
+        self.assertIn("4 次升级", self.t._ban_title(same))
+        four = [{"ip": "203.0.113.%d" % i} for i in range(1, 5)]
+        self.assertIn("4 个攻击源", self.t._ban_title(four))
+        self.assertNotIn("升级", self.t._ban_title(four))
+
+    def test_tightened_thresholds_cannot_sink_below_the_floor(self):
+        """Posture tightening must not drop the flood threshold under a normal
+        admin console's polling rate -- that is 'opening a page is an attack'."""
+        effective = max(self.d.settings.flood_floor,
+                        self.d.thr(self.d.settings.http_flood_threshold))
+        self.assertGreaterEqual(effective, self.d.settings.flood_floor)
+        self.assertGreaterEqual(effective, 100,
+                                "收紧后的洪泛阈值太低：%s" % effective)
+
+
+class TestWhitelistTakesEffectWithoutARestart(unittest.TestCase):
+    """`whitelist add` must actually unblock, without a restart.
+
+    Measured on a real host: the config file listed the operator's address while
+    the enforcement set kept blocking them, so every page timed out. The daemon
+    builds its whitelist object at construction and had no runtime reload path,
+    and the alert text told the operator to run the command -- not to restart
+    anything. A recovery step that does not work is worse than none.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        self._real = self.t.UNBAN_REQUESTS
+        self.t.UNBAN_REQUESTS = self.root / "requests.jsonl"
+        self.addCleanup(setattr, self.t, "UNBAN_REQUESTS", self._real)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+
+    def test_a_reload_request_is_written_and_drained(self):
+        self.assertTrue(self.t.request_whitelist_reload())
+        self.assertEqual(1, self.d.apply_unban_requests())
+        self.assertEqual("", self.t.UNBAN_REQUESTS.read_text())
+
+    def test_a_reload_request_is_not_replayed(self):
+        """One-shot, like an unban: replaying would silently undo later work."""
+        self.t.request_whitelist_reload()
+        self.d.apply_unban_requests()
+        self.assertEqual(0, self.d.apply_unban_requests())
+
+    def test_a_daemon_with_a_stale_whitelist_stops_banning_after_reload(self):
+        """The exact production failure: in-memory whitelist empty, config full."""
+        ip = "27.221.187.226"
+        self.assertFalse(self.d.whitelist.allowed(ip))
+        self.cfg.set("threat.whitelist", [ip])
+        self.t.request_whitelist_reload()
+        self.d.apply_unban_requests()
+        self.assertTrue(self.d.whitelist.allowed(ip),
+                        "重载后白名单仍未生效 —— 这正是那次全站超时的原因")
+
+
+class TestOneSignalIsOneSignal(unittest.TestCase):
+    """One incident must not be counted as many, anywhere.
+
+    Three separate counters used to amplify a single burst: the offence ladder,
+    the attack posture, and the log sources themselves. Each was verified
+    against the real host log that produced the seven-day ban.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+
+    def test_one_burst_raises_the_posture_once(self):
+        """A burst calls ban() dozens of times a second; the posture is a
+        machine-wide switch that halves thresholds, so feeding it per call
+        turned one attacker into a machine-wide lockdown."""
+        seen = []
+        real = self.d.posture.note
+        self.d.posture.note = lambda w: (seen.append(w), real(w))[1]
+        for i in range(20):
+            self.d._note_attack(1, "请求洪泛（%d 次/60s）203.0.113.7" % (250 + i))
+        self.assertEqual(1, len(seen),
+                         "同一来源的一轮突发把姿态喂了 %d 次" % len(seen))
+
+    def test_a_different_source_still_raises_the_posture(self):
+        seen = []
+        real = self.d.posture.note
+        self.d.posture.note = lambda w: (seen.append(w), real(w))[1]
+        self.d._note_attack(1, "扫描 203.0.113.7")
+        self.d._note_attack(1, "扫描 198.51.100.9")
+        self.assertEqual(2, len(seen), "不同来源应各自计入")
+
+    def test_duplicate_log_sources_are_tailed_once(self):
+        """The same access log listed twice doubled every count -- the
+        amplifier that turned a ~2.4 req/s console into "259 per minute"."""
+        import os as _os
+        f = self.root / "access.log"
+        f.write_text("")
+        self.d.settings.log_sources = {
+            "auth": [], "nginx_access": [str(f)],
+            "panel": [str(f)], "decoy": []}
+        plan = self.d._source_plan()
+        self.assertEqual(1, len(plan), "同一个文件被跟随了 %d 次" % len(plan))
+
+    def test_a_stored_old_default_migrates_to_the_new_one(self):
+        """`save()` persists the whole merged tree, so an old default value in
+        config.json permanently shadowed the new one. Measured live: the host
+        still ran 500 while the fix said 1200."""
+        cfg = vconfig.Config(path=self.root / "old.json",
+                             secrets_path=self.root / "olds.json")
+        cfg.set("threat.http.flood_threshold", 500)
+        d = self.t.ThreatDaemon(cfg, log=_QuietLog(), dry_run=True, echo=False)
+        self.assertEqual(1200, d.settings.http_flood_threshold)
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 
@@ -7007,12 +7200,24 @@ class TestSelfProtection(unittest.TestCase):
 
     def setUp(self):
         from vigil.guards.checks import selfcheck
+        from vigil import gates
         self.sc = selfcheck
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         base = self.root / "state"
         self.cfg = vconfig.Config(path=self.root / "config.json",
                                   secrets_path=self.root / "secrets.json")
+        # `_targets()` also walks whatever this program has generated on the
+        # *host*.  That made these tests depend on machine state: after any
+        # nginx/gate work the real artifacts no longer matched the stored
+        # baseline, so even the "establish a baseline" run reported CRIT and
+        # the suite went red for a reason that had nothing to do with the code
+        # under test.  Pin it to empty; the host-artifact question is covered by
+        # the check's own tests, not by a unit test about the temp tree.
+        self._real_artifacts = gates.generated_artifacts
+        gates.generated_artifacts = lambda *a, **k: []
+        self.addCleanup(setattr, gates, "generated_artifacts",
+                        self._real_artifacts)
 
     def tearDown(self):
         self.tmp.cleanup()

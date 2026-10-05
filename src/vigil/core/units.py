@@ -25,8 +25,7 @@ UNIT_TEMPLATE_SERVICE = """[Unit]
 Description={description}
 After=network-online.target{after_extra}
 Wants=network-online.target
-{unit_extra}
-[Service]
+{unit_extra}{unit_extra_lines}[Service]
 Type={stype}
 # The package is deployed to a prefix that is not on the default sys.path,
 # so tell the interpreter where to find it. Without this every unit fails
@@ -116,6 +115,9 @@ def service(name: str, description: str, exec_lines, stype: str = "simple",
     alert could still get out. These settings are the answer that does not
     depend on luck.
     """
+    # [Unit] 段的附加键（目前只有 StartLimitIntervalSec，见下）
+    unit_extra_lines = ""
+
     restart_lines = ""
     if restart and stype != "oneshot":
         restart_lines = ("Restart=%s\nRestartSec=%d\n"
@@ -145,6 +147,7 @@ def service(name: str, description: str, exec_lines, stype: str = "simple",
         description=description,
         after_extra=("\nAfter=" + after_extra) if after_extra else "",
         unit_extra=unit_extra,
+        unit_extra_lines=unit_extra_lines,
         stype=stype,
         exec_lines=exec_lines.rstrip(),
         restart_lines=restart_lines,

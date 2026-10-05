@@ -342,6 +342,15 @@ def cmd_uninstall(args) -> int:
         ui.note("没有发现需要撤回的网页配置")
 
     from ..core import paths
+
+    # 删配置之前，先把白名单**留在会被保留的地方并念出来**。
+    #
+    # 这条是拿一次真实停服换来的：卸载删掉 /etc/vigil 时把 threat.whitelist
+    # 一并带走，重装后白名单为空，程序于是按正常规则把运维自己的 IP 也封了
+    # —— 全部管理页面连接超时，因为 iptables 里本程序的 ipset DROP 排在
+    # ufw 之前。白名单是唯一「程序不该动这些地址」的知识，丢了就只剩误伤。
+    _preserve_whitelist()
+
     if args.purge:
         import shutil
         if not args.dry_run:
@@ -461,6 +470,7 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
     import shutil
     from pathlib import Path
 
+    unrealised = []
     # 先让各子系统自己收拾（它们知道自己的片段在哪、也负责重载）
     for label, fn in (("诱导面", "lure"), ("诱饵", "decoy"),
                       ("请求卫生", "hygiene"), ("Web 防护", "shield")):
@@ -471,9 +481,10 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
                              fromlist=["uninstall"])
             if not dry_run:
                 getattr(mod, "uninstall")()
-        except Exception:                                      # noqa: BLE001
-            # 子系统自己清理失败不影响后面的白名单清扫
-            pass
+        except Exception as e:                                 # noqa: BLE001
+            # 子系统自己清理失败不影响后面的白名单清扫，但**不能不说** ——
+            # 静默吞掉会让人以为那一层已经清干净了。
+            unrealised.append("%s：%s" % (label, str(e)[:80]))
 
     # 再按名字白名单扫一遍：子系统可能改过名、可能被禁用、也可能上次没清干净。
     #
@@ -497,7 +508,7 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
 
     ordered = includers + zones
     if not ordered or dry_run:
-        return [str(p) for p in ordered]
+        return [str(p) for p in ordered] + unrealised
 
     # 隔离区保留相对路径，搬回去才能原位 —— 之前用 `removed-<文件名>` 平铺，
     # 同名文件（四个站点目录都有 vigil-deny.conf）互相覆盖，还原时丢了三个。
@@ -555,4 +566,38 @@ def _withdraw_artifacts(dry_run: bool = False) -> list:
 
     shell.run(["systemctl", "reload", "nginx"], timeout=30)
     shutil.rmtree(str(quarr), ignore_errors=True)
-    return found
+    return found + unrealised
+
+
+def _preserve_whitelist() -> list:
+    """把白名单写到日志目录（卸载会保留）并打印出来。
+
+    返回被保留的条目，便于调用方提示。
+    """
+    from ..core import paths
+    from ..core.config import load as _load
+
+    try:
+        cfg = _load()
+    except Exception:                                              # noqa: BLE001
+        return []
+    wl = list(((cfg or {}).get("threat") or {}).get("whitelist") or [])
+    if not wl:
+        return []
+    try:
+        dest = Path(paths.LOG) / "whitelist-preserved.json"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(__import__("json").dumps(wl, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError:
+        dest = None
+    ui.out()
+    ui.warning("即将删除配置，其中包含**来源白名单** —— 这是唯一一份"
+               "「本程序不该对这些地址动手」的知识。")
+    if dest:
+        ui.note("已保留一份到 %s（重装后可用 `vigil whitelist import` 取回）" % dest)
+    for ip in wl[:12]:
+        ui.out("    %s" % ip)
+    if len(wl) > 12:
+        ui.out("    …… 另有 %d 条" % (len(wl) - 12))
+    return wl

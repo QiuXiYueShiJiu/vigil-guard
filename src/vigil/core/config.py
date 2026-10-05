@@ -247,7 +247,10 @@ DEFAULTS: dict = {
             "exploit_low_window": 300,
             "burst_threshold": 100,
             "burst_window": 60,
-            "flood_threshold": 500,
+            # 浏览器到不了的速率。之前的 500/60s（≈8 req/s）低于一个多标签
+            # 管理台的正常轮询，实测把一个正在看后台的人判成了攻击者。
+            "flood_threshold": 1200,
+            "flood_floor": 600,
             "flood_window": 60,
             # NOTE: the built-in signature tables are intentionally NOT
             # listed here. An empty list is indistinguishable from "the
