@@ -83,10 +83,17 @@ PNG，没有浏览器也能一眼看出地图对不对。`--marks` 的每项是
 `纬度,经度,等级`，等级 0 正常（绿）、1 攻击（红）、2 高压（深红），
 和页面上一致。
 
-另外 `node tools/sim/run-home.mjs`（见 `tools/sim/README.md`）会把真实的
-`map.js` 跑在 DOM 桩上，检查投影出来的南北顺序和纵向跨度。
+另外 `node tools/sim/fits.mjs` 会把真实的 `map.js` 跑在 DOM 桩
+（`tools/dom-stub.mjs`，用真实 HTML 搭出来的）上，逐一断言 8 种画布比例下
+±180° 经度、±84° 纬度都落在画布内 —— 纵向跨度与南北顺序都钉在这里。
+（这一条原先写的是 `tools/sim/run-home.mjs`，那个文件并不存在；命令换成实际
+在跑的那个。）
 
-**改动投影后至少跑一次这两样。** 这次四个 bug 里，有三个是它们抓出来的。
+`tools/sim/` 下还有几个同类检查：`interaction.mjs` 断言**地图手势确实不可用**、
+按钮选中路径可用（见 [README](../README.md) 与 `frontend/assets/map.js` 的
+`GESTURES_ENABLED`），`zoom-align.mjs` 断言缩放全程底图与标记不互相错位。
+
+**改动投影后至少跑一次这些。** 这次四个 bug 里，有三个是它们抓出来的。
 
 ## 数据格式
 
