@@ -5980,6 +5980,126 @@ class TestWebInstallDoesNotClobber(unittest.TestCase):
         self.assertFalse(self.web._generated_vhost(self.root / "missing.conf"))
 
 
+class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
+    """A bundle unpacked into /tmp is not a memory-resident payload.
+
+    Browser automation (Playwright, Puppeteer, Selenium) downloads a browser
+    *release* into a temp directory and runs it from there. By path alone that
+    is the same shape as "a binary executing out of /tmp" -- a real malware
+    signature -- so every automation run produced a WARN:
+
+        chrome(pid ...) 从临时目录运行: /tmp/<dir>/browsers/chromium-<v>/...
+        进程链: chrome ← node-MainThread
+
+    The exemption is structural (release layout **and** a trusted driving
+    process), and these tests also pin the shapes that must **keep** warning,
+    because an exemption that switches the detection off is worse than the
+    false positive it removes.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import util
+        self.util = util
+
+    def _bundle(self, *parts):
+        return os.path.join(tempfile.gettempdir(), "vigil-probe", *parts)
+
+    @staticmethod
+    def _chain(*frames):
+        return [{"pid": p, "comm": c, "cmdline": m} for p, c, m in frames]
+
+    def _with_chain(self, exe, *frames):
+        real = self.util.process_chain
+        self.util.process_chain = lambda pid, depth=6: self._chain(*frames)
+        try:
+            return self.util.browser_automation(frames[0][0], exe)
+        finally:
+            self.util.process_chain = real
+
+    def test_a_release_bundle_driven_by_node_is_recognised(self):
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        got = self._with_chain(exe, (10, "chrome", exe),
+                               (9, "node-MainThread", "node /srv/app/test.js"))
+        self.assertTrue(got, "node 驱动的浏览器发行包应当被识别")
+        self.assertIn("自动化工具链", got)
+
+    def test_a_headless_shell_layout_is_recognised_too(self):
+        exe = self._bundle("ms-playwright", "chromium-1234",
+                           "chrome-linux", "headless_shell")
+        got = self._with_chain(exe, (10, "headless_shell", exe),
+                               (9, "node", "node /srv/app/run.js"))
+        self.assertTrue(got)
+
+    def test_a_bundle_started_by_a_shell_is_not_exempt(self):
+        """A shell launching a browser out of /tmp is exactly the bad shape."""
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        got = self._with_chain(exe, (10, "chrome", exe),
+                               (9, "bash", "bash -c " + exe))
+        self.assertEqual("", got)
+
+    def test_a_random_binary_in_a_temp_dir_is_still_suspicious(self):
+        exe = self._bundle("payload")
+        got = self._with_chain(exe, (10, "payload", exe),
+                               (9, "node", "node /srv/app/test.js"))
+        self.assertEqual("", got, "与浏览器发行包无关的 /tmp 二进制必须照旧告警")
+
+    def test_a_browser_binary_without_the_release_layout_is_still_suspicious(self):
+        exe = self._bundle("chrome")
+        got = self._with_chain(exe, (10, "chrome", exe),
+                               (9, "node", "node /srv/app/test.js"))
+        self.assertEqual("", got, "光有文件名、没有发行布局，不算豁免")
+
+    def test_a_bundle_with_no_automation_ancestor_is_still_suspicious(self):
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        got = self._with_chain(exe, (10, "chrome", exe),
+                               (9, "systemd", "/sbin/init"))
+        self.assertEqual("", got)
+
+    def _run_check(self, hits):
+        from vigil.guards.checks import base, security
+        real = self.util.suspect_procs_detail
+        self.util.suspect_procs_detail = lambda *a, **k: hits
+        try:
+            chk = security.SuspiciousProcesses()
+            return chk.safe_run(base.CheckContext(
+                cfg=None, state={}, env={}, log=_QuietLog(), now=time.time()))
+        finally:
+            self.util.suspect_procs_detail = real
+
+    def test_the_check_stays_ok_when_all_hits_are_automation(self):
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        res = self._run_check([{"pid": 4242, "comm": "chrome", "exe": exe,
+                                "kind": "temp", "automation": "疑似自动化工具链"}])
+        self.assertEqual("OK", res.status)
+        self.assertIn("自动化工具链", res.detail)
+        self.assertIn(exe, res.detail, "降级了也要说清楚看到了什么")
+
+    def test_a_payload_beside_a_bundle_still_warns(self):
+        exe = self._bundle("payload")
+        res = self._run_check([
+            {"pid": 4242, "comm": "chrome",
+             "exe": self._bundle("browsers", "chromium-1234",
+                                 "chrome-linux64", "chrome"),
+             "kind": "temp", "automation": "疑似自动化工具链"},
+            {"pid": 4243, "comm": "payload", "exe": exe,
+             "kind": "temp", "automation": ""},
+        ])
+        self.assertEqual("WARN", res.status)
+        self.assertIn("可疑进程 1 个", res.detail, "豁免的那一个不能计入异常")
+        self.assertIn("payload", res.detail)
+        self.assertIn("自动化工具链", res.detail, "跳过的仍要列出来")
+
+    def test_a_deleted_binary_is_never_exempt(self):
+        res = self._run_check([{"pid": 4244, "comm": "chrome",
+                                "exe": "/usr/bin/chrome",
+                                "kind": "deleted", "automation": ""}])
+        self.assertEqual("WARN", res.status)
+
+
 class TestOneBurstIsOneOffence(unittest.TestCase):
     """One incident must count as one incident.
 

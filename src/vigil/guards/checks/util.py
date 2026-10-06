@@ -338,8 +338,90 @@ def audit_attribution(cfg, basenames, since_ts=None) -> dict:
 # --------------------------------------------------------------------------
 
 
-def suspect_procs(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
-    """Processes running a deleted binary, or running out of a temp dir."""
+#: Executable basenames that are browsers or their headless builds.
+_BROWSER_BINARIES = frozenset({
+    "chrome", "chromium", "chromium-browser", "headless_shell",
+    "chrome-headless-shell", "chrome_crashpad_handler", "firefox",
+    "firefox-bin", "msedge", "msedgewebview2", "opera", "brave",
+})
+
+#: A path component naming a browser *distribution layout*, as opposed to a
+#: random directory. Playwright/Puppeteer/Selenium unpack a versioned release
+#: and run the binary from inside it, so the parents are named things like
+#: ``chromium-1234``, ``chrome-linux64``, ``browsers``, ``ms-playwright``.
+#: This is structure, not a fixed path: the same names appear on any host.
+_BROWSER_LAYOUT_RX = re.compile(
+    r"^(?:browsers?|ms-playwright|playwright|puppeteer"
+    r"|(?:chromium|chrome|firefox|headless[_-]?shell|chrome[_-]headless[_-]shell)"
+    r"(?:[-_.][\w.]*)?)$", re.I)
+
+#: Runtimes that legitimately drive a browser unpacked into a temp dir.
+#: Deliberately does *not* include shells, perl or php: a browser bundle
+#: started by ``bash -c`` is exactly the shape that should keep warning.
+#: Matched against an ancestor's ``comm`` or the basename of its argv[0], so
+#: Node's ``node-MainThread`` counts as ``node``.
+_AUTOMATION_RUNTIME_RX = re.compile(
+    r"^(?:node|nodejs|npm|npx|yarn|pnpm|bun|deno"
+    r"|python3?(?:\.\d+)?|java|dotnet|ruby"
+    r"|playwright|puppeteer|pytest|jest|mocha|vitest|karma|selenium"
+    r"|webdriver|chromedriver|geckodriver|msedgedriver|electron"
+    r")(?:[-_.].*)?$", re.I)
+
+
+def _automation_frame(frame) -> bool:
+    """Is this process one of the runtimes that drives headless browsers?"""
+    comm = str(frame.get("comm") or "")
+    first = ""
+    cmdline = str(frame.get("cmdline") or "")
+    if cmdline:
+        first = os.path.basename(cmdline.split(" ")[0])
+    return any(c and _AUTOMATION_RUNTIME_RX.match(c) for c in (comm, first))
+
+
+def browser_automation(pid, exe: str, depth: int = 6) -> str:
+    """Describe *exe* as a browser-automation bundle, or ``""`` if it is not.
+
+    A browser automation tool downloads a browser *release* into a temp
+    directory and runs it from there. By path alone that is the same shape as
+    "a binary executing out of /tmp", which is a real malware signature -- so
+    every automation run tripped the check.
+
+    The exemption is structural, never path-specific. All three must hold:
+
+      * the executable's basename is a known browser binary, **and**
+      * some parent directory of it names a browser distribution layout
+        (``chromium-<version>``, ``chrome-linux64``, ``browsers``, ...),
+        **and**
+      * an ancestor process is a known automation runtime (node, python,
+        playwright, a webdriver, ...).
+
+    All three, not any one: an arbitrary ELF dropped in ``/tmp`` still warns,
+    a browser binary outside a release layout still warns, and a real browser
+    bundle launched by a shell still warns. Only the shape that automation
+    actually produces is downgraded.
+    """
+    name = os.path.basename(str(exe).rstrip("/"))
+    if name.lower() not in _BROWSER_BINARIES:
+        return ""
+    parts = [p for p in str(exe).split("/") if p]
+    if not any(_BROWSER_LAYOUT_RX.match(p) for p in parts[:-1]):
+        return ""
+    for frame in process_chain(pid, depth):
+        if _automation_frame(frame):
+            return ("疑似自动化工具链：%s 浏览器发行包，由 %s(pid %s) 驱动"
+                    % (name, frame.get("comm") or "?", frame.get("pid")))
+    return ""
+
+
+def suspect_procs_detail(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
+    """Suspicious processes as dicts.
+
+    Each hit is ``{pid, comm, exe, kind, automation}``. ``kind`` is
+    ``"deleted"`` (the binary is gone from disk) or ``"temp"`` (running out of
+    a temp dir); ``automation`` is a non-empty description when the temp-dir
+    hit matches a browser-automation bundle. Only the temp-dir branch can be
+    downgraded -- a genuinely deleted binary is never "probably fine".
+    """
     hits = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -354,11 +436,32 @@ def suspect_procs(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
             # upgrade, panel self-update) leaves the same pattern. Only flag
             # it when the path is genuinely gone.
             if not os.path.exists(real):
-                hits.append("%s(pid %s) 可执行文件已被删除且磁盘上不存在: %s"
-                            % (comm, pid, real))
+                hits.append({"pid": int(pid), "comm": comm, "exe": real,
+                             "kind": "deleted", "automation": ""})
         elif any(exe.startswith(d.rstrip("/") + "/") for d in tmp_dirs):
-            hits.append("%s(pid %s) 从临时目录运行: %s" % (comm, pid, exe))
+            hits.append({"pid": int(pid), "comm": comm, "exe": exe,
+                         "kind": "temp",
+                         "automation": browser_automation(pid, exe)})
     return hits
+
+
+def suspect_line(hit: dict) -> str:
+    """One human-readable line for a :func:`suspect_procs_detail` hit."""
+    if hit.get("kind") == "deleted":
+        return ("%s(pid %s) 可执行文件已被删除且磁盘上不存在: %s"
+                % (hit.get("comm") or "?", hit.get("pid"), hit.get("exe")))
+    return ("%s(pid %s) 从临时目录运行: %s"
+            % (hit.get("comm") or "?", hit.get("pid"), hit.get("exe")))
+
+
+def suspect_procs(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
+    """Every raw hit as a string, automation bundles included.
+
+    Kept as the text-only view of :func:`suspect_procs_detail`; callers that
+    need to tell an automation bundle from a payload should use the detail
+    version, which carries the ``automation`` tag.
+    """
+    return [suspect_line(h) for h in suspect_procs_detail(tmp_dirs)]
 
 
 # --------------------------------------------------------------------------

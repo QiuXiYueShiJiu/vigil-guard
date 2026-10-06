@@ -322,29 +322,48 @@ class SuspiciousProcesses(Check):
 
     def run(self, ctx: CheckContext) -> CheckResult:
         try:
-            hits = util.suspect_procs()
+            hits = util.suspect_procs_detail()
         except OSError as exc:
             return CheckResult(OK, "无法枚举进程：%s" % exc)
         if not hits:
             return CheckResult(OK, "无可疑进程")
 
+        # A browser automation tool unpacks a browser release into a temp
+        # directory and runs it from there -- structurally the same as "a
+        # binary running out of /tmp". `browser_automation` has already
+        # required a release layout *and* a trusted driving process; only
+        # those are set aside, and they are still named here so the operator
+        # can see what was skipped.
+        suspicious = [h for h in hits if not h.get("automation")]
+        automation = [h for h in hits if h.get("automation")]
+
+        if not suspicious:
+            lines = [util.suspect_line(h) for h in automation[:_DETAIL_CAP]]
+            return CheckResult(
+                OK,
+                "发现 %d 个从临时目录运行的浏览器进程，全部识别为自动化工具链"
+                "（浏览器发行包布局 + 受信驱动进程），不计为可疑：\n       %s"
+                % (len(automation), "\n       ".join(lines)))
+
         lines = []
-        for item in hits[:_DETAIL_CAP]:
-            lines.append(item)
-            m = re.search(r"pid\s+(\d+)", item)
-            if m:
-                try:
-                    chain = util.process_chain(int(m.group(1)), 3)
-                except (TypeError, ValueError):
-                    chain = []
-                if len(chain) > 1:
-                    lines.append("   进程链: " + " ← ".join(
-                        "%s(pid %s)" % (f.get("comm") or "?", f.get("pid"))
-                        for f in chain))
-        if len(hits) > _DETAIL_CAP:
-            lines.append("…… 等 %d 项未展开" % (len(hits) - _DETAIL_CAP))
+        for h in suspicious[:_DETAIL_CAP]:
+            lines.append(util.suspect_line(h))
+            try:
+                chain = util.process_chain(h.get("pid"), 3)
+            except (TypeError, ValueError):
+                chain = []
+            if len(chain) > 1:
+                lines.append("   进程链: " + " ← ".join(
+                    "%s(pid %s)" % (f.get("comm") or "?", f.get("pid"))
+                    for f in chain))
+        if len(suspicious) > _DETAIL_CAP:
+            lines.append("…… 等 %d 项未展开" % (len(suspicious) - _DETAIL_CAP))
+        note = ""
+        if automation:
+            note = ("\n       （另有 %d 个从临时目录运行的浏览器进程识别为自动化"
+                    "工具链，未计为异常）" % len(automation))
         return CheckResult(WARN,
                            "发现可疑进程 %d 个（可执行文件已删除或从临时目录运行，"
-                           "是恶意程序/内存马的典型特征）：\n       %s\n"
+                           "是恶意程序/内存马的典型特征）：\n       %s%s\n"
                            "       请保留 /proc/<pid>/ 现场后终止进程，并对全盘做一次扫描。"
-                           % (len(hits), "\n       ".join(lines)))
+                           % (len(suspicious), "\n       ".join(lines), note))
