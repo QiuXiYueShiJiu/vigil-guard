@@ -32,6 +32,7 @@ const REQUIRED_HOME = [
   ['attack-table', '攻击表格'],
   ['countries', '来源分布'],
   ['zoom-in', '缩放控件'],
+  ['map-select', '选中来源控件'],
   ['map-sub', '地图说明'],
 ];
 

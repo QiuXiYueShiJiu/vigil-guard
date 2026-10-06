@@ -170,12 +170,23 @@ bash dashboard/deploy/install.sh      # 重新部署（幂等）
   产物 `backend/data/world.json` 约 1.33 MiB，gzip 后约 565 KiB。
 - 离线校验：`python3 tools/render-map.py --preset asia -o /tmp/x.png`
   用纯标准库把同一套投影数学渲染成 PNG，无需浏览器。
-- **手势已停用**：拖拽 / 捏合 / 滚轮缩放**全部关掉**，操作收敛到
-  `#zoom-in` / `#zoom-out` 两个按钮（开关在 `frontend/assets/map.js` 的
-  `GESTURES_ENABLED`）。这是交互设计上的取舍，不是 bug 修复 —— 手势在
-  地图上的表现不过关，先收敛到按钮。配套地 `home.css` 里地图容器的
-  `touch-action` 必须是 `pan-x pan-y`：留 `none` 的话，关掉手势会连页面
-  本身的滚动一起拖不动。
+- **手势已停用**：拖拽 / 捏合 / 滚轮缩放**全部关掉**，操作收敛到按钮
+  （`#zoom-in` / `#zoom-out` / `#map-fit` 与四个取景预设）。开关在
+  `frontend/assets/map.js` 的 `GESTURES_ENABLED`，而且它是**条件注册**：
+  关闭时画布上不注册任何 pointer / wheel / touch 监听器，所以"没有手势"
+  是可以断言的（`tools/sim/interaction.mjs`、`align.mjs` 就是在断言这一点），
+  而不是"那几条不会触发"。这是交互设计上的取舍，不是 bug 修复。
+- **选中来源走按钮，不走手指**：停用手势会连带丢掉"点按查看来源"，所以
+  `#map-select`（「◎」）调用 `map.selectLatest()`，走**同一个** `onSelect`
+  回调；事件流里的每一行也可以点，选中的那一条会显示在读数面板里。刻意不
+  新增画布绘制路径，也刻意不自动移动视野 —— 手势关掉之后操作者无法手动
+  平移，任何自动跳转都是单程票。
+- 配套地 `home.css` 里地图容器的 `touch-action` 必须是 `pan-x pan-y`：留
+  `none` 的话，关掉手势会连页面本身的滚动一起拖不动。同理，画布上没有
+  拖拽手势了，`:active` 的 `cursor: grabbing` 也一并去掉 —— 别给不存在的
+  操作做宣传。
+- 部署（`deploy/install.sh`）把静态资源交给 nginx 直接提供；改完前端只需
+  重新执行一次安装脚本（幂等），不必重启服务。本文档只说，不代替你执行。
 
 ## 6. 安全
 

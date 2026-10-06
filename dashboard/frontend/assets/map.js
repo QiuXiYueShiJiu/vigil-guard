@@ -82,12 +82,17 @@ function projectionLat(py) {
 
 const MIN_Y = projectionY(80);
 const MAX_Y = projectionY(-70);
-// 手势控制已停用：小地图的交互设计不过关（拖拽/捏合的判定在真机上难以predictably
-// 表现），改为**只用 UI 按钮**控制 —— 放大 / 缩小由 `#zoom-in`、`#zoom-out` 驱动。
+// 手势控制已停用：这张地图的交互设计不过关 —— 拖拽 / 捏合的判定在真机上难以
+// 稳定表现，而且会和点选、以及浏览器自身的缩放手势互相抢事件。改为**只用 UI
+// 按钮**：放大 / 缩小由 `#zoom-in`、`#zoom-out` 驱动，选中来源由 `#map-select`
+// 驱动。
 //
-// 保留下面这段处理代码而不是删除：手势逻辑本身没有错，是设计没做好；将来重新设计
-// 时把这里改回 true 即可一处恢复，不必去各处找回被删掉的监听器。
-const GESTURES_ENABLED = false;
+// 这是交互设计上的取舍，不是 bug 修复：手势逻辑本身没有错，是设计没做好。将来
+// 重新设计时把这里改回 true 即可一处恢复，不必去各处找回被删掉的监听器 ——
+// 监听器是**整块**按这个开关注册的（见 `_bind`）。
+//
+// 导出它是为了让 `tools/sim/` 能直接断言当前的设计，而不是靠读注释。
+export const GESTURES_ENABLED = false;
 
 const MIN_ZOOM = 0.15;
 const MAX_ZOOM = 40;
@@ -201,6 +206,8 @@ export class FlatMap {
     this._baseReady = false;
     this._baseDrawnAt = 0;
     this._last = 0;
+    // Gesture state. Dormant while `GESTURES_ENABLED` is false -- `_bind()`
+    // registers no handler that reads any of it, and nothing else does.
     this._dragging = false;
     this._moved = 0;
     this._drawn = 0;
@@ -424,96 +431,109 @@ export class FlatMap {
   /* ── input ──────────────────────────────────────────────────────── */
 
   _bind() {
+    /* 手势**整块**注册，或者一个都不注册。
+
+       之前的写法是保留全部监听器、在每个处理函数里 `if (!GESTURES_ENABLED)
+       return`。六个监听器里只有三个带守卫，而没带守卫的 `pointerup` 仍然会
+       调用 `onSelect` —— 因为 `_moved` 只在带守卫的 `pointerdown` 里被重置，
+       永远停在初始值 0，于是 `0 < 6` 恒成立。「已停用」的地图依然会在每次
+       抬手时报告一次选中。给缺的那三个补上守卫只能治这一次的症状，下一个
+       被加进来的监听器会掉进同一个坑；所以整块交给 `GESTURES_ENABLED`：
+       开关关闭时画布上**没有任何** pointer / wheel / touch 监听器，这是一件
+       可以断言的事实，而不是一句解释。
+
+       选中能力没有跟着手势一起消失，它换了一个明确入口：`selectLatest()`
+       配合读数面板，由工具栏的「◎」按钮（以及点击事件流里的一行）驱动，
+       见 `docs/WEB.md`。 */
     const canvas = this.canvas;
-    let lastX = 0;
-    let lastY = 0;
+    if (GESTURES_ENABLED) {
+      let lastX = 0;
+      let lastY = 0;
 
-    const panTo = (dx, dy) => {
-      this.target.lon = this._wrapLon(this.target.lon
-        - dx * (360 / (this.w * this.target.zoom)));
-      // Panning happens in projection space, not latitude space.
-      // projectionY grows southward, and dragging the map down (dy > 0) should
-      // reveal what lies north -- so the view's projection value *decreases*.
-      // An earlier version added dy and then negated the result again, which
-      // inverted vertical panning on every pointer device, touch included.
-      const yScale = (this.w * this.target.zoom) / 4;
-      this.target.projY = clamp(this.target.projY - dy / yScale, MIN_Y, MAX_Y);
-      this._dirty = true;
-    };
+      const panTo = (dx, dy) => {
+        this.target.lon = this._wrapLon(this.target.lon
+          - dx * (360 / (this.w * this.target.zoom)));
+        // Panning happens in projection space, not latitude space.
+        // projectionY grows southward, and dragging the map down (dy > 0) should
+        // reveal what lies north -- so the view's projection value *decreases*.
+        // An earlier version added dy and then negated the result again, which
+        // inverted vertical panning on every pointer device, touch included.
+        const yScale = (this.w * this.target.zoom) / 4;
+        this.target.projY = clamp(this.target.projY - dy / yScale, MIN_Y, MAX_Y);
+        this._dirty = true;
+      };
 
-    canvas.addEventListener('pointerdown', (ev) => {
-      if (!GESTURES_ENABLED) return;
-      this._pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-      if (this._pointers.size === 1) {
-        this._dragging = true;
-        this._moved = 0;
+      canvas.addEventListener('pointerdown', (ev) => {
+        this._pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+        if (this._pointers.size === 1) {
+          this._dragging = true;
+          this._moved = 0;
+          lastX = ev.clientX;
+          lastY = ev.clientY;
+          if (canvas.setPointerCapture) {
+            try { canvas.setPointerCapture(ev.pointerId); } catch (_) { /* ignore */ }
+          }
+        } else if (this._pointers.size === 2) {
+          // Baseline the pinch distance the moment the second finger lands.
+          // Waiting for the next pointermove swallowed the first gesture and
+          // made pinch-to-zoom feel dead on touch.
+          const pts = Array.from(this._pointers.values());
+          this._pinch = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+        }
+        if (canvas.style) canvas.style.cursor = 'grabbing';
+      });
+
+      canvas.addEventListener('pointermove', (ev) => {
+        if (!this._pointers.has(ev.pointerId)) return;
+        this._pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
+
+        if (this._pointers.size >= 2) {
+          const pts = Array.from(this._pointers.values());
+          const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+          if (this._pinch > 0) {
+            const rect = canvas.getBoundingClientRect();
+            this.zoomBy(dist / this._pinch,
+              (pts[0].x + pts[1].x) / 2 - rect.left,
+              (pts[0].y + pts[1].y) / 2 - rect.top);
+            this._dirty = true;
+          }
+          this._pinch = dist;
+          this._moved = 99;
+          return;
+        }
+
+        if (!this._dragging) return;
+        const dx = ev.clientX - lastX;
+        const dy = ev.clientY - lastY;
         lastX = ev.clientX;
         lastY = ev.clientY;
-        if (canvas.setPointerCapture) {
-          try { canvas.setPointerCapture(ev.pointerId); } catch (_) { /* ignore */ }
-        }
-      } else if (this._pointers.size === 2) {
-        // Baseline the pinch distance the moment the second finger lands.
-        // Waiting for the next pointermove swallowed the first gesture and
-        // made pinch-to-zoom feel dead on touch.
-        const pts = Array.from(this._pointers.values());
-        this._pinch = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-      }
-      if (canvas.style) canvas.style.cursor = 'grabbing';
-    });
+        this._moved += Math.abs(dx) + Math.abs(dy);
+        panTo(dx, dy);
+      });
 
-    canvas.addEventListener('pointermove', (ev) => {
-      if (!GESTURES_ENABLED) return;
-      if (!this._pointers.has(ev.pointerId)) return;
-      this._pointers.set(ev.pointerId, { x: ev.clientX, y: ev.clientY });
-
-      if (this._pointers.size >= 2) {
-        const pts = Array.from(this._pointers.values());
-        const dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
-        if (this._pinch > 0) {
+      const endPointer = (ev) => {
+        this._pointers.delete(ev.pointerId);
+        if (this._pointers.size < 2) this._pinch = 0;
+        if (canvas.style) canvas.style.cursor = 'grab';
+        if (this._pointers.size > 0) return;
+        this._dragging = false;
+        // A tap, not a drag: report the nearest source under the finger.
+        if (this._moved < 6 && this.opts.onSelect) {
           const rect = canvas.getBoundingClientRect();
-          this.zoomBy(dist / this._pinch,
-            (pts[0].x + pts[1].x) / 2 - rect.left,
-            (pts[0].y + pts[1].y) / 2 - rect.top);
-          this._dirty = true;
+          this.opts.onSelect(this._pick(ev.clientX - rect.left, ev.clientY - rect.top));
         }
-        this._pinch = dist;
-        this._moved = 99;
-        return;
-      }
+      };
+      canvas.addEventListener('pointerup', endPointer);
+      canvas.addEventListener('pointercancel', endPointer);
+      canvas.addEventListener('pointerleave', (ev) => { if (this._dragging) endPointer(ev); });
 
-      if (!this._dragging) return;
-      const dx = ev.clientX - lastX;
-      const dy = ev.clientY - lastY;
-      lastX = ev.clientX;
-      lastY = ev.clientY;
-      this._moved += Math.abs(dx) + Math.abs(dy);
-      panTo(dx, dy);
-    });
-
-    const endPointer = (ev) => {
-      this._pointers.delete(ev.pointerId);
-      if (this._pointers.size < 2) this._pinch = 0;
-      if (canvas.style) canvas.style.cursor = 'grab';
-      if (this._pointers.size > 0) return;
-      this._dragging = false;
-      // A tap, not a drag: report the nearest source under the finger.
-      if (this._moved < 6 && this.opts.onSelect) {
+      canvas.addEventListener('wheel', (ev) => {
+        ev.preventDefault();
         const rect = canvas.getBoundingClientRect();
-        this.opts.onSelect(this._pick(ev.clientX - rect.left, ev.clientY - rect.top));
-      }
-    };
-    canvas.addEventListener('pointerup', endPointer);
-    canvas.addEventListener('pointercancel', endPointer);
-    canvas.addEventListener('pointerleave', (ev) => { if (this._dragging) endPointer(ev); });
-
-    canvas.addEventListener('wheel', (ev) => {
-      if (!GESTURES_ENABLED) return;
-      ev.preventDefault();
-      const rect = canvas.getBoundingClientRect();
-      this.zoomBy(ev.deltaY < 0 ? 1.12 : 1 / 1.12,
-        ev.clientX - rect.left, ev.clientY - rect.top);
-    }, { passive: false });
+        this.zoomBy(ev.deltaY < 0 ? 1.12 : 1 / 1.12,
+          ev.clientX - rect.left, ev.clientY - rect.top);
+      }, { passive: false });
+    }
 
     window.addEventListener('resize', this._onResize);
   }
@@ -530,6 +550,34 @@ export class FlatMap {
       if (d < bestDist) { bestDist = d; best = t; }
     }
     return best ? best.event : null;
+  }
+
+  /** The source whose mark is newest on the plate, or null.
+
+      This is the map's selection entry point now that the pointer is not one.
+      "Nearest" needs a pointer position; with no pointer the useful equivalent
+      is **most recent** -- the mark that just appeared, which is what an
+      operator looking at a live plate is asking about. `_pick()` is kept for
+      the position case (it is pure geometry and has its own test), so
+      restoring gestures restores tap-to-select without touching this. */
+  latestSource() {
+    let best = null;
+    for (let i = 0; i < this.traces.length; i += 1) {
+      const t = this.traces[i];
+      if (t.fade <= 0.02) continue;      // already faded off the plate
+      if (!best || t.age < best.age) best = t;
+    }
+    return best ? best.event : null;
+  }
+
+  /** Report the newest source through `onSelect`; return it, or null.
+
+      Same callback the pointer path used, so the readout has one code path
+      regardless of how a source was selected -- and no new drawing. */
+  selectLatest() {
+    const event = this.latestSource();
+    if (event && this.opts.onSelect) this.opts.onSelect(event);
+    return event;
   }
 
   /* ── events ─────────────────────────────────────────────────────── */

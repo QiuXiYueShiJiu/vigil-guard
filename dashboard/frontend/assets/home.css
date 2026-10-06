@@ -67,6 +67,9 @@
 }
 @keyframes evIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
 .ev:hover { background: var(--surface-soft); }
+/* 事件流里的行是可点的：地图手势关掉之后，它是"按条选中来源"的入口。
+   光标是这里唯一的提示，所以别省。 */
+.stream .ev { cursor: pointer; }
 .ev.lv1 { background: rgba(208, 64, 48, .07); }
 .ev.lv2 { background: rgba(132, 30, 24, .10); }
 .ev-time { color: var(--muted); }
@@ -178,8 +181,10 @@ table.data td.time { font-family: var(--mono); color: var(--muted); white-space:
   touch-action: pan-x pan-y;
   overscroll-behavior: contain;
 }
+/* touch-action 必须是 pan-x pan-y：手势停用之后触摸要交还给浏览器。
+   这里也刻意**没有** `:active { cursor: grabbing }` —— 画布已经不再响应拖拽，
+   留着那个光标等于给一个不存在的操作做宣传。 */
 .map-wrap canvas { display: block; width: 100%; height: 100%; cursor: default; touch-action: pan-x pan-y; }
-.map-wrap canvas:active { cursor: grabbing; }
 .map-loading {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   gap: 10px; font-size: 13px; color: var(--muted);

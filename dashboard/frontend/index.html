@@ -49,6 +49,9 @@
         <span class="tool-sep"></span>
         <button class="chip icon" id="zoom-in" title="放大">＋</button>
         <button class="chip icon" id="zoom-out" title="缩小">－</button>
+        <!-- 地图手势已停用（见 assets/map.js 的 GESTURES_ENABLED），选中来源
+             因此需要一个明确入口：点它把下方读数切到最新一个来源。 -->
+        <button class="chip icon" id="map-select" title="选中最近的来源">◎</button>
         <button class="chip icon" id="map-fit" title="整幅世界">⤢</button>
         <button class="chip" id="map-pause" title="暂停 / 继续绘制">暂停</button>
       </div>
@@ -68,7 +71,7 @@
       <span class="tool-sep"></span>
       <div class="ro" id="readout">
         <b class="ro-title" id="ro-title">最近动态</b>
-        <span class="ro-body" id="ro-body">拖动平移 · 滚轮或双指缩放 · 点按查看来源</span>
+        <span class="ro-body" id="ro-body">取景与缩放用上方按钮 · 点「◎」查看最近的来源 · 点事件流里的行查看那一条</span>
       </div>
     </div>
   </section>

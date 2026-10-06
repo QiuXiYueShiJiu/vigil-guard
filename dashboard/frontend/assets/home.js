@@ -61,6 +61,7 @@ const dom = {
   mapPause: document.getElementById('map-pause'),
   zoomIn: document.getElementById('zoom-in'),
   zoomOut: document.getElementById('zoom-out'),
+  mapSelect: document.getElementById('map-select'),
 
   cpuPct: document.getElementById('cpu-pct'),
   cpuSpark: document.getElementById('cpu-spark'),
@@ -117,6 +118,7 @@ try {
     opts: { server: {} }, ready: false, meta: {},
     load: async () => { throw err; }, adopt: () => {}, setServer() {},
     flyTo() {}, zoomBy() {}, start() {}, stop() {}, push: () => false,
+    latestSource: () => null, selectLatest: () => null,
   };
   setTimeout(() => showMapError('init', err.message), 0);
 }
@@ -252,6 +254,22 @@ function wireControls() {
       });
     });
   }
+  // 点按拾取跟着手势一起关掉了（见 map.js 的 GESTURES_ENABLED）。这里是它的
+  // 替代入口：一个按钮，走**同一个** onSelect 回调，所以读数面板只有一条代码
+  // 路径，与来源是怎么被选中的无关。
+  if (dom.mapSelect) {
+    dom.mapSelect.addEventListener('click', () => {
+      if (!map.selectLatest()) showMapHint();
+    });
+  }
+  // 事件流则提供"按条选中"：点哪一行就显示哪一条来源。刻意**不移动视野** ——
+  // 手势关掉之后操作者无法手动平移，任何自动跳转都是单程票。
+  if (dom.stream) {
+    dom.stream.addEventListener('click', (ev) => {
+      const row = ev.target && ev.target.closest ? ev.target.closest('.ev') : null;
+      if (row && row._event) showReadout(row._event);
+    });
+  }
   dom.adminEntry.addEventListener('click', (ev) => {
     ev.preventDefault();
     window.location.href = '/admin.html';
@@ -383,6 +401,10 @@ function addRow(item) {
       }) : null,
     ]),
   ]);
+  // The row carries its own event so the click handler on the stream can select
+  // exactly this source. Keeping it on the element (not in a parallel array)
+  // means the rows that get trimmed off the top take their data with them.
+  row._event = item;
   dom.stream.insertBefore(row, dom.stream.firstChild);
   rows.push(row);
   while (rows.length > 90) {
@@ -458,6 +480,14 @@ function showReadout(event) {
     event.lv ? (levelLabel(event.lv) + '：' + (event.why || '')) : '正常访问',
   ].join('\n');
   dom.readout.classList.toggle('hot', !!event.lv);
+}
+
+/* 地图上暂时没有可选的来源。说出来，比让按钮看起来是坏的强 —— 静默在页面上
+   读起来就是"这东西不工作"。 */
+function showMapHint() {
+  dom.roTitle.textContent = '最近动态';
+  dom.roBody.textContent = '地图上暂时没有可选的来源 —— 等有流量上屏后再点「◎」。';
+  dom.readout.classList.remove('hot');
 }
 
 /* ── summary / resources ──────────────────────────────────── */

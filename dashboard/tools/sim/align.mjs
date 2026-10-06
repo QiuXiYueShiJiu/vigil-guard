@@ -83,19 +83,37 @@ for (let i = 1; i < shots.length; i += 1) {
 }
 check('两个城市的间距随缩放线性变化', proportional);
 
-console.log('3) 平移后点跟着地图走（同一位移量）');
+console.log('3) 视图移动时点跟着地图走（同一位移量）');
+// 这一条原来由**拖拽**驱动。手势停用之后视图只由按钮 / 预设驱动，所以改成直接
+// 移动视图 —— 要守的不变量没变：点的像素位置必须与视图经度严格同步、方向相反。
 map.flyTo({ lon: 115, lat: 18, zoom: 2 }); settle();
 const before = at(139.69, 35.68);
+map.target.lon -= 100 / map._scale();     // 等价于把视野向东推 100px
+settle();
+const after = at(139.69, 35.68);
+check('东京跟着视图位移', Math.abs((after.x - before.x) - 100) < 0.5
+  && Math.abs(after.y - before.y) < 1e-6,
+'dx=' + (after.x - before.x).toFixed(2) + ' dy=' + (after.y - before.y).toFixed(2));
+
+console.log('3b) 手势停用：合成的拖拽事件不再移动视图');
+// 断言的是当前设计，不是"曾经的行为"。要把 GESTURES_ENABLED 改回 true，
+// 就得连这些用例一起改 —— 那正是应该发生的。
+const pinned = { lon: map.target.lon, projY: map.target.projY, zoom: map.target.zoom };
 const fireId = (t, id, x, y) => (listeners[t] || []).forEach((f) => f({
   type: t, pointerId: id, clientX: x, clientY: y, preventDefault() {},
 }));
 fireId('pointerdown', 1, 600, 300);
-fireId('pointermove', 1, 700, 340);      // 拖 (100, 40)
-settle();
-const after = at(139.69, 35.68);
-check('东京跟着拖拽位移', Math.abs((after.x - before.x) - 100) < 0.5
-  && Math.abs((after.y - before.y) - 40) < 0.5,
-'dx=' + (after.x - before.x).toFixed(2) + ' dy=' + (after.y - before.y).toFixed(2));
+fireId('pointermove', 1, 700, 340);      // 以前这一拖会把视野推走 (100, 40)
+fireId('pointerup', 1, 700, 340);
+check('拖拽不再改变视图（经度 / 纬度 / 缩放都不变）',
+  map.target.lon === pinned.lon && map.target.projY === pinned.projY
+  && map.target.zoom === pinned.zoom,
+  'lon ' + map.target.lon.toFixed(3) + ' projY ' + map.target.projY.toFixed(3)
+  + ' zoom ' + map.target.zoom.toFixed(2));
+const gestureKeys = ['pointerdown', 'pointermove', 'pointerup', 'pointercancel',
+  'pointerleave', 'wheel'].filter((t) => (listeners[t] || []).length);
+check('画布上没有注册任何手势监听器', gestureKeys.length === 0,
+  gestureKeys.length ? gestureKeys.join(', ') : '一个都没有');
 
 console.log('4) 服务端信标与流星同源（同一 lat/lon 必落同一像素）');
 map.setServer({ lat: 22.3, lon: 114.17 });
