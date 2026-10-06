@@ -203,11 +203,20 @@ DEFAULTS: dict = {
         },
         # -- decoy endpoints (deception) ---------------------------------
         "decoy": {
-            # A hit on a decoy path is conclusive, not suggestive: the path
-            # does not exist on disk, nothing the site serves links to it,
+            # A hit on a decoy path is normally conclusive, not suggestive: the
+            # path does not exist on disk, nothing the site serves links to it,
             # and the only clients that ask for it are scanners. So the very
             # first hit already earns a ban measured in weeks.
+            #
+            # Exception: names that are plausible *real* routes on the right
+            # deployment (`/actuator/health`, `/login`, `/graphql`). When the
+            # screening cannot prove such a path is absent, a hit is only
+            # observed until `soft_hits` requests land inside
+            # `soft_window_seconds` -- so a monitor's first probe is not a
+            # seven-day ban, while a scanner still bans itself quickly.
             "enabled": True,
+            "soft_hits": 3,
+            "soft_window_seconds": 300,
             # 7d / 14d / the longest ipset can hold (~24.8 days). ipset
             # stores a timeout as 32-bit milliseconds, so 30d and 90d steps
             # were rejected at enforcement time and the escalation silently
@@ -586,6 +595,13 @@ DEFAULTS: dict = {
         "immutable": True,          # set -e 2 so rules cannot be relaxed
     },
 
+    # -- hygiene (请求卫生片段里的方法白名单) ------------------------------
+    # 默认包含 OPTIONS —— 浏览器跨域预检和 REST 接口探测都以它开头，
+    # 拒绝它会让正常 API 全部 405。收紧到仅 GET/HEAD/POST 需显式配置。
+    "hygiene": {
+        "allowed_methods": ["GET", "HEAD", "POST", "OPTIONS"],
+    },
+
     # -- web (自带的状态与反馈页面) ---------------------------------------
     # 默认关闭：这是一个对外可达的页面，装不装由运维决定，不由默认值决定。
     # 只监听本机，由已有的 Web 服务反代对外 —— 让这个进程直接对外就等于
@@ -600,6 +616,12 @@ DEFAULTS: dict = {
         "domain": "",
         "username": "",
         "session_minutes": 60,
+        # Direct peers whose X-Forwarded-For may be believed when rate-limiting
+        # logins. The service listens on loopback and is proxied, so the peer is
+        # the proxy: without this, every visitor shares one bucket. Adding an
+        # entry is an explicit statement that the address is *our* reverse
+        # proxy -- believing the header from anyone else is a bypass.
+        "trusted_proxies": ["127.0.0.1/8", "::1"],
     },
 
     # Filled in at install time; display only.

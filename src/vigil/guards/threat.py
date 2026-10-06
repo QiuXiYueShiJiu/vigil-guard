@@ -391,11 +391,18 @@ class Settings:
             self._r("threat.posture.factor", 0.5), 0.5)
 
         # -- decoy endpoints ---------------------------------------------
-        # A hit on a decoy path is not evidence, it is a conclusion: the
-        # path does not exist on disk and nothing the site serves links to
-        # it. There is no legitimate explanation to weigh, which is why the
-        # first hit already earns a long ban rather than a warning.
+        # A hit on a decoy path is *usually* a conclusion: the path does not
+        # exist on disk and nothing the site serves links to it. But some
+        # curated names are plausible real routes on the right deployment
+        # (`/actuator/health`, `/login`, `/graphql`), and when the screening
+        # cannot prove they are absent the first request is as likely to be
+        # the operator's own health check as a scanner. Those get a window
+        # instead of a seven-day ban on sight.
         self.decoy_enabled = bool(self._r("threat.decoy.enabled", True))
+        self.decoy_soft_hits = _int(
+            self._r("threat.decoy.soft_hits", 3), 3, minimum=1)
+        self.decoy_soft_window = _int(
+            self._r("threat.decoy.soft_window_seconds", 300), 300, minimum=1)
         # 7 days / 14 days / the longest ipset can express (~24.8 days).
         # The previous 30d and 90d steps were unenforceable, so every decoy
         # escalation beyond the first silently failed.
@@ -1009,25 +1016,59 @@ class NetblockTracker:
 
 
 class BanBreaker:
-    """Circuit breaker: at most *limit* bans per rolling *window*."""
+    """Circuit breaker: at most *limit* distinct bans per rolling *window*.
 
-    def __init__(self, limit: int = 60, window: int = 3600):
+    Counted by **(source, detector)**, not by call.
+
+    The original appended a timestamp on every :meth:`record` call, and
+    :meth:`ThreatDaemon.ban` calls it once per ``ban()`` -- so one source
+    having one bad second (measured: 56 ``ban()`` calls in a single second)
+    filled the whole 60/hour budget. The breaker then tripped and *all*
+    automatic banning stopped for an hour, which an attacker can arrange on
+    purpose: burst hard enough, then do whatever the burst was covering for.
+
+    A source may be genuinely banned many times by many detectors inside the
+    window; that is several decisions, and counting each distinct one keeps
+    the breaker measuring "how many different decisions did we make" rather
+    than "how loudly did one of them repeat". The escalation ladder still
+    punishes the repeat through offence counts -- it just does not get to
+    disable the engine while it does.
+    """
+
+    def __init__(self, limit: int = 60, window: int = 3600, max_keys: int = 0):
         self._lock = threading.Lock()
         self._limit = max(1, int(limit))
         self._window = max(1, int(window))
-        self._times = deque()
+        #: How many distinct keys are remembered at once. Bounded so a spray
+        #: from many addresses cannot grow this without limit; the cap is
+        #: generous relative to the limit because keys older than the window
+        #: are dropped on every read anyway.
+        self._max_keys = max_keys or max(1024, self._limit * 8)
+        self._seen = {}
 
-    def record(self) -> None:
+    def record(self, ip: str = "", detector: str = "") -> None:
+        """Note one source/detector decision; repeats inside the window count once."""
+        key = "%s|%s" % (str(ip or "").strip(), str(detector or "").strip())
+        now = time.time()
         with self._lock:
-            self._times.append(time.time())
+            cutoff = now - self._window
+            for old in [k for k, t in self._seen.items() if t < cutoff]:
+                self._seen.pop(old, None)
+            # First sighting wins: a repeat must not refresh the window, or a
+            # long burst would pin the count forever.
+            self._seen.setdefault(key, now)
+            if len(self._seen) > self._max_keys:
+                for old in sorted(self._seen, key=self._seen.get)[
+                        : len(self._seen) - self._max_keys]:
+                    self._seen.pop(old, None)
 
     def recent(self) -> int:
         now = time.time()
         with self._lock:
             cutoff = now - self._window
-            while self._times and self._times[0] < cutoff:
-                self._times.popleft()
-            return len(self._times)
+            for old in [k for k, t in self._seen.items() if t < cutoff]:
+                self._seen.pop(old, None)
+            return len(self._seen)
 
     def tripped(self):
         count = self.recent()
@@ -1070,6 +1111,15 @@ _IP_LEAD = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]{6,})\b")
 #: fails outright. Measured during an attack drill, where twenty lifted bans
 #: all returned because draining waited on a 300 s timer.
 UNBAN_POLL_SECONDS = 3
+
+#: How many *consecutive* handler failures on one log source before an alert is
+#: raised. One malformed line is worth a WARN; a run of them means the source
+#: is not being checked at all and nobody would otherwise notice.
+DETECTOR_FAIL_ALERT_AFTER = 5
+
+#: Report every Nth consecutive failure after the first, so a permanently
+#: broken source cannot fill the journal at the rate of the log itself.
+DETECTOR_FAIL_REPORT_EVERY = 50
 
 
 class LogFollower:
@@ -1565,6 +1615,12 @@ class Enforcer:
     ``ipset add`` failed is worse than no alert at all.
     """
 
+    #: How many times to retry an insert before declaring failure, and how
+    #: long to wait between tries. `iptables` refuses to run while another
+    #: process holds the xtables lock, which is normal on a panel host.
+    INSERT_RETRIES = 3
+    INSERT_RETRY_SLEEP = 0.5
+
     def __init__(self, set_name: str, chain: str, ipset: str = "ipset",
                  iptables: str = "iptables", maxelem: int = 20000,
                  dry_run: bool = False, log=None, net_set_name: str = ""):
@@ -1600,7 +1656,15 @@ class Enforcer:
         return self.set_name in names.split()
 
     def ensure(self) -> bool:
-        """Create the set and re-assert the INPUT match rule at position 1."""
+        """Create the set and re-assert the INPUT match rule at position 1.
+
+        The return value means **"the ban mechanism is in place"**, which is
+        two things: the set exists *and* the rule that consults it is present
+        and first. It used to return ``created or self.set_exists()``, so a
+        host whose INPUT rule had been flushed away still got ``True`` -- and
+        every ban landed in a set nothing read while `selfheal` considered its
+        job done.
+        """
         if self.dry_run:
             self._plan([self.ipset, "create", self.set_name, "hash:ip",
                         "timeout", "0", "maxelem", str(self.maxelem)])
@@ -1619,8 +1683,14 @@ class Enforcer:
                 self.log.error("创建 ipset 集合 %s 失败：%s", self.set_name,
                               oneline(err, 160))
         self.ensure_net_set()
-        self.assert_priority()
-        return created or self.set_exists()
+        rule_ok = self.assert_priority()
+        in_place = self.rule_position() == 1
+        if not (rule_ok and in_place) and self.log:
+            self.log.error(
+                "封禁规则未就位：%s 中找不到 `-m set --match-set %s src -j DROP`"
+                "（或不在第 1 条）—— 自动封禁当前不生效",
+                self.chain, self.set_name)
+        return bool(self.set_exists() and rule_ok and in_place)
 
     # -- the network-range set --------------------------------------------
     def net_set_exists(self) -> bool:
@@ -1718,6 +1788,32 @@ class Enforcer:
                 return idx
         return None
 
+    def _insert_match_rule(self) -> bool:
+        """Insert the DROP rule at position 1, retrying a transient failure.
+
+        `iptables -I` fails while another process holds the xtables lock --
+        routine on a panel that reloads firewall rules. Treating the first
+        failure as final is bad enough; the reorder path had *already*
+        deleted the existing rule, so a transient lock left the host with no
+        ban rule at all and no retry.
+        """
+        last = ""
+        for attempt in range(self.INSERT_RETRIES):
+            ok, _out, err = self._run([
+                self.iptables, "-I", self.chain, "1", "-m", "set",
+                "--match-set", self.set_name, "src", "-j", "DROP"])
+            if ok:
+                if self.log:
+                    self.log.info(_t("rule_inserted", self.chain, self.set_name))
+                return True
+            last = err or last
+            if attempt + 1 < self.INSERT_RETRIES:
+                time.sleep(self.INSERT_RETRY_SLEEP)
+        if self.log:
+            self.log.error("插入拦截规则失败（已重试 %d 次）：%s",
+                           self.INSERT_RETRIES, oneline(last, 160))
+        return False
+
     def assert_priority(self) -> bool:
         """Verify the DROP rule is first, and move it back if it is not.
 
@@ -1725,19 +1821,17 @@ class Enforcer:
         before every other rule) and compare with reality.  A panel or
         fail2ban reload that inserts rules ahead of ours must not silently
         disable banning.
+
+        Returns whether the rule ended up in place. The reorder path deletes
+        before it inserts, so its return value is the difference between "the
+        rule moved" and "the rule is gone" -- callers must not read a bare
+        ``None``/``True`` as health.
         """
         position = self.rule_position()
         if position == 1:
             return True
         if position is None:
-            ok, _out, err = self._run([
-                self.iptables, "-I", self.chain, "1", "-m", "set",
-                "--match-set", self.set_name, "src", "-j", "DROP"])
-            if ok and self.log:
-                self.log.info(_t("rule_inserted", self.chain, self.set_name))
-            elif not ok and self.log:
-                self.log.error("插入拦截规则失败：%s", oneline(err, 160))
-            return ok
+            return self._insert_match_rule()
         # Present but not first: delete and re-insert at 1.
         spec = self._rule_spec()
         if spec is None:
@@ -1747,12 +1841,14 @@ class Enforcer:
             if self.log:
                 self.log.error("删除错位拦截规则失败：%s", oneline(err, 160))
             return False
-        ok, _out, err = self._run([
-            self.iptables, "-I", self.chain, "1", "-m", "set",
-            "--match-set", self.set_name, "src", "-j", "DROP"])
-        if ok and self.log:
+        if not self._insert_match_rule():
+            if self.log:
+                self.log.error("错位规则已删除但重新插入失败 —— "
+                               "当前没有任何封禁规则在 %s 中生效", self.chain)
+            return False
+        if self.log:
             self.log.warn(_t("rule_reordered", position))
-        return ok
+        return True
 
     def _rule_spec(self):
         ok, out, _err = self._run([self.iptables, "-S", self.chain])
@@ -1897,9 +1993,9 @@ SCAN_STATUS = frozenset({404, 410, 444})
 #: 依旧会因请求量触发洪泛封禁 —— 少的是「把它当扫描」这层错误归因。
 ROUTINE_STATUS = frozenset({401, 403, 405, 406, 407, 415, 416, 429})
 
-_CRIT_KINDS = frozenset({"BREACH", "DIST", "BAN_FAIL"})
-_KIND_ORDER = ("BREACH", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE", "BAN",
-               "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
+_CRIT_KINDS = frozenset({"BREACH", "DIST", "BAN_FAIL", "DETECT"})
+_KIND_ORDER = ("BREACH", "DETECT", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE",
+               "BAN", "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
 
 
 def _ban_title(events) -> str:
@@ -1926,8 +2022,17 @@ class EventReporter:
     def __init__(self, daemon):
         self.d = daemon
         settings = daemon.settings
-        self._q = deque(maxlen=settings.event_queue_max)
+        # Deliberately a plain deque with an explicit bound, not
+        # `deque(maxlen=...)`: a maxlen deque discards the oldest item
+        # silently, so a burst could drop a CRIT event and the alert that
+        # eventually went out said nothing about it. Two views of the same
+        # minute -- the alert and the log -- disagreed, and only one of them
+        # was read.
+        self._q = deque()
+        self._max = max(1, int(settings.event_queue_max))
         self._lock = threading.Lock()
+        self._dropped = 0
+        self._dropped_total = 0
         self._wake = threading.Event()
         self._stop = daemon.stop
         self._flush_interval = settings.event_flush_interval
@@ -1936,6 +2041,10 @@ class EventReporter:
 
     def queue(self, event: dict) -> None:
         with self._lock:
+            if len(self._q) >= self._max:
+                self._q.popleft()
+                self._dropped += 1
+                self._dropped_total += 1
             self._q.append(event)
         if event.get("immediate"):
             self._wake.set()
@@ -1954,6 +2063,16 @@ class EventReporter:
     def pending(self) -> int:
         with self._lock:
             return len(self._q)
+
+    def dropped(self) -> int:
+        """Events lost to the queue bound since the last alert went out."""
+        with self._lock:
+            return self._dropped
+
+    def dropped_total(self) -> int:
+        """Events lost to the queue bound since start-up."""
+        with self._lock:
+            return self._dropped_total
 
     def flush(self, force: bool = False) -> bool:
         with self._lock:
@@ -1984,6 +2103,20 @@ class EventReporter:
                     self._q.extendleft(reversed(items))
                 return False
         alert = self.build_alert(items)
+        with self._lock:
+            dropped = self._dropped
+        if dropped:
+            section = alert.add_section("未上报事件")
+            section.add("另有 %d 条事件因队列上限（%d 条）未上报 —— "
+                        "它们已经丢失，无法补发。"
+                        % (dropped, self._max))
+            section.add("  原因通常是事件产生速度超过了告警发送速度"
+                        "（如一次大范围扫描）。如果反复出现，请调大 "
+                        "`threat.event_queue_max` 或放开发送限速。")
+            # Only cleared here: an early return above kept the batch waiting,
+            # so the count still refers to events nobody has been told about.
+            with self._lock:
+                self._dropped = 0
         self.d.log.warn(_t("event_flush", alert.title, len(items)))
         self._last_send = now
         with self.d.state.lock:
@@ -2027,6 +2160,7 @@ class EventReporter:
             "WHITELIST": "白名单 IP 命中了封禁规则（已放行，请核实）",
             "POSTURE": "自动进入高压防护",
             "NETBLOCK": "自动升级为网段封禁",
+            "DETECT": "检测器连续失败（该日志源可能已停止检测）",
             "INFO": "自动化处置事件 %d 条" % len(items),
         }
         title = title_map.get(kind, title_map["INFO"])
@@ -2049,6 +2183,20 @@ class EventReporter:
             sec.add("影响：该网段内的无关地址也会被阻断。共享出口"
                     "（运营商、校园、机房）误伤面较大。")
             sec.add("撤回：vigil threat netblock clear %s" % event.get("net", ""))
+        if groups.get("DETECT"):
+            section = alert.add_section("检测器失效")
+            for event in groups["DETECT"]:
+                section.add("⚠ 日志源 %s 的 %s 检测器连续失败 %d 次。"
+                            % (event.get("path", "?"), event.get("detector", "?"),
+                               int(event.get("count", 0))))
+                section.add("  最近一次错误: %s"
+                            % oneline(event.get("err", ""), 200))
+                section.add("  影响：该来源正在被 tail，但每一行都在抛异常，"
+                            "**检测等于没开**。状态页上的「监控 N 个来源」仍然成立，"
+                            "所以只看状态不会被发现 —— 这就是它必须主动告警的原因。")
+                section.add("  排查：`vigil threat test` 用样例日志验证规则，"
+                            "并检查该日志的格式是否变了。")
+                section.add("")
         if groups.get("BREACH"):
             section = alert.add_section("安全警告：疑似爆破成功")
             for event in groups["BREACH"]:
@@ -2158,6 +2306,10 @@ class EventReporter:
         if kind == "POSTURE":
             return ("攻击信号达到阈值，本机已自动收紧封禁阈值；"
                     "平静一段时间后会自动恢复。")
+        if kind == "DETECT":
+            return ("某个日志源的检测器连续处理失败，该来源的检测很可能已经"
+                    "整体失效 —— 守护进程仍在运行、状态页仍显示「正在监控」，"
+                    "但这一路日志不会再产生任何判定。请检查日志格式与检测器代码。")
         return "自动化处置事件汇总。"
 
     def _ban_lines(self, event) -> list:
@@ -2281,6 +2433,13 @@ class ThreatDaemon:
         self._geo_lock = threading.Lock()
         self._threads = []
         self._log_source_list = []
+        #: Per-source detector health: consecutive handler failures and whether
+        #: an alert has already been raised for this run of them. "Looks
+        #: healthy while doing nothing" is this project's recurring failure, so
+        #: the fact that a tail thread is throwing must be visible from the
+        #: status output, not only in a log line nobody reads.
+        self.detector_health = {}
+        self._detector_health_lock = threading.Lock()
 
     # -- signatures --------------------------------------------------------
     def _compile_signatures(self) -> dict:
@@ -2452,7 +2611,7 @@ class ThreatDaemon:
                 })
             return False
 
-        self.breaker.record()
+        self.breaker.record(ip, detector)
         note = self.source_note(ip)
         if note:
             reason = reason + note
@@ -2507,6 +2666,11 @@ class ThreatDaemon:
 
     # -- SSH detectors -----------------------------------------------------
     def handle_ssh(self, line: str) -> None:
+        # `threat.ssh.enabled` used to be read into an attribute nothing ever
+        # consulted: an operator who turned SSH detection off kept getting
+        # banned. A switch that does not switch is worse than no switch.
+        if not self.settings.ssh_enabled:
+            return
         match = self.RE_SSH_FAIL.search(line)
         if match:
             user, ip = match.group(1), match.group(2)
@@ -2665,6 +2829,16 @@ class ThreatDaemon:
         if ok:
             self.netblocks.forget(net)
             self.bump_stat("netblock_bans")
+            reason = ("网段升级：同一网段内 %d 个独立来源协同攻击"
+                      % len(sample or []))
+            # Record it in the same state file the per-address bans live in.
+            # It used to be written nowhere but the kernel (`hash:net`), so a
+            # /24 could be blocking a whole ISP range while `vigil status`
+            # showed nothing -- and adding an address from that range to the
+            # whitelist could not lift it, because the purge walked only
+            # `state.bans`. Two views of "what is banned" that disagree is how
+            # an operator concludes the tool is lying.
+            self.state.note_ban(net, time.time() + seconds, reason, 1, "netblock")
             self.audit("[网段升级] %s -> %ss（窗口内 %d 个独立来源）"
                        % (net, seconds, len(sample or [])))
             if self.settings.notify_bans:
@@ -2763,6 +2937,13 @@ class ThreatDaemon:
         threshold, no second chance -- and the resulting ban is measured in
         weeks rather than minutes.
 
+        One exception, and it is deliberate: a name from
+        :data:`decoy._LIVE_ROUTE_PATTERNS` may be a *working* endpoint on the
+        right deployment, and the screening cannot always disprove it. Those
+        are counted in a window and only banned once they repeat, because
+        banning a monitoring probe on its first request is a greater harm
+        than missing one scanner.
+
         Nothing else in the line is interpreted: the path is not matched
         against signatures and the user agent is not consulted. A request
         that arrived in *this* log was already classified by the fact that it
@@ -2785,12 +2966,43 @@ class ThreatDaemon:
             if len(bits) >= 2:
                 uri = bits[1]
         self.note_decoy_hit(ip, uri)
+        # A path that could be a real route on this deployment is observed,
+        # not convicted, on first sight. The screening refuses to install a
+        # decoy whose `location` the site already declares, but it cannot see
+        # a route served by a template outside the webroot -- and a monitor
+        # whose first health-check request becomes a seven-day ban is the
+        # one outcome worth more than the decoy it costs.
+        try:
+            from . import decoy as decoy_mod
+            plausible_route = decoy_mod.live_route_risk(uri)
+        except (ImportError, OSError):
+            plausible_route = False
+        if plausible_route:
+            over, count = self.windows.bump(
+                ip, "decoy_soft:%s" % (uri.split("?")[0] or "?"),
+                self.settings.decoy_soft_window, self.settings.decoy_soft_hits)
+            if not over:
+                self.audit("[观察] %s 请求了可能是真实路由的诱饵路径 %s"
+                           "（%d 次/%ds，达到 %d 次才封禁）"
+                           % (ip, uri or "?", count,
+                              self.settings.decoy_soft_window,
+                              self.settings.decoy_soft_hits))
+                self.bump_stat("decoy_soft_observed")
+                return
+            self.windows.forget(ip)
+            self.ban(ip, "蜜罐诱饵命中（疑似活路由，%d 次/%ds）：%s"
+                     % (count, self.settings.decoy_soft_window, uri or "?"),
+                     detector="decoy_soft")
+            return
         if not self.source_note(ip):
             self._note_attack(3, "诱饵命中")
         self.ban(ip, "蜜罐诱饵命中：请求了不存在的诱饵路径 %s" % (uri or "?"),
                  detector="decoy", severity=2)
 
     def handle_http(self, line: str) -> None:
+        # See handle_ssh: `threat.http.enabled` was a dead switch.
+        if not self.settings.http_enabled:
+            return
         match = self.RE_HTTP.match(line)
         if match:
             ip, request, status = match.group(1), match.group(2), int(match.group(3))
@@ -2947,6 +3159,46 @@ class ThreatDaemon:
             except OSError:
                 pass
 
+    def _note_detector_failure(self, kind: str, path: str, exc, count: int) -> None:
+        """Make a failing detector visible, without turning it into a log flood.
+
+        A handler that raises on every line means the *whole source* is no
+        longer being checked, while `status` still says "monitoring N sources".
+        That is the exact shape of silent failure this program must not have,
+        so the first failure is a WARN, repeats are sampled, and a sustained
+        run raises one alert (deduplicated by detector, so a broken source
+        does not generate one mail per log line).
+        """
+        message = oneline(str(exc), 200) or exc.__class__.__name__
+        if count == 1:
+            self.log.warn("检测器 %s 处理日志行失败（来源 %s）：%s —— "
+                          "该来源的检测当前不完整", kind, path, message)
+        elif count % DETECTOR_FAIL_REPORT_EVERY == 0:
+            self.log.warn("检测器 %s 已连续失败 %d 次（来源 %s）：%s",
+                          kind, count, path, message)
+        with self._detector_health_lock:
+            self.detector_health[kind] = {"path": path, "fails": count,
+                                          "last": time.time(),
+                                          "error": message, "alerted": count >=
+                                          DETECTOR_FAIL_ALERT_AFTER}
+        if count == DETECTOR_FAIL_ALERT_AFTER:
+            self.bump_stat("detector_failures")
+            if self.cooldowns.allow("detector_fail:%s" % kind):
+                self.reporter.queue({
+                    "kind": "DETECT", "immediate": True, "detector": kind,
+                    "path": path, "count": count, "err": message})
+
+    def _note_detector_recovered(self, kind: str, path: str, was: int) -> None:
+        with self._detector_health_lock:
+            self.detector_health.pop(kind, None)
+        self.log.warn("检测器 %s 已恢复（来源 %s，此前连续失败 %d 次）",
+                      kind, path, was)
+
+    def _detector_failures(self) -> list:
+        with self._detector_health_lock:
+            return [dict(entry, detector=kind)
+                    for kind, entry in sorted(self.detector_health.items())]
+
     def tail_file(self, path: str, handler, kind: str) -> None:
         """Follow one log, resuming from where the last run stopped.
 
@@ -2957,6 +3209,7 @@ class ThreatDaemon:
         follower = LogFollower(path, self._log_offsets, log=self.log,
                                save=lambda _store: self.save_log_offsets())
         tick = 0
+        fails = 0
         while not self.stop.is_set():
             got = False
             try:
@@ -2971,10 +3224,19 @@ class ThreatDaemon:
                     try:
                         handler(line)
                     except Exception as exc:               # noqa: BLE001
-                        self.log.debug("处理异常 %s: %s", kind, exc)
+                        # Was `self.log.debug(...)`, i.e. invisible at the
+                        # default level: a detector could be dead for weeks
+                        # while the banner said the source was watched.
+                        fails += 1
+                        self._note_detector_failure(kind, path, exc, fails)
+                    else:
+                        if fails:
+                            self._note_detector_recovered(kind, path, fails)
+                            fails = 0
                     follower.tell()
             except Exception as exc:                       # noqa: BLE001
-                self.log.debug("跟随 %s 出错：%s", path, exc)
+                fails += 1
+                self._note_detector_failure(kind, path, exc, fails)
                 follower._close()
 
             tick += 1
@@ -2982,6 +3244,7 @@ class ThreatDaemon:
                 follower.flush()
             self.stop.wait(1 if got else 3)
         follower.flush()
+        follower.close()
 
     def selfheal(self) -> None:
         """Re-assert the set and the INPUT rule after ufw/panel reloads."""
@@ -2997,7 +3260,10 @@ class ThreatDaemon:
                     restored = 0
                     for ip, seconds in pending:
                         if seconds > 0:
-                            ok, err = self.enforcer.add(ip, seconds)
+                            if "/" in str(ip):
+                                ok, err = self.enforcer.add_net(ip, seconds)
+                            else:
+                                ok, err = self.enforcer.add(ip, seconds)
                             if ok:
                                 restored += 1
                             else:
@@ -3107,14 +3373,17 @@ class ThreatDaemon:
                     self.log.warn("白名单重载失败：%s" % e)
                 continue
             ip = str(req.get("ip", "")).strip()
-            if ip and self._valid_ip(ip):
+            if ip and is_valid_address(ip):
                 # Both halves are required. Dropping the record alone left
                 # the address in the enforcement set, so it stayed blocked
                 # while every command reported it as unbanned -- the exact
                 # "looks fixed, still broken" shape this project keeps
                 # finding. Removing from the set alone was the earlier bug
                 # in the other direction.
-                self.enforcer.remove(ip)
+                if "/" in ip:
+                    self.enforcer.remove_net(ip)
+                else:
+                    self.enforcer.remove(ip)
                 self.state.drop_ban(ip)
                 applied += 1
         if applied:
@@ -3209,6 +3478,13 @@ class ThreatDaemon:
         self.log.info("=" * 60)
         self.log.info(_t("started", os.getpid()))
         self.log.info(_t("whitelist", "、".join(self.whitelist.entries())))
+        # 白名单是唯一的救援路径：本程序的 DROP 规则排在 INPUT 第 1 条，
+        # ufw 里的 allow 对它无效。一次全站超时的根因就是白名单为空，
+        # 所以启动横幅必须把这件事喊出来，而不是等人去翻状态页。
+        _gap = whitelist_rescue_gap(self.cfg)
+        if _gap:
+            self.log.warn(_gap)
+            self.audit("[提醒] " + _gap)
         sources = self.settings.log_sources
         # Every category is printed, including the decoy log. A source that
         # is watched but not listed in the start-up banner is a source nobody
@@ -3276,20 +3552,80 @@ class ThreatDaemon:
             self.log.info(_t("stopped"))
         return 0
 
+    def _known_nets(self) -> list:
+        """Every network-range ban we can see: our state and the kernel."""
+        nets = {str(k) for k in (self.state.bans or {}) if "/" in str(k)}
+        try:
+            nets |= set(self.enforcer.net_members() or {})
+        except (OSError, AttributeError):
+            pass
+        return sorted(nets)
+
+    def _net_touches_whitelist(self, net: str) -> bool:
+        """Would a whitelisted address be caught by banning this range?
+
+        Overlap, not containment: a whitelist entry is a promise that the
+        address is never blocked, and a /24 that contains it breaks that
+        promise even though the promise is narrower than the range.
+        """
+        try:
+            banned = ipaddress.ip_network(str(net), strict=False)
+        except ValueError:
+            return False
+        for addr in local_addresses():
+            try:
+                if ipaddress.ip_address(addr) in banned:
+                    return True
+            except ValueError:
+                continue
+        for entry in (self.cfg.get("threat.whitelist", []) or []):
+            text = str(entry).strip()
+            if not text:
+                continue
+            try:
+                if "/" in text:
+                    if ipaddress.ip_network(text, strict=False).overlaps(banned):
+                        return True
+                elif ipaddress.ip_address(text) in banned:
+                    return True
+            except ValueError:
+                continue
+        return False
+
     def _purge_whitelisted_bans(self) -> None:
-        """Safety valve: a whitelisted address is never left banned."""
-        purged = []
+        """Safety valve: a whitelisted address is never left banned.
+
+        Covers the network-range set as well as the per-address one. The
+        original walked only `state.bans`, and `ban_netblock` wrote only to
+        the kernel, so adding an address from a banned /24 to the whitelist
+        left the /24 in place -- the rescue path did not reach the range the
+        operator was actually trapped behind.
+        """
+        purged, purged_nets = [], []
         with self.state.lock:
             for ip in list(self.state.bans):
+                if "/" in str(ip):
+                    continue
                 if self.whitelist.allowed(ip):
                     self.state.bans.pop(ip, None)
                     self.state.offenses.pop(ip, None)
                     purged.append(ip)
+        for net in self._known_nets():
+            if self._net_touches_whitelist(net):
+                with self.state.lock:
+                    self.state.bans.pop(net, None)
+                purged_nets.append(net)
         for ip in purged:
             if not self.dry_run:
                 self.enforcer.remove(ip)
+        for net in purged_nets:
+            if not self.dry_run:
+                self.enforcer.remove_net(net)
         if purged:
             self.log.warn(_t("purged", len(purged), "、".join(purged)))
+        if purged_nets:
+            self.log.warn("已解除与白名单重叠的网段封禁 %d 个：%s"
+                          % (len(purged_nets), "、".join(purged_nets)))
 
     def _restore_pending_bans(self) -> None:
         pending = self.state.pending()
@@ -3300,7 +3636,13 @@ class ThreatDaemon:
             if self.dry_run:
                 restored += 1
                 continue
-            ok, err = self.enforcer.add(ip, seconds)
+            # A network-range ban must go back into the `hash:net` set. Adding
+            # the CIDR to `hash:ip` does not store a range -- it expands into
+            # 256 host entries -- so the two have to be routed separately.
+            if "/" in str(ip):
+                ok, err = self.enforcer.add_net(ip, seconds)
+            else:
+                ok, err = self.enforcer.add(ip, seconds)
             if ok:
                 restored += 1
             else:
@@ -3327,6 +3669,26 @@ class ThreatDaemon:
             "bans": len(self.state.bans),
             "offenses": len(self.state.offenses),
             "stats": dict(self.state.stats),
+            "detector_health": self._detector_failures(),
+            "events_pending": self.reporter.pending(),
+            "events_dropped": self.reporter.dropped_total(),
+            # Configuration that is read and displayed but drives nothing. It
+            # is listed *here*, next to the settings it belongs to, rather than
+            # left to be inferred from a doc: `threat.portscan.*` is accepted,
+            # validated and never consulted by any detector, so an operator
+            # reading `enabled: true` believes port scanning is covered when
+            # nothing is watching for it. Saying so is the whole fix.
+            "unimplemented": [
+                {
+                    "keys": ["threat.portscan.enabled",
+                             "threat.portscan.max_ports",
+                             "threat.portscan.window_seconds",
+                             "threat.portscan.ban_seconds"],
+                    "feature": "端口扫描检测",
+                    "effect": "当前无效：这些键会被读取和展示，但没有任何检测器"
+                              "使用它们，端口扫描不会被计数也不会被封禁。",
+                },
+            ],
         }
 
 
@@ -3440,6 +3802,14 @@ def _print_config(cfg) -> int:
     print("=" * 72)
     print(json.dumps(daemon.describe(), ensure_ascii=False, indent=2,
                      sort_keys=True))
+    # Printed twice on purpose: it is in the JSON above, but an operator
+    # scanning the output for "why is nothing happening" will read the prose,
+    # not the nested key.
+    for item in daemon.describe().get("unimplemented") or []:
+        print("\n[未实现] %s —— %s" % (item.get("feature", ""),
+                                        item.get("effect", "")))
+        print("         配置键（读取但无效）：%s"
+              % "、".join(item.get("keys") or []))
     print("\n[config keys read]  (in_schema=False means not in core/config.py DEFAULTS)")
     for item in daemon.settings.keys_read:
         print("  %-46s schema=%-5s source=%s"
@@ -3546,26 +3916,111 @@ def status_snapshot(cfg, log=None) -> dict:
     stats = info.get("stats") or {}
     if not info.get("whitelist"):
         notes.append("白名单为空 —— 存在被自己的风控锁在外面的风险")
+    gap = whitelist_rescue_gap(cfg)
+    if gap:
+        notes.append(gap)
+    for item in info.get("unimplemented") or []:
+        notes.append("%s%s —— %s" % (item.get("feature", ""),
+                                     "（配置键 %s）" % "、".join(item.get("keys") or [])
+                                     if item.get("keys") else "",
+                                     item.get("effect", "")))
+    for entry in info.get("detector_health") or []:
+        notes.append("检测器 %s 在来源 %s 上连续失败 %d 次 —— 该来源的检测当前无效"
+                     % (entry.get("detector", "?"), entry.get("path", "?"),
+                        int(entry.get("fails", 0))))
+    if int(info.get("events_dropped") or 0):
+        notes.append("已有 %d 条事件因告警队列上限被丢弃（未上报）—— "
+                     "可调大 threat.event_queue_max"
+                     % int(info.get("events_dropped") or 0))
     if not daemon.enforcer.set_exists() and not daemon.dry_run:
         notes.append("封禁集合 %s 不存在，自动封禁当前未生效"
                      % info.get("ipset_set"))
+
+    # Merge the per-address set with the network-range set, so a /24 that is
+    # currently blocked is counted (and listed) rather than invisible.
+    nets = {}
+    try:
+        nets = daemon.enforcer.net_members() or {}
+    except Exception:                                   # noqa: BLE001
+        nets = {}
+    banned_names = set(members) | set(nets) | set(daemon.state.bans or {})
 
     return {
         "enabled": bool(cfg.get("threat.enabled", True)),
         "ipset": info.get("ipset_set"),
         "chain": info.get("iptables_chain"),
         "whitelist_count": len(info.get("whitelist") or []),
-        "banned_count": len(members) or len(daemon.state.bans),
+        "banned_count": len(banned_names),
         "bans_total": stats.get("bans_total", 0),
         "offenses": len(daemon.state.offenses),
         "sources": len(sources),
         "source_list": sources,
         "signatures": info.get("signatures"),
         "strict_mode": info.get("strict_mode"),
+        "unimplemented": info.get("unimplemented") or [],
+        "detector_health": info.get("detector_health") or [],
         "stats": stats,
         "notes": notes,
         "daemon": info,
     }
+
+
+def _is_rescue_entry(entry: str, local: set) -> bool:
+    """Is this whitelist entry something that could let an operator back in?
+
+    Only addresses that are *not* the host itself count. Loopback, link-local
+    and every address configured on a local interface will still be reachable
+    when the operator is locked out from outside -- they are exactly the
+    entries that give a false sense of a rescue path.
+    """
+    text = str(entry or "").strip()
+    if not text:
+        return False
+    try:
+        net = (ipaddress.ip_network(text, strict=False) if "/" in text
+               else None)
+        addr = None if net else ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    if net is not None:
+        if net.is_loopback or net.is_link_local:
+            return False
+        # A range holding one of our own addresses is not a way back in from
+        # anywhere the operator actually is.
+        for own in local:
+            try:
+                if ipaddress.ip_address(own) in net:
+                    return False
+            except ValueError:
+                continue
+        return True
+    if addr.is_loopback or addr.is_link_local:
+        return False
+    return str(addr) not in local
+
+
+def whitelist_rescue_gap(cfg) -> str:
+    """A warning when the whitelist offers no way back in, else ``""``.
+
+    The DROP rule sits at INPUT position 1, ahead of ufw, so the whitelist is
+    the only thing standing between a mistaken automatic ban and a total
+    lockout -- that is how one real outage happened. A whitelist holding only
+    loopback and the host's own addresses cannot rescue anyone: it is empty in
+    every way that matters. This is deliberately a *reliable* check; guessing
+    the operator's current address is not something this program can do
+    honestly, so it does not pretend to.
+    """
+    entries = list(cfg.get("threat.whitelist", []) or [])
+    try:
+        local = {str(ipaddress.ip_address(a)) for a in local_addresses()}
+    except ValueError:
+        local = {"127.0.0.1", "::1"}
+    if any(_is_rescue_entry(e, local) for e in entries):
+        return ""
+    return ("白名单里除回环与本机地址外没有任何条目 —— 自动封禁一旦误伤，"
+            "没有任何「把我自己放回来」的路径（本程序的 DROP 规则排在 ufw 之前）。"
+            "请把管理端的固定出口地址加入 threat.whitelist，"
+            "例如 `vigil threat whitelist add <你的地址>`。")
 
 
 def list_bans(cfg, log=None) -> list:
@@ -3574,6 +4029,10 @@ def list_bans(cfg, log=None) -> list:
     The kernel's ipset membership is authoritative for *what is actually
     blocked*; the state file additionally knows why and until when. When
     they disagree the kernel wins, because that is what is really happening.
+
+    Network-range bans are included. They live in a separate `hash:net` set,
+    so a `/24` could be blocking a whole shared-ISP range and appear nowhere
+    in this list -- the one view an operator checks when a site is down.
     """
     daemon = _cli_daemon(cfg, log, dry_run=True)
     now = time.time()
@@ -3594,6 +4053,7 @@ def list_bans(cfg, log=None) -> list:
             "until": until,
             "remaining": max(0, int(until - now)) if until else 0,
             "geo": daemon.geo_text(ip),
+            "netblock": "/" in str(ip) or info.get("detector") == "netblock",
         }
     for ip, left in members.items():
         if ip in out:
@@ -3603,7 +4063,20 @@ def list_bans(cfg, log=None) -> list:
         out[ip] = {"ip": ip, "reason": "（内核中存在，本程序无记录）",
                    "detector": "", "offense": 0,
                    "until": now + (left or 0), "remaining": int(left or 0),
-                   "geo": daemon.geo_text(ip)}
+                   "geo": daemon.geo_text(ip), "netblock": False}
+    try:
+        nets = daemon.enforcer.net_members() or {}
+    except Exception:                                   # noqa: BLE001
+        nets = {}
+    for net, left in nets.items():
+        if net in out:
+            if left is not None:
+                out[net]["remaining"] = int(left)
+            continue
+        out[net] = {"ip": net, "reason": "（内核中存在，本程序无记录）",
+                    "detector": "netblock", "offense": 0,
+                    "until": now + (left or 0), "remaining": int(left or 0),
+                    "geo": daemon.geo_text(net), "netblock": True}
     return sorted(out.values(), key=lambda b: b["remaining"])
 
 
@@ -3669,6 +4142,102 @@ def remove_net(cfg, net: str, log=None) -> bool:
     return ok
 
 
+def firewall_artifacts(cfg=None, log=None) -> dict:
+    """This program's own ipset sets and INPUT rules, as they exist now.
+
+    Read-only, and deliberately limited to names we own: uninstall must be
+    able to remove exactly what it created and nothing else. Both the
+    configured per-address set and the derived ``<set>_net`` range set count
+    as ours; a name is matched whole (``--match-set <name> src``), so
+    ``vigil_threat`` can never match ``vigil_threat_net``.
+    """
+    cfg = cfg or load_config()
+    set_name = str(cfg.get("threat.ipset_set", "vigil_threat") or "vigil_threat")
+    chain = str(cfg.get("threat.iptables_chain", "INPUT") or "INPUT")
+    ours = [set_name, set_name + "_net"]
+    iptables = (shell.which(str(cfg.get("threat.iptables_program", "iptables")),
+                            "/usr/sbin/iptables", "/sbin/iptables")
+                or str(cfg.get("threat.iptables_program", "iptables")))
+    ipset = (shell.which(str(cfg.get("threat.ipset_program", "ipset")),
+                         "/usr/sbin/ipset", "/sbin/ipset")
+             or str(cfg.get("threat.ipset_program", "ipset")))
+    out = {"sets": [], "rules": [], "chain": chain, "set_names": ours}
+
+    ok, names, _err = shell.run([ipset, "list", "-n"], timeout=10)
+    if ok:
+        present = set(names.split())
+        out["sets"] = [n for n in ours if n in present]
+
+    ok, listing, _err = shell.run([iptables, "-S", chain], timeout=10)
+    if not ok:
+        return out
+    for line in listing.splitlines():
+        if not line.startswith("-A %s " % chain) or "-j DROP" not in line:
+            continue
+        if not any(("--match-set %s src" % name) in line for name in ours):
+            continue
+        out["rules"].append(line[len("-A %s " % chain):].split())
+    return out
+
+
+def remove_firewall_artifacts(cfg=None, log=None, dry_run: bool = False) -> dict:
+    """Remove this program's firewall objects **by name** on uninstall.
+
+    Uninstall used to leave both the sets and the INPUT rules behind, which
+    meant a reinstall stacked a second identical DROP rule and every future
+    rule reorder had two copies to manage. The stated reason for not touching
+    the firewall ("that is how you lock yourself out") is right about *other
+    people's* rules and wrong about our own: deleting a rule whose only match
+    is our own set cannot affect anything we did not create.
+
+    Safety rails, because this runs at the moment the operator is already
+    nervous:
+
+    * only the two names this program derives (``<set>`` and ``<set>_net``);
+    * a rule is only removed when its ``--match-set`` is one of those names
+      *and* its target is DROP;
+    * sets are destroyed **after** the rules are gone, because the kernel
+      refuses to destroy a set that a rule still references;
+    * every failure is reported, never raised.
+    """
+    from ..core.config import load as _load_cfg
+    cfg = cfg or _load_cfg()
+    state = firewall_artifacts(cfg, log=log)
+    chain = state["chain"]
+    ours = state["set_names"]
+    iptables = (shell.which(str(cfg.get("threat.iptables_program", "iptables")),
+                            "/usr/sbin/iptables", "/sbin/iptables")
+                or str(cfg.get("threat.iptables_program", "iptables")))
+    ipset = (shell.which(str(cfg.get("threat.ipset_program", "ipset")),
+                         "/usr/sbin/ipset", "/sbin/ipset")
+             or str(cfg.get("threat.ipset_program", "ipset")))
+
+    removed_rules, destroyed, skipped, errors = [], [], [], []
+    for spec in state["rules"]:
+        if dry_run:
+            skipped.append(" ".join(spec))
+            continue
+        ok, _out, err = shell.run([iptables, "-D", chain] + spec, timeout=10)
+        if ok:
+            removed_rules.append(" ".join(spec))
+        else:
+            errors.append("删除规则失败（%s）：%s"
+                          % (" ".join(spec), oneline(err, 120)))
+    for name in ours:
+        if name not in state["sets"]:
+            continue
+        if dry_run:
+            skipped.append("destroy %s" % name)
+            continue
+        ok, _out, err = shell.run([ipset, "destroy", name], timeout=10)
+        if ok:
+            destroyed.append(name)
+        else:
+            errors.append("销毁集合 %s 失败：%s" % (name, oneline(err, 120)))
+    return {"rules": removed_rules, "sets": destroyed, "would": skipped,
+            "errors": errors, "dry_run": dry_run, "chain": chain}
+
+
 def unban(cfg, ip: str, log=None) -> tuple:
     """Lift a ban, durably. Returns ``(ok, detail)``.
 
@@ -3679,10 +4248,17 @@ def unban(cfg, ip: str, log=None) -> tuple:
       file, so the removal survives the daemon's next save and the next
       restart. Without the second step the address reappeared minutes later,
       which looks exactly like the unban silently failing.
+
+    A network range is routed to the ``hash:net`` set. It used to go to
+    ``ipset del <hash:ip set> <cidr>``, which never matched anything, and the
+    command then reported "该地址当前不在封禁记录中" while the /24 stayed
+    blocked -- a wrong answer that sent the operator looking in the wrong
+    place.
     """
     if not is_valid_address(ip):
         return False, "不是合法的 IP 或网段: %s" % ip
     daemon = _cli_daemon(cfg, log, dry_run=False)
+    is_net = "/" in str(ip)
 
     # Three steps, because each covers a different failure:
     #
@@ -3701,7 +4277,10 @@ def unban(cfg, ip: str, log=None) -> tuple:
     # not visible from the CLI) -- so on the real host it took the direct
     # path, the daemon clobbered it, and the bans came back. A request that
     # is always written cannot be skipped by a bad guess.
-    daemon.enforcer.remove(ip)
+    if is_net:
+        daemon.enforcer.remove_net(ip)
+    else:
+        daemon.enforcer.remove(ip)
     try:
         os.makedirs(os.path.dirname(str(UNBAN_REQUESTS)), exist_ok=True)
         with open(str(UNBAN_REQUESTS), "a", encoding="utf-8") as fh:

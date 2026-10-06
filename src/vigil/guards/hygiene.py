@@ -47,6 +47,7 @@ free.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 from ..core import detect, paths
@@ -60,16 +61,53 @@ MAX_URI = 4096
 #: Longest `Host` we will accept, in bytes. 253 is the DNS maximum.
 MAX_HOST = 254
 
-#: Methods this host serves. Everything else is refused with 405.
+#: Methods this host serves when the operator has not said otherwise.
 #:
-#: The site is a set of static pages plus a small API surface: it has nothing
-#: that is legitimately written to over HTTP. `PUT`, `DELETE`, `TRACE`,
-#: `PROPFIND`, `MKCOL` and friends exist here only as something to exploit --
-#: WebDAV misconfiguration, cross-site tracing, and the long tail of CMS
-#: upload bugs all begin with a method the site never needed. Refusing them
-#: at the top of the server block costs nothing and removes a whole class of
-#: request before any other rule has to consider it.
-ALLOWED_METHODS = ("GET", "HEAD", "POST")
+#: `OPTIONS` is here because leaving it out broke real clients: a browser's
+#: CORS preflight and a REST API's capability probe both send it, and the rule
+#: answered 405. A hardening rule that takes a working API offline is the wrong
+#: trade -- the methods worth refusing are the ones that *write* or that exist
+#: only to be exploited (`PUT`, `DELETE`, `TRACE`, `PROPFIND`), not the one a
+#: well-behaved cross-origin client must send first.
+#:
+#: The list is configurable (`hygiene.allowed_methods`) because a site with no
+#: API at all may prefer the stricter set; the default is the one that does not
+#: break normal use.
+DEFAULT_ALLOWED_METHODS = ("GET", "HEAD", "POST", "OPTIONS")
+
+#: Kept as the name older callers and tests use. It is the *default*; the
+#: effective list comes from :func:`allowed_methods`.
+ALLOWED_METHODS = DEFAULT_ALLOWED_METHODS
+
+#: Shape a method name may have. It is interpolated into an nginx regex
+#: (`^(GET|HEAD|...)$`), so anything that could close the group or add an
+#: alternative must never get through.
+_METHOD_RE = re.compile(r"^[A-Z][A-Z0-9-]{0,19}$")
+
+
+def _clean_methods(raw) -> tuple:
+    out = []
+    for item in (raw or []):
+        token = str(item or "").strip().upper()
+        if token and _METHOD_RE.match(token) and token not in out:
+            out.append(token)
+    return tuple(out)
+
+
+def allowed_methods(cfg=None) -> tuple:
+    """The effective method allow-list.
+
+    ``cfg is None`` means "the built-in default", not "read whatever is on
+    this host": a pure renderer must stay host-independent, and the callers
+    that have a configuration pass it in.
+    """
+    if cfg is None:
+        return DEFAULT_ALLOWED_METHODS
+    try:
+        configured = _clean_methods(cfg.get("hygiene.allowed_methods", None))
+    except (AttributeError, TypeError, ValueError):
+        configured = ()
+    return configured or DEFAULT_ALLOWED_METHODS
 
 #: Path shapes that are never a legitimate request, rejected on the **raw**
 #: `$request_uri` rather than the normalised `$uri`.
@@ -102,13 +140,14 @@ BAD_URI = (r"((^|/)(\.\./|\.\.$|%2e%2e|%252e|%c0%ae|%e0%80%ae)|%00)")
 OVERRIDE_HEADERS = ("$http_x_http_method_override", "$http_x_method_override")
 
 
-def render() -> str:
+def render(methods=None) -> str:
     """The server-scope snippet.
 
     Kept free of any host-specific value: this file is written to every
     protected site and must not carry one site's identity into another's
     configuration.
     """
+    method_list = _clean_methods(methods) or DEFAULT_ALLOWED_METHODS
     return """# 由 vigil 生成：请求卫生（请勿手工编辑，vigil update/卸载会重建或删除）
 #
 # 在 server{} 作用域收紧请求行与 Host 头的大小。面板在 http{} 里把它们
@@ -119,8 +158,9 @@ def render() -> str:
 client_header_buffer_size     4k;
 large_client_header_buffers   4 8k;
 
-# 只接受本站真正需要的请求方法。其余（PUT / DELETE / TRACE / PROPFIND …）
-# 在本站没有任何合法用途，只可能是被利用的对象。
+# 只接受本站真正需要的请求方法（可用 hygiene.allowed_methods 调整）。
+# 其余（PUT / DELETE / TRACE / PROPFIND …）在本站没有合法用途，只可能是
+# 被利用的对象。%(options_note)s
 if ($request_method !~ ^(%(methods)s)$) {
     return 405;
 }
@@ -147,7 +187,9 @@ if ($request_uri ~* "%(bad_uri)s") {
 # 方法覆盖头：只检查 $request_method 是拦不住它们的。
 %(override)s
 """ % {"max_uri": MAX_URI, "uri_re": MAX_URI + 1, "host_re": MAX_HOST + 1,
-       "methods": "|".join(ALLOWED_METHODS), "bad_uri": BAD_URI,
+       "methods": "|".join(method_list), "bad_uri": BAD_URI,
+       "options_note": ("OPTIONS 默认放行：跨域预检必须用它，拒绝它等于让"
+                        "正常 API 全部 405。" if "OPTIONS" in method_list else ""),
        "override": "\n".join(
            "if (%s) { return 400; }" % h for h in OVERRIDE_HEADERS)}
 
@@ -190,14 +232,14 @@ def targets() -> list:
     return out
 
 
-def install(dry_run: bool = False) -> tuple:
+def install(dry_run: bool = False, cfg=None) -> tuple:
     """Write the snippet and prove nginx took it. All-or-nothing."""
     from ..gates import shield
 
     pairs = targets()
     if not pairs:
         return False, "没有找到受保护的站点（扩展目录为空）"
-    body = render()
+    body = render(allowed_methods(cfg))
     written, created = [], []
     try:
         for _site, conf in pairs:
@@ -265,10 +307,11 @@ def uninstall() -> tuple:
     return ok, "已移除 %d 个站点：%s" % (removed, how)
 
 
-def status() -> dict:
+def status(cfg=None) -> dict:
     pairs = targets()
+    methods = allowed_methods(cfg)
     active = [(str(conf), conf.exists() and
-               conf.read_text(encoding="utf-8") == render())
+               conf.read_text(encoding="utf-8") == render(methods))
               for _site, conf in pairs]
     return {"sites": len(pairs),
             "installed": sum(1 for _p, ok in active if ok),
@@ -280,7 +323,7 @@ def status() -> dict:
             "present": sum(1 for p, _ok in active if Path(p).exists()),
             "stale": [p for p, ok in active if not ok],
             "max_uri": MAX_URI, "max_host": MAX_HOST,
-            "allowed_methods": list(ALLOWED_METHODS)}
+            "allowed_methods": list(methods)}
 
 
 def main(argv=None) -> int:

@@ -11013,5 +11013,1409 @@ class TestBusyIsNotTheSameAsSuspicious(unittest.TestCase):
         self.assertIn("500", res.detail)
 
 
+# --------------------------------------------------------------------------
+# v3.3.1 fixes: the confirmed-but-unfixed defects from the full audit.
+#
+# Fixtures are neutral: RFC 5737 documentation addresses and `example.com`
+# only, so nothing here carries this host's identity.
+# --------------------------------------------------------------------------
+
+
+class _RecordingLog:
+    """A logger that keeps every line, for asserting that one was emitted."""
+
+    def __init__(self):
+        self.lines = []
+
+    def _add(self, level, msg, *a):
+        try:
+            text = (msg % a) if a else str(msg)
+        except (TypeError, ValueError):
+            text = "%s %s" % (msg, a)
+        self.lines.append((level, text))
+
+    def debug(self, m, *a): self._add("debug", m, *a)     # noqa: E704
+    def info(self, m, *a): self._add("info", m, *a)       # noqa: E704
+    def warn(self, m, *a): self._add("warn", m, *a)       # noqa: E704
+    def error(self, m, *a): self._add("error", m, *a)     # noqa: E704
+    def crit(self, m, *a): self._add("crit", m, *a)       # noqa: E704
+
+    def text(self):
+        return "\n".join(t for _lvl, t in self.lines)
+
+    def levels(self):
+        return [lvl for lvl, _t in self.lines]
+
+
+class _LiveWebServer:
+    """The real status server on an ephemeral loopback port.
+
+    Driving the actual handler is the point: the login limit, the forwarded
+    header handling and the request logging all live in the HTTP path, and a
+    unit test of `_Attempts` would have passed against the broken version.
+    """
+
+    def __init__(self, cfg, logger):
+        import threading
+        from vigil.web import server as wserver
+        self.wserver = wserver
+        self.srv = wserver.make_server(cfg, "127.0.0.1", 0, logger=logger)
+        self.port = self.srv.server_address[1]
+        self._thread = threading.Thread(target=self.srv.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+
+    def request(self, method, path, body=None, headers=None, timeout=5):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                          timeout=timeout)
+        try:
+            conn.request(method, path, body=body, headers=headers or {})
+            resp = conn.getresponse()
+            return resp.status, resp.read()
+        finally:
+            conn.close()
+
+    def login(self, forwarded_for=None, username="op", password="wrong"):
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        if forwarded_for is not None:
+            headers["X-Forwarded-For"] = forwarded_for
+        return self.request("POST", "/login",
+                            body="username=%s&password=%s" % (username, password),
+                            headers=headers)
+
+    def close(self):
+        try:
+            self.srv.shutdown()
+        finally:
+            self.srv.server_close()
+
+
+class _IsolatedThreatPaths:
+    """Point the threat module's state files at a temporary directory.
+
+    The module resolves `THREAT_STATE`, `LOG_OFFSETS`, `UNBAN_REQUESTS` and
+    `POSTURE_FLAG` from `paths.STATE_STATE` at import time, so a daemon built
+    in a test would otherwise read -- and, on flush, *write* -- the real
+    host's state. A test run must be a rehearsal against fictional hosts.
+    """
+
+    def _isolate_threat_paths(self, root):
+        from vigil.guards import threat as threat_mod
+        self._saved_paths = (threat_mod.LOG_OFFSETS,
+                             threat_mod.UNBAN_REQUESTS,
+                             threat_mod.POSTURE_FLAG,
+                             threat_mod.paths.THREAT_STATE)
+        threat_mod.LOG_OFFSETS = root / "log-offsets.json"
+        threat_mod.UNBAN_REQUESTS = root / "unban.jsonl"
+        threat_mod.POSTURE_FLAG = root / "posture"
+        threat_mod.paths.THREAT_STATE = root / "threat-state.json"
+        self.addCleanup(self._restore_threat_paths)
+
+    def _restore_threat_paths(self):
+        from vigil.guards import threat as threat_mod
+        (threat_mod.LOG_OFFSETS, threat_mod.UNBAN_REQUESTS,
+         threat_mod.POSTURE_FLAG, threat_mod.paths.THREAT_STATE
+         ) = self._saved_paths
+
+
+class TestProxyAwareLoginRateLimit(unittest.TestCase):
+    """M15: one visitor's typos must not lock everybody out.
+
+    The service listens on loopback and is proxied, so `client_address[0]`
+    was `127.0.0.1` for every visitor: eight wrong passwords from a stranger
+    locked the operator out for ten minutes. Reading X-Forwarded-For
+    unconditionally is the opposite bug -- a client can invent a fresh source
+    per attempt. Both directions are pinned here.
+    """
+
+    def test_forwarded_header_is_ignored_from_an_untrusted_peer(self):
+        from vigil.web import server as wserver
+        self.assertEqual(
+            "203.0.113.9",
+            wserver.client_key("203.0.113.9", "198.51.100.7"),
+            "非受信对端提供的 X-Forwarded-For 被采信了 —— 可伪造绕过限流")
+
+    def test_the_rightmost_hop_is_the_one_the_proxy_saw(self):
+        from vigil.web import server as wserver
+        # The left entries are supplied by the client and are not evidence.
+        self.assertEqual("198.51.100.7", wserver.client_key(
+            "127.0.0.1", "203.0.113.9, 198.51.100.7"))
+
+    def test_trusted_hops_in_the_chain_are_skipped(self):
+        from vigil.web import server as wserver
+        self.assertEqual("203.0.113.9", wserver.client_key(
+            "127.0.0.1", "203.0.113.9, 127.0.0.1"))
+
+    def test_a_missing_or_broken_header_falls_back_to_the_peer(self):
+        from vigil.web import server as wserver
+        self.assertEqual("127.0.0.1", wserver.client_key("127.0.0.1", ""))
+        self.assertEqual("127.0.0.1", wserver.client_key("127.0.0.1", "not-an-ip"))
+        self.assertEqual("127.0.0.1", wserver.client_key("127.0.0.1", ","))
+
+    def test_multiple_proxies_can_be_trusted_explicitly(self):
+        from vigil.web import server as wserver
+        trusted = ("10.0.0.0/8", "127.0.0.1/8")
+        self.assertEqual("203.0.113.9",
+                         wserver.client_key("10.0.0.5", "203.0.113.9",
+                                            trusted=trusted))
+        self.assertEqual("10.0.0.5",
+                         wserver.client_key("10.0.0.5", "203.0.113.9"))
+
+    def test_two_sources_are_counted_separately(self):
+        from vigil.web import server as wserver
+        attempts = wserver._Attempts(limit=3, window=60)
+        a = wserver.client_key("127.0.0.1", "203.0.113.9")
+        b = wserver.client_key("127.0.0.1", "198.51.100.4")
+        for _ in range(3):
+            attempts.bump(a)
+        self.assertTrue(attempts.blocked(a))
+        self.assertFalse(attempts.blocked(b), "一个来源的失败牵连了另一个来源")
+
+    def test_a_forged_header_cannot_rotate_the_key(self):
+        from vigil.web import server as wserver
+        attempts = wserver._Attempts(limit=3, window=60)
+        for i in range(1, 6):
+            # Same socket peer, a new invented forwarding address every time.
+            key = wserver.client_key("203.0.113.9", "198.51.100.%d" % i)
+            self.assertEqual("203.0.113.9", key)
+            attempts.bump(key)
+        self.assertTrue(attempts.blocked("203.0.113.9"),
+                        "伪造 X-Forwarded-For 绕过了限流")
+
+    def test_a_successful_login_clears_the_strikes(self):
+        from vigil.web import server as wserver
+        attempts = wserver._Attempts(limit=3, window=60)
+        attempts.bump("203.0.113.9")
+        attempts.bump("203.0.113.9")
+        attempts.clear("203.0.113.9")
+        self.assertFalse(attempts.blocked("203.0.113.9"),
+                         "成功登录之后仍然背着失败计数")
+
+    def test_the_trusted_proxy_list_comes_from_the_config(self):
+        from vigil.web import server as wserver
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = vconfig.Config(path=Path(tmp) / "c.json",
+                                 secrets_path=Path(tmp) / "s.json")
+            self.assertEqual(tuple(wserver.DEFAULT_TRUSTED_PROXIES),
+                             wserver._trusted_from_cfg(cfg))
+            cfg.set("web.trusted_proxies", ["10.0.0.0/8"])
+            self.assertEqual(("10.0.0.0/8",), wserver._trusted_from_cfg(cfg))
+
+
+class TestWebLoginBehindTheRealServer(unittest.TestCase):
+    """The same three properties, driven through the actual HTTP handler."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.log = _RecordingLog()
+
+    def _server(self, limit=3):
+        from vigil.web import server as wserver
+        srv = _LiveWebServer(self.cfg, self.log)
+        self.addCleanup(srv.close)
+        # A small limit keeps the test quick while exercising the same code.
+        srv.srv.RequestHandlerClass.attempts = wserver._Attempts(
+            limit=limit, window=60)
+        return srv
+
+    def test_each_forwarded_source_gets_its_own_budget(self):
+        srv = self._server()
+        for _ in range(3):
+            status, _b = srv.login(forwarded_for="203.0.113.9")
+            self.assertEqual(401, status)
+        self.assertEqual(429, srv.login(forwarded_for="203.0.113.9")[0],
+                         "同一来源没有被限流")
+        # A different visitor must still be able to try.
+        self.assertEqual(401, srv.login(forwarded_for="198.51.100.4")[0],
+                         "一个来源把另一个来源锁在了门外（M15 的原症状）")
+
+    def test_the_limit_is_not_bypassed_by_minting_new_addresses(self):
+        # Loopback is not a trusted proxy here, so the header must be ignored
+        # and every request shares the peer's bucket.
+        self.cfg.set("web.trusted_proxies", ["198.51.100.0/24"])
+        srv = self._server()
+        codes = [srv.login(forwarded_for="203.0.113.%d" % i)[0]
+                 for i in range(1, 5)]
+        self.assertEqual(429, codes[-1],
+                         "伪造 X-Forwarded-For 每次换一个来源就绕过了限流")
+
+    def test_a_failed_login_is_written_to_the_logger(self):
+        srv = self._server()
+        status, _b = srv.login(forwarded_for="203.0.113.9")
+        self.assertEqual(401, status)
+        text = self.log.text()
+        self.assertIn("401", text, "认证失败没有留下任何痕迹")
+        self.assertIn("203.0.113.9", text, "认证失败没有记录来源")
+
+    def test_a_server_error_is_written_to_the_logger(self):
+        from http import HTTPStatus
+        from urllib.parse import urlsplit
+        srv = self._server()
+        handler_cls = srv.srv.RequestHandlerClass
+        original = handler_cls.do_GET
+
+        def do_GET(self):
+            if urlsplit(self.path).path == "/__boom":
+                return self._send(HTTPStatus.INTERNAL_SERVER_ERROR, b"boom")
+            return original(self)
+
+        handler_cls.do_GET = do_GET
+        try:
+            status, _b = srv.request("GET", "/__boom")
+        finally:
+            handler_cls.do_GET = original
+        self.assertEqual(500, status)
+        self.assertIn("error", self.log.levels(), "5xx 没有落进 logger")
+        self.assertIn("500", self.log.text())
+
+    def test_a_successful_login_clears_the_counter_through_the_handler(self):
+        from vigil.web import server as wserver
+        wserver.set_password(self.cfg, "op", "correct horse battery staple")
+        srv = self._server(limit=3)
+        for _ in range(2):
+            self.assertEqual(401, srv.login(forwarded_for="203.0.113.9")[0])
+        status, _b = srv.login(forwarded_for="203.0.113.9",
+                               password="correct horse battery staple")
+        self.assertEqual(200, status)
+        # The two typos must not count against the next attempt.
+        self.assertEqual(401, srv.login(forwarded_for="203.0.113.9")[0],
+                         "成功登录后失败计数没有清零")
+
+
+class TestCsrfTableHasRealMutualExclusion(unittest.TestCase):
+    """The CSRF table's lock was created per call, so it excluded nothing."""
+
+    def test_one_token_per_session_even_under_concurrency(self):
+        import threading
+        from vigil.web import server as wserver
+        calls = []
+
+        class _Handler:
+            csrf = {}
+
+        handler = _Handler()
+        real_token = wserver.pysecrets.token_urlsafe
+
+        def slow_token(n=24):
+            calls.append(1)
+            time.sleep(0.05)
+            return "tok-%d" % len(calls)
+
+        wserver.pysecrets.token_urlsafe = slow_token
+        results = []
+        try:
+            threads = [threading.Thread(
+                target=lambda: results.append(
+                    wserver.Handler._csrf_for(handler, "session-1")))
+                for _ in range(6)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(5)
+        finally:
+            wserver.pysecrets.token_urlsafe = real_token
+        self.assertEqual(1, len(calls),
+                         "CSRF 表没有真正的互斥：同一会话被生成了 %d 个令牌"
+                         % len(calls))
+        self.assertEqual(1, len(set(results)))
+        self.assertEqual(1, len(handler.csrf))
+
+
+class TestCircuitBreakerCountsSourcesNotAttempts(_IsolatedThreatPaths, unittest.TestCase):
+    """M1: one source's burst must not disable banning for an hour."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def _breaker(self, limit=3, window=3600):
+        from vigil.guards import threat as threat_mod
+        return threat_mod.BanBreaker(limit=limit, window=window)
+
+    def test_a_repeated_decision_counts_once(self):
+        b = self._breaker()
+        for _ in range(60):
+            b.record("203.0.113.9", "http_burst")
+        self.assertEqual(1, b.recent(), "同一来源同一检测器被重复计数")
+
+    def test_distinct_sources_are_counted_apart(self):
+        b = self._breaker()
+        for last in (1, 2, 3):
+            b.record("203.0.113.%d" % last, "http_burst")
+        self.assertEqual(3, b.recent())
+
+    def test_a_different_detector_is_a_different_decision(self):
+        b = self._breaker()
+        b.record("203.0.113.9", "http_burst")
+        b.record("203.0.113.9", "ssh_brute")
+        self.assertEqual(2, b.recent())
+
+    def test_it_still_trips_at_the_limit(self):
+        b = self._breaker(limit=3)
+        for last in (1, 2, 3):
+            b.record("203.0.113.%d" % last, "http_burst")
+        tripped, count = b.tripped()
+        self.assertTrue(tripped, "真的达到上限时反而不熔断了")
+        self.assertEqual(3, count)
+
+    def test_entries_leave_the_window(self):
+        b = self._breaker(limit=3, window=10)
+        b.record("203.0.113.9", "http_burst")
+        b._seen["203.0.113.9|http_burst"] = time.time() - 100
+        self.assertEqual(0, b.recent())
+        self.assertFalse(b.tripped()[0])
+
+    def test_a_single_source_burst_does_not_trip_the_daemon_breaker(self):
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.max_bans_per_hour", 3)
+        daemon = threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                         dry_run=True, echo=False)
+        for _ in range(30):
+            daemon.ban("203.0.113.9", "目录扫描", detector="http_burst")
+        self.assertFalse(daemon.breaker.tripped()[0],
+                         "单一来源的一次突发打满了熔断，随后 1 小时不再封禁")
+        # Real distinct decisions still trip it.
+        for last in (1, 2):
+            daemon.ban("198.51.100.%d" % last, "目录扫描", detector="http_burst")
+        self.assertTrue(daemon.breaker.tripped()[0],
+                        "多个独立来源达到上限后应当熔断")
+
+
+class TestDetectorFailuresAreVisible(_IsolatedThreatPaths, unittest.TestCase):
+    """M7: a detector that throws must not be a debug-level secret."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def _daemon(self):
+        from vigil.guards import threat as threat_mod
+        log = _RecordingLog()
+        daemon = threat_mod.ThreatDaemon(self.cfg, log=log, dry_run=True,
+                                         echo=False)
+        self.queued = []
+        daemon.reporter.queue = lambda event: self.queued.append(event)
+        return daemon, log
+
+    def test_a_first_failure_is_a_warning(self):
+        daemon, log = self._daemon()
+        daemon._note_detector_failure("auth", "/var/log/auth.log",
+                                      ValueError("bad line"), 1)
+        self.assertIn("warn", log.levels(), "检测器失败连 warn 都没有")
+        self.assertIn("auth", log.text())
+
+    def test_a_sustained_failure_raises_one_alert(self):
+        daemon, _log = self._daemon()
+        for count in range(1, 9):
+            daemon._note_detector_failure("nginx_access", "/var/log/nginx.log",
+                                          ValueError("bad line"), count)
+        detect = [e for e in self.queued if e.get("kind") == "DETECT"]
+        self.assertEqual(1, len(detect),
+                         "连续失败既没有告警，或者每条日志告了一条")
+        self.assertEqual("nginx_access", detect[0]["detector"])
+        self.assertTrue(detect[0]["path"])
+        entry = daemon.detector_health.get("nginx_access")
+        self.assertIsNotNone(entry)
+        self.assertGreaterEqual(entry["fails"], 5)
+
+    def test_a_recovered_source_is_reported_and_forgotten(self):
+        daemon, log = self._daemon()
+        daemon._note_detector_failure("auth", "/var/log/auth.log",
+                                      ValueError("x"), 3)
+        daemon._note_detector_recovered("auth", "/var/log/auth.log", 3)
+        self.assertNotIn("auth", daemon.detector_health)
+        self.assertIn("恢复", log.text())
+
+    def test_a_broken_handler_is_not_silent_in_the_tail_loop(self):
+        import threading
+        from vigil.guards import threat as threat_mod
+        daemon, log = self._daemon()
+        log_path = Path(self.tmp.name) / "auth.log"
+        log_path.write_text("line\n" * 8, encoding="utf-8")
+        daemon._log_offsets[str(log_path)] = {
+            "inode": log_path.stat().st_ino, "offset": 0}
+
+        def boom(_line):
+            raise ValueError("log format changed")
+
+        thread = threading.Thread(
+            target=daemon.tail_file, args=(str(log_path), boom, "auth"),
+            daemon=True)
+        thread.start()
+        deadline = time.time() + 10
+        try:
+            while time.time() < deadline:
+                if daemon.detector_health.get("auth", {}).get("fails", 0) >= 5:
+                    break
+                time.sleep(0.1)
+        finally:
+            daemon.stop.set()
+            thread.join(5)
+        entry = daemon.detector_health.get("auth") or {}
+        self.assertGreaterEqual(entry.get("fails", 0), 5,
+                                "tail 循环里的检测器异常没有留下任何记录")
+        self.assertIn("warn", log.levels(), "检测器连续失败只写了 debug")
+        self.assertTrue(any(e.get("kind") == "DETECT" for e in self.queued),
+                        "同一来源连续失败没有告警")
+
+    def test_a_healthy_handler_leaves_no_failure_state(self):
+        import threading
+        daemon, log = self._daemon()
+        log_path = Path(self.tmp.name) / "nginx.log"
+        log_path.write_text("line\n" * 8, encoding="utf-8")
+        daemon._log_offsets[str(log_path)] = {
+            "inode": log_path.stat().st_ino, "offset": 0}
+        thread = threading.Thread(
+            target=daemon.tail_file, args=(str(log_path), lambda _l: None,
+                                           "nginx_access"), daemon=True)
+        thread.start()
+        deadline = time.time() + 5
+        try:
+            while time.time() < deadline and daemon.state.stats.get("events", 0) < 4:
+                time.sleep(0.1)
+        finally:
+            daemon.stop.set()
+            thread.join(5)
+        self.assertEqual({}, daemon.detector_health)
+        self.assertEqual([], [lvl for lvl, _t in log.lines
+                              if lvl in ("warn", "error", "crit")])
+
+
+class TestPortScanIsHonestlyUnimplemented(_IsolatedThreatPaths, unittest.TestCase):
+    """M2: the switch says "on" and nothing watches.
+
+    Making it true is a design job (it needs a side channel such as
+    conntrack). Pretending it works is not an option this project can take,
+    so the configuration is reported as inert wherever it is displayed.
+    """
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def test_show_config_lists_it_as_unimplemented(self):
+        from vigil.guards import threat as threat_mod
+        daemon = threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                         dry_run=True, echo=False)
+        items = daemon.describe().get("unimplemented") or []
+        self.assertTrue(items, "端口扫描检测未实现这件事没有被报告")
+        blob = json.dumps(items, ensure_ascii=False)
+        self.assertIn("portscan", blob)
+        self.assertIn("无效", blob)
+
+    def test_status_notes_say_it_plainly(self):
+        from vigil.guards import threat as threat_mod
+        real = threat_mod.local_addresses
+        threat_mod.local_addresses = lambda: {"127.0.0.1", "::1"}
+        try:
+            snap = threat_mod.status_snapshot(self.cfg)
+        finally:
+            threat_mod.local_addresses = real
+        joined = "\n".join(snap.get("notes") or [])
+        self.assertIn("端口扫描", joined)
+        self.assertIn("无效", joined)
+
+
+class TestEnabledSwitchesActuallySwitch(_IsolatedThreatPaths, unittest.TestCase):
+    """M3: `threat.http.enabled` / `threat.ssh.enabled` were dead keys."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def _daemon(self):
+        from vigil.guards import threat as threat_mod
+        return threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                       dry_run=True, echo=False)
+
+    def test_disabling_http_detection_stops_http_bans(self):
+        self.cfg.set("threat.http.enabled", False)
+        daemon = self._daemon()
+        line = _http_line("203.0.113.9", "GET /../../etc/passwd HTTP/1.1", 404)
+        daemon.handle_http(line)
+        self.assertEqual({}, daemon.state.bans,
+                         "关掉 HTTP 检测之后照样封人")
+
+    def test_enabling_http_detection_still_bans(self):
+        daemon = self._daemon()
+        line = _http_line("203.0.113.9", "GET /../../etc/passwd HTTP/1.1", 404)
+        daemon.handle_http(line)
+        self.assertIn("203.0.113.9", daemon.state.bans)
+
+    def test_disabling_ssh_detection_stops_ssh_bans(self):
+        self.cfg.set("threat.ssh.enabled", False)
+        daemon = self._daemon()
+        for _ in range(daemon.settings.ssh_max_failures + 2):
+            daemon.handle_ssh(
+                "Failed password for root from 203.0.113.9 port 2222 ssh2")
+        self.assertEqual({}, daemon.state.bans,
+                         "关掉 SSH 检测之后照样封人")
+
+    def test_enabling_ssh_detection_still_bans(self):
+        daemon = self._daemon()
+        for _ in range(daemon.settings.ssh_max_failures):
+            daemon.handle_ssh(
+                "Failed password for root from 203.0.113.9 port 2222 ssh2")
+        self.assertIn("203.0.113.9", daemon.state.bans)
+
+
+def _http_line(ip, request, status):
+    return ('%s - - [27/Feb/2026:10:00:00 +0800] "%s" %d 512 "-" "curl/8.0"'
+            % (ip, request, status))
+
+
+class TestHygieneMethodsAreConfigurable(unittest.TestCase):
+    """M11: no OPTIONS meant every CORS preflight and REST probe got a 405."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def test_options_is_allowed_by_default(self):
+        from vigil.guards import hygiene
+        self.assertIn("OPTIONS", hygiene.ALLOWED_METHODS)
+        body = hygiene.render()
+        self.assertIn("OPTIONS", body)
+        rule = [l for l in body.splitlines() if "request_method" in l][0]
+        self.assertIn("GET|HEAD|POST|OPTIONS", rule)
+
+    def test_the_methods_can_be_narrowed_by_configuration(self):
+        from vigil.guards import hygiene
+        self.cfg.set("hygiene.allowed_methods", ["GET", "HEAD"])
+        self.assertEqual(("GET", "HEAD"), hygiene.allowed_methods(self.cfg))
+        body = hygiene.render(hygiene.allowed_methods(self.cfg))
+        self.assertNotIn("OPTIONS", body)
+
+    def test_lowercase_entries_are_normalised(self):
+        from vigil.guards import hygiene
+        self.cfg.set("hygiene.allowed_methods", ["get", "post"])
+        self.assertEqual(("GET", "POST"), hygiene.allowed_methods(self.cfg))
+
+    def test_a_malformed_entry_cannot_escape_the_regex(self):
+        from vigil.guards import hygiene
+        self.cfg.set("hygiene.allowed_methods",
+                     ["GET)|return 444;(#", "POST", ""])
+        got = hygiene.allowed_methods(self.cfg)
+        self.assertEqual(("POST",), got)
+        body = hygiene.render(got)
+        rule = [l for l in body.splitlines() if "request_method" in l][0]
+        self.assertNotIn("return 444", rule)
+
+    def test_a_fully_invalid_list_falls_back_to_the_default(self):
+        from vigil.guards import hygiene
+        self.cfg.set("hygiene.allowed_methods", ["(", ")"])
+        self.assertEqual(hygiene.DEFAULT_ALLOWED_METHODS,
+                         hygiene.allowed_methods(self.cfg))
+
+    def test_status_reports_the_effective_methods(self):
+        from vigil.guards import hygiene
+        st = hygiene.status(self.cfg)
+        self.assertIn("OPTIONS", st["allowed_methods"])
+
+
+class TestEventQueueOverflowIsReported(_IsolatedThreatPaths, unittest.TestCase):
+    """M9: the deque dropped the oldest event silently -- possibly a CRIT."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+        self.cfg.set("threat.event_queue_max", 10)
+
+    def _daemon(self):
+        from vigil.guards import threat as threat_mod
+        daemon = threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                         dry_run=True, echo=False)
+        self.delivered = []
+        daemon.deliver = lambda alert: (self.delivered.append(alert) or True)
+        return daemon
+
+    def test_overflow_is_counted(self):
+        daemon = self._daemon()
+        self.assertEqual(10, daemon.reporter._max)
+        for i in range(13):
+            daemon.reporter.queue({"kind": "INFO", "text": "e%d" % i})
+        self.assertEqual(10, daemon.reporter.pending())
+        self.assertEqual(3, daemon.reporter.dropped())
+        self.assertEqual(3, daemon.reporter.dropped_total())
+        self.assertEqual(3, daemon.describe()["events_dropped"])
+
+    def test_the_next_alert_says_how_many_were_lost(self):
+        daemon = self._daemon()
+        for i in range(13):
+            daemon.reporter.queue({"kind": "INFO", "text": "e%d" % i})
+        self.assertTrue(daemon.reporter.flush(force=True))
+        self.assertEqual(1, len(self.delivered))
+        alert = self.delivered[0]
+        text = "\n".join(line for sec in alert.sections for line in sec.lines)
+        self.assertIn("3", text)
+        self.assertIn("队列上限", text)
+        self.assertIn("未上报", text)
+        self.assertEqual(0, daemon.reporter.dropped(),
+                         "告警发出后计数没有清零")
+
+    def test_a_held_back_batch_keeps_the_count(self):
+        """An early return must not discard the count for unsent events."""
+        daemon = self._daemon()
+        daemon.reporter._min_interval = 10 ** 6
+        daemon.reporter._last_send = time.time()
+        for i in range(13):
+            daemon.reporter.queue({"kind": "INFO", "text": "e%d" % i})
+        # Not immediate and rate-limited: the batch is put back.
+        self.assertFalse(daemon.reporter.flush(force=False))
+        self.assertEqual(3, daemon.reporter.dropped())
+        daemon.reporter.flush(force=True)
+        self.assertEqual(0, daemon.reporter.dropped())
+
+
+class _FirewallHost:
+    """A scripted ipset/iptables host for the uninstall cleanup tests."""
+
+    def __init__(self):
+        self.rules = [
+            "-P INPUT ACCEPT",
+            "-A INPUT -m set --match-set vigil_threat src -j DROP",
+            "-A INPUT -m set --match-set other_set src -j DROP",
+            "-A INPUT -p tcp --dport 22 -j ACCEPT",
+            "-A INPUT -m set --match-set vigil_threat_net src -j DROP",
+        ]
+        self.sets = ["vigil_threat", "vigil_threat_net", "other_set"]
+        self.deleted = []
+        self.destroyed = []
+        self.insert_fail_times = 0
+        self.inserts = 0
+
+    def which(self, name, *fallbacks):
+        return "/sbin/%s" % name
+
+    def run(self, argv, timeout=None, **_kw):
+        prog = str(argv[0])
+        if prog.endswith("iptables"):
+            return self._iptables(argv)
+        if prog.endswith("ipset"):
+            return self._ipset(argv)
+        return True, "", ""
+
+    def _iptables(self, argv):
+        action = argv[1] if len(argv) > 1 else ""
+        if action == "-S":
+            return True, "\n".join(self.rules) + "\n", ""
+        if action == "-D":
+            spec = " ".join(argv[3:])
+            self.deleted.append(spec)
+            line = "-A INPUT " + spec
+            if line in self.rules:
+                self.rules.remove(line)
+                return True, "", ""
+            return False, "", "no such rule"
+        if action == "-I":
+            self.inserts += 1
+            if self.inserts <= self.insert_fail_times:
+                return False, "", "Another app is currently holding the xtables lock"
+            self.rules.insert(1, "-A INPUT " + " ".join(argv[4:])
+                              if len(argv) > 4 else "-A INPUT")
+            return True, "", ""
+        return True, "", ""
+
+    def _ipset(self, argv):
+        action = argv[1] if len(argv) > 1 else ""
+        if action == "list":
+            return True, "\n".join(self.sets) + "\n", ""
+        if action == "destroy":
+            name = argv[2]
+            if name in self.sets:
+                self.sets.remove(name)
+                self.destroyed.append(name)
+                return True, "", ""
+            return False, "", "The set with the name %s does not exist" % name
+        return True, "", ""
+
+
+class TestFirewallCleanupOnUninstall(unittest.TestCase):
+    """M12: uninstall left our ipset sets and INPUT rules behind.
+
+    A reinstall then stacked a duplicate DROP rule. Removal must be exact --
+    names this program owns, target DROP -- and must never touch anything
+    else on a host that has other firewall managers.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+        self.host = _FirewallHost()
+        from vigil.guards import threat as threat_mod
+        self.threat = threat_mod
+        self.patches = [
+            mock.patch.object(threat_mod.shell, "which", self.host.which),
+            mock.patch.object(threat_mod.shell, "run", self.host.run),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_the_inventory_names_only_our_objects(self):
+        found = self.threat.firewall_artifacts(self.cfg)
+        self.assertEqual(["vigil_threat", "vigil_threat_net"], found["sets"])
+        specs = [" ".join(s) for s in found["rules"]]
+        self.assertEqual(2, len(specs))
+        for spec in specs:
+            self.assertIn("vigil_threat", spec)
+        self.assertFalse(any("other_set" in s for s in specs),
+                         "把别人的规则算成了自己的")
+
+    def test_removal_deletes_only_our_rules_and_sets(self):
+        out = self.threat.remove_firewall_artifacts(self.cfg)
+        self.assertEqual([], out["errors"])
+        self.assertEqual(["vigil_threat", "vigil_threat_net"], sorted(out["sets"]))
+        joined = "\n".join(out["rules"])
+        self.assertIn("vigil_threat", joined)
+        self.assertNotIn("other_set", joined)
+        self.assertNotIn("other_set", self.host.destroyed)
+        self.assertIn("other_set", self.host.sets, "别人的 ipset 集合被删了")
+        self.assertTrue(any("--dport 22" in r for r in self.host.rules),
+                        "与本程序无关的规则被删了")
+        self.assertFalse(any("vigil_threat" in r for r in self.host.rules),
+                         "本程序的规则没有被删干净")
+
+    def test_a_dry_run_changes_nothing(self):
+        before_rules = list(self.host.rules)
+        before_sets = list(self.host.sets)
+        out = self.threat.remove_firewall_artifacts(self.cfg, dry_run=True)
+        self.assertEqual([], out["rules"])
+        self.assertEqual([], out["sets"])
+        self.assertTrue(out["would"])
+        self.assertEqual(before_rules, self.host.rules)
+        self.assertEqual(before_sets, self.host.sets)
+
+
+class TestRulePriorityFailuresAreRealFailures(unittest.TestCase):
+    """M12: a failed insert returned a value nobody checked, after deleting."""
+
+    def setUp(self):
+        from vigil.guards import threat as threat_mod
+        self.threat = threat_mod
+        self.host = _FirewallHost()
+
+    def _enforcer(self, dry_run=False):
+        enc = self.threat.Enforcer("vigil_threat", "INPUT", dry_run=dry_run)
+        enc.INSERT_RETRY_SLEEP = 0
+        return enc
+
+    def test_a_transient_insert_failure_is_retried(self):
+        self.host.rules = ["-P INPUT ACCEPT"]
+        self.host.insert_fail_times = 2
+        patches = [mock.patch.object(self.threat.shell, "which", self.host.which),
+                   mock.patch.object(self.threat.shell, "run", self.host.run)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        enc = self._enforcer()
+        self.assertTrue(enc.assert_priority())
+        self.assertEqual(3, self.host.inserts, "插入失败后没有重试")
+
+    def test_a_permanent_insert_failure_is_reported(self):
+        self.host.rules = ["-P INPUT ACCEPT"]
+        self.host.insert_fail_times = 99
+        patches = [mock.patch.object(self.threat.shell, "which", self.host.which),
+                   mock.patch.object(self.threat.shell, "run", self.host.run)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        enc = self._enforcer()
+        self.assertFalse(enc.assert_priority(),
+                         "插入彻底失败却报告成功")
+
+    def test_a_failed_reinsert_after_delete_is_not_reported_as_healthy(self):
+        # The rule is present but not first; the delete succeeds and the
+        # insert then fails. That used to return the insert's failure only
+        # from a branch whose caller ignored it.
+        self.host.rules = [
+            "-P INPUT ACCEPT",
+            "-A INPUT -p tcp --dport 22 -j ACCEPT",
+            "-A INPUT -m set --match-set vigil_threat src -j DROP",
+        ]
+        self.host.insert_fail_times = 99
+        patches = [mock.patch.object(self.threat.shell, "which", self.host.which),
+                   mock.patch.object(self.threat.shell, "run", self.host.run)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        enc = self._enforcer()
+        self.assertFalse(enc.assert_priority())
+        self.assertTrue(self.host.deleted, "没有走到删除再插入的分支")
+
+    def test_ensure_requires_both_the_set_and_the_rule(self):
+        enc = self._enforcer()
+        enc.set_exists = lambda: True
+        enc.ensure_net_set = lambda: True
+        enc.assert_priority = lambda: False
+        enc.rule_position = lambda: None
+        self.assertFalse(enc.ensure(),
+                         "集合存在但规则不在位时 ensure() 仍报告健康")
+        enc.assert_priority = lambda: True
+        enc.rule_position = lambda: 2
+        self.assertFalse(enc.ensure(), "规则不在第 1 条却报告健康")
+        enc.rule_position = lambda: 1
+        self.assertTrue(enc.ensure())
+        enc.set_exists = lambda: False
+        self.assertFalse(enc.ensure(), "集合不存在却报告健康")
+
+
+class TestWhitelistRescuePathIsChecked(_IsolatedThreatPaths, unittest.TestCase):
+    """M14: the DROP rule precedes ufw, so the whitelist is the only way back."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def test_loopback_only_is_flagged(self):
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+        gap = threat_mod.whitelist_rescue_gap(self.cfg)
+        self.assertTrue(gap, "白名单只有回环却没有提示")
+        self.assertIn("白名单", gap)
+
+    def test_a_real_source_address_counts_as_a_rescue_path(self):
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.whitelist",
+                     ["127.0.0.1/8", "::1", "203.0.113.7"])
+        self.assertEqual("", threat_mod.whitelist_rescue_gap(self.cfg))
+
+    def test_the_hosts_own_addresses_are_not_a_rescue_path(self):
+        from vigil.guards import threat as threat_mod
+        own = sorted(a for a in threat_mod.local_addresses()
+                     if a not in ("127.0.0.1", "::1"))
+        if not own:
+            self.skipTest("本机没有额外的接口地址")
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1", own[0]])
+        self.assertTrue(threat_mod.whitelist_rescue_gap(self.cfg),
+                        "把本机自己的地址当成了救援路径")
+
+    def test_an_empty_whitelist_is_flagged(self):
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.whitelist", [])
+        self.assertTrue(threat_mod.whitelist_rescue_gap(self.cfg))
+
+    def test_status_notes_carry_the_warning(self):
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+        real = threat_mod.local_addresses
+        threat_mod.local_addresses = lambda: {"127.0.0.1", "::1"}
+        try:
+            snap = threat_mod.status_snapshot(self.cfg)
+        finally:
+            threat_mod.local_addresses = real
+        self.assertIn("白名单", "\n".join(snap.get("notes") or []))
+
+
+class TestNetblockBansAreVisibleAndRescuable(_IsolatedThreatPaths, unittest.TestCase):
+    """H8/M6: a /24 could be blocked with no record and no way to lift it."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        from vigil.guards import threat as threat_mod
+        self.threat = threat_mod
+        # Keep the state file inside this test's own directory too (the mixin
+        # pointed it at the other temp root).
+        threat_mod.paths.THREAT_STATE = self.root / "threat-state.json"
+
+    def _write_state(self, bans):
+        self.threat.paths.THREAT_STATE.write_text(
+            json.dumps({"bans": bans, "offenses": {}, "stats": {}}),
+            encoding="utf-8")
+
+    def test_ban_netblock_records_the_range_in_the_state(self):
+        daemon = self.threat.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                          dry_run=True, echo=False)
+        daemon.enforcer.add_net = lambda net, seconds: (True, "")
+        daemon.enforcer.net_members = lambda: {}
+        self.assertTrue(daemon.ban_netblock("8.8.4.0/24", ["8.8.4.1"]))
+        entry = daemon.state.bans.get("8.8.4.0/24")
+        self.assertIsNotNone(entry, "网段封禁从未写入状态，status 里看不见")
+        self.assertEqual("netblock", entry["detector"])
+
+    def test_list_bans_includes_networks(self):
+        self._write_state({
+            "203.0.113.9": {"until": time.time() + 600, "reason": "扫描",
+                            "detector": "http_burst", "count": 1},
+            "8.8.4.0/24": {"until": time.time() + 600, "reason": "网段升级",
+                           "detector": "netblock", "count": 1},
+        })
+        bans = self.threat.list_bans(self.cfg)
+        by_ip = {b["ip"]: b for b in bans}
+        self.assertIn("8.8.4.0/24", by_ip, "网段封禁没有出现在封禁列表里")
+        self.assertTrue(by_ip["8.8.4.0/24"]["netblock"])
+        snap = self.threat.status_snapshot(self.cfg)
+        self.assertEqual(2, snap["banned_count"], "banned_count 没有合并网段")
+
+    def test_the_purge_lifts_a_range_that_contains_a_whitelisted_address(self):
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1", "8.8.4.50"])
+        daemon = self.threat.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                          dry_run=True, echo=False)
+        daemon.state.bans["8.8.4.0/24"] = {
+            "until": time.time() + 600, "reason": "网段升级",
+            "detector": "netblock", "count": 1}
+        daemon.enforcer.net_members = lambda: {}
+        daemon._purge_whitelisted_bans()
+        self.assertNotIn("8.8.4.0/24", daemon.state.bans,
+                         "白名单里的地址所在网段没有被解除封禁")
+
+    def test_the_purge_lifts_a_range_covered_by_a_whitelisted_cidr(self):
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1", "8.8.4.0/25"])
+        daemon = self.threat.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                          dry_run=True, echo=False)
+        daemon.state.bans["8.8.4.0/24"] = {
+            "until": time.time() + 600, "reason": "x",
+            "detector": "netblock", "count": 1}
+        daemon.enforcer.net_members = lambda: {}
+        daemon._purge_whitelisted_bans()
+        self.assertNotIn("8.8.4.0/24", daemon.state.bans)
+
+    def test_an_unrelated_range_is_kept(self):
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1", "203.0.113.7"])
+        daemon = self.threat.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                          dry_run=True, echo=False)
+        daemon.state.bans["8.8.4.0/24"] = {
+            "until": time.time() + 600, "reason": "x",
+            "detector": "netblock", "count": 1}
+        daemon.enforcer.net_members = lambda: {}
+        daemon._purge_whitelisted_bans()
+        self.assertIn("8.8.4.0/24", daemon.state.bans,
+                      "与白名单无关的网段被封禁清除误删了")
+
+    def test_unban_routes_a_range_to_remove_net(self):
+        self._write_state({
+            "8.8.4.0/24": {"until": time.time() + 600, "reason": "x",
+                           "detector": "netblock", "count": 1}})
+        calls = {"net": [], "ip": []}
+        fake = type("D", (), {})()
+        fake.enforcer = type("E", (), {
+            "remove_net": lambda s, net: calls["net"].append(net) or True,
+            "remove": lambda s, ip: calls["ip"].append(ip) or True})()
+        fake.state = type("S", (), {
+            "bans": dict(self.threat.read_json(
+                self.threat.paths.THREAT_STATE, {})["bans"]),
+            "drop_ban": lambda s, ip: s.bans.pop(ip, None),
+            "save": lambda s: True})()
+        fake.audit = lambda *_a, **_k: None
+        real = self.threat._cli_daemon
+        self.threat._cli_daemon = lambda *a, **k: fake
+        real_requests = self.threat.UNBAN_REQUESTS
+        self.threat.UNBAN_REQUESTS = self.root / "unban.jsonl"
+        try:
+            ok, detail = self.threat.unban(self.cfg, "8.8.4.0/24")
+        finally:
+            self.threat._cli_daemon = real
+            self.threat.UNBAN_REQUESTS = real_requests
+        self.assertTrue(ok, detail)
+        self.assertEqual(["8.8.4.0/24"], calls["net"],
+                         "网段解封没有路由到 remove_net")
+        self.assertEqual([], calls["ip"],
+                         "网段被当成单个地址交给了 hash:ip 集合")
+
+
+class TestDecoyScreeningKnowsAboutRealRoutes(unittest.TestCase):
+    """H6: a real `/graphql` or `/login` must not become a 7-day trap."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.webroot = Path(self.tmp.name) / "www"
+        self.webroot.mkdir()
+        from vigil.guards import decoy as decoy_mod
+        self.d = decoy_mod
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def test_a_declared_location_is_refused_as_a_decoy(self):
+        _safe, rejected = self.d.screen(
+            str(self.webroot), candidates=[("/health", "health", "x")],
+            text="", routes={"/health"})
+        self.assertEqual(["/health"], [p for p, _w in rejected])
+        self.assertIn("活路由", dict(rejected)["/health"])
+
+    def test_a_prefix_location_covers_its_children(self):
+        _safe, rejected = self.d.screen(
+            str(self.webroot),
+            candidates=[("/api/admin/users", "api/admin/users", "x")],
+            text="", routes={"/api"})
+        self.assertIn("/api/admin/users", dict(rejected))
+
+    def test_an_unrelated_location_changes_nothing(self):
+        safe, rejected = self.d.screen(
+            str(self.webroot),
+            candidates=[("/.git/config", "git/config", "x")],
+            text="", routes={"/app"})
+        self.assertEqual([], rejected)
+        self.assertEqual([("/.git/config", "git/config", "x")], safe)
+
+    def test_no_routes_supplied_means_no_route_screening(self):
+        safe, rejected = self.d.screen(
+            str(self.webroot),
+            candidates=[("/login", "login", "x")], text="")
+        self.assertEqual([], rejected)
+        self.assertTrue(safe)
+
+    def test_locations_are_parsed_from_a_vhost(self):
+        text = ("server {\n"
+                "  location / { try_files $uri =404; }\n"
+                "  location = /login { proxy_pass http://127.0.0.1:1; }\n"
+                "  location ^~ /app/ { proxy_pass http://127.0.0.1:2; }\n"
+                "  location ~ \\.php$ { return 444; }\n"
+                "}\n")
+        self.assertEqual({"/login", "/app"}, self.d.parse_locations(text))
+
+    def test_a_wildcard_domain_does_not_break_the_scan(self):
+        # `site_routes` must never raise because the host has no nginx.
+        real = self.d._site
+        self.d._site = lambda cfg: ("", "")
+        try:
+            self.assertEqual(set(), self.d.site_routes(self.cfg))
+        finally:
+            self.d._site = real
+
+    def test_install_passes_the_sites_routes_to_screening(self):
+        captured = {}
+        real_screen, real_site, real_routes, real_inc = (
+            self.d.screen, self.d._site, self.d.site_routes, self.d._include_dir)
+
+        def fake_screen(webroot, candidates=None, text=None, routes=None):
+            captured["routes"] = routes
+            return [("/.git/config", "git/config", "x")], []
+
+        self.d.screen = fake_screen
+        self.d._site = lambda cfg: ("example.com", str(self.webroot))
+        self.d.site_routes = lambda cfg: {"/login"}
+        self.d._include_dir = lambda domain: None      # stops before nginx
+        try:
+            out = self.d.install(self.cfg)
+        finally:
+            (self.d.screen, self.d._site, self.d.site_routes,
+             self.d._include_dir) = (real_screen, real_site, real_routes,
+                                     real_inc)
+        self.assertEqual({"/login"}, captured.get("routes"))
+        self.assertFalse(out["ok"])                    # no include dir found
+        self.assertIn("/.git/config", out["paths"])
+
+    def test_live_route_risk_flags_the_dangerous_names(self):
+        for path in ("/actuator/health", "/login", "/graphql",
+                     "/api/v1/internal/config", "/wp-login.php",
+                     "/user/login", "/mcp"):
+            self.assertTrue(self.d.live_route_risk(path), path)
+        for path in ("/.env", "/.git/config", "/backup.sql",
+                     "/docker-compose.yml", "/secrets.json"):
+            self.assertFalse(self.d.live_route_risk(path), path)
+
+
+class TestPlausibleLiveRoutesAreObservedFirst(_IsolatedThreatPaths, unittest.TestCase):
+    """A monitor's first health-check must not be a seven-day ban."""
+
+    def setUp(self):
+        _root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(_root), True)
+        self._isolate_threat_paths(_root)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.daemon = threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                              dry_run=True, echo=False)
+
+    def _hit(self, ip, uri):
+        self.daemon.handle_decoy(
+            '%s - - [27/Sep/2026:14:42:00 +0800] "GET %s HTTP/1.1" 444 0 "-" "x"'
+            % (ip, uri))
+
+    def test_one_hit_on_a_plausible_route_does_not_ban(self):
+        self._hit("203.0.113.9", "/actuator/health")
+        self.assertNotIn("203.0.113.9", self.daemon.state.bans,
+                         "监控探针的第一次健康检查就被封了 7 天")
+
+    def test_repeated_hits_on_a_plausible_route_do_ban(self):
+        for _ in range(self.daemon.settings.decoy_soft_hits):
+            self._hit("203.0.113.9", "/graphql")
+        entry = self.daemon.state.bans.get("203.0.113.9")
+        self.assertIsNotNone(entry, "重复探测活路由始终不封禁")
+        self.assertEqual("decoy_soft", entry["detector"])
+
+    def test_a_real_secret_path_is_still_banned_on_the_first_hit(self):
+        self._hit("198.51.100.9", "/.aws/credentials")
+        entry = self.daemon.state.bans.get("198.51.100.9")
+        self.assertIsNotNone(entry)
+        self.assertEqual("decoy", entry["detector"])
+        self.assertGreaterEqual(entry["until"] - time.time(), 6 * 86400)
+
+    def test_the_window_is_configurable(self):
+        self.cfg.set("threat.decoy.soft_hits", 1)
+        daemon = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        daemon.handle_decoy('203.0.113.9 - - [x] "GET /login HTTP/1.1" 444 0')
+        entry = daemon.state.bans.get("203.0.113.9")
+        self.assertIsNotNone(entry)
+        self.assertEqual("decoy_soft", entry["detector"])
+
+
+class TestAuthStatusesAreNotEvidenceOfAbsence(unittest.TestCase):
+    """H7: a 401/403 endpoint is a working endpoint, not a dead path."""
+
+    def setUp(self):
+        from vigil.guards import learning as lmod
+        self.l = lmod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.saved = (lmod.observations_path, lmod.learned_path,
+                      lmod.suggestions_path)
+        lmod.observations_path = lambda: self.base / "obs.jsonl"
+        lmod.learned_path = lambda: self.base / "learned.json"
+        lmod.suggestions_path = lambda: self.base / "suggest.json"
+
+    def tearDown(self):
+        (self.l.observations_path, self.l.learned_path,
+         self.l.suggestions_path) = self.saved
+        self.tmp.cleanup()
+
+    def test_an_authenticated_endpoint_is_never_adopted(self):
+        for last in (1, 2, 3, 4):
+            self.l.observe("203.0.113.%d" % last, "/auth/session", 401)
+        candidates = {c["token"]: c for c in self.l.mine()}
+        entry = candidates.get("/auth")
+        self.assertIsNotNone(entry)
+        self.assertGreater(entry["auth_hits"], 0)
+        self.assertEqual(0, entry["not_found"],
+                         "401/403 被算成了「路径不存在」")
+        out = self.l.evaluate(entry, legit=set())
+        self.assertEqual("reject", out["verdict"])
+        self.assertIn("鉴权", out["reason"])
+
+    def test_run_does_not_adopt_an_authenticated_endpoint(self):
+        for last in (1, 2, 3, 4):
+            self.l.observe("203.0.113.%d" % last, "/auth/session", 403)
+        result = self.l.run(cfg=None, adopt=True)
+        self.assertEqual([], result["adopted"],
+                         "需要鉴权的接口被自动采纳成了 7 天诱饵")
+
+    def test_a_401_in_the_access_log_enters_the_legitimate_corpus(self):
+        log = self.base / "access.log"
+        log.write_text(
+            '203.0.113.9 - - [x] "GET /api/v1/session HTTP/1.1" 401 0\n'
+            '203.0.113.10 - - [x] "GET /missing-thing HTTP/1.1" 404 0\n',
+            encoding="utf-8")
+        legit = self.l._successful_paths(str(log))
+        self.assertIn("/api/v1/session", legit,
+                      "访问日志里的 401 没有被当成合法语料")
+        self.assertNotIn("/missing-thing", legit)
+
+    def test_a_candidate_without_404_evidence_is_refused(self):
+        candidate = {"token": "/some-thing", "distinct_ips": 8, "served_ok": 0,
+                     "not_found": 0, "auth_hits": 0, "last_seen": time.time()}
+        out = self.l.evaluate(candidate, legit=set())
+        self.assertEqual("reject", out["verdict"])
+        self.assertIn("不存在", out["reason"])
+
+    def test_a_plain_404_candidate_is_still_adopted(self):
+        candidate = {"token": "/secret-area", "distinct_ips": 6, "served_ok": 0,
+                     "not_found": 30, "auth_hits": 0, "last_seen": time.time()}
+        self.assertEqual("adopt", self.l.evaluate(candidate, set())["verdict"])
+
+    def test_evolve_no_longer_treats_403_as_probing(self):
+        import vigil.evolve as evolve
+        from vigil.guards import learning
+        obs = [{"ts": 1, "ip": "203.0.113.%d" % i, "path": "/api/v1/profile",
+                "status": 403, "ua": ""} for i in range(1, 8)]
+        real = learning.read_observations
+        learning.read_observations = lambda limit=20000: obs
+        try:
+            ev = evolve.evidence(cfg=None)
+        finally:
+            learning.read_observations = real
+        self.assertEqual([], ev["candidates"],
+                         "403 被当成「没人合法访问过」的证据采纳了")
+
+    def test_evolve_still_sees_404_probing(self):
+        import vigil.evolve as evolve
+        from vigil.guards import learning
+        obs = [{"ts": 1, "ip": "203.0.113.%d" % i, "path": "/old-backup.php",
+                "status": 404, "ua": ""} for i in range(1, 10)]
+        real = learning.read_observations
+        learning.read_observations = lambda limit=20000: obs
+        try:
+            ev = evolve.evidence(cfg=None)
+        finally:
+            learning.read_observations = real
+        paths = [c["path"] for c in ev["candidates"]]
+        self.assertIn("/old-backup.php", paths)
+
+
+class TestSiteAvailabilityInfersTheDomain(unittest.TestCase):
+    """M13: the check reported "未配置站点域名，跳过" and monitored nothing."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.curl = {}
+
+    def _run(self, code, curl_ok=True):
+        from vigil.guards.checks import base, process
+        real_have, real_run = process.shell.have, process.shell.run
+        process.shell.have = lambda name: True
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "curl":
+                self.curl["argv"] = list(argv)
+                return curl_ok, code, ""
+            return True, "", ""
+
+        process.shell.run = fake_run
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return process.SiteAvailability().safe_run(ctx)
+        finally:
+            process.shell.have, process.shell.run = real_have, real_run
+
+    def test_the_domain_comes_from_an_installed_gate(self):
+        self.cfg.set("gate.dsh_gate.enabled", True)
+        self.cfg.set("gate.dsh_gate.domain", "probe.example.com")
+        res = self._run("401")
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("登录闸门", res.detail)
+        self.assertIn("probe.example.com", " ".join(self.curl["argv"]))
+
+    def test_an_empty_gate_domain_is_handled_gracefully(self):
+        from vigil.guards.checks.process import infer_site_domain
+        self.cfg.set("gate.dsh_gate.enabled", True)
+        self.cfg.set("gate.dsh_gate.domain", "")
+        self.cfg.set("gate.dsh_gate.server_name", "")
+        self.assertEqual("", infer_site_domain(self.cfg))
+        res = self._run("401")
+        self.assertEqual("WARN", res.status,
+                         "无法监控时不应报告一切正常")
+        self.assertIn("不会监控", res.detail)
+
+    def test_a_wildcard_or_placeholder_is_not_probed(self):
+        from vigil.guards.checks.process import infer_site_domain
+        self.cfg.set("gate.bt_panel.enabled", True)
+        self.cfg.set("gate.bt_panel.domain", "*.example.com")
+        self.cfg.set("gate.bt_panel.server_name", "_")
+        self.assertEqual("", infer_site_domain(self.cfg))
+        self.cfg.set("gate.bt_panel.server_name", "panel.example.com")
+        self.assertEqual("panel.example.com", infer_site_domain(self.cfg))
+
+    def test_a_disabled_gate_does_not_supply_a_domain(self):
+        from vigil.guards.checks.process import infer_site_domain
+        self.cfg.set("gate.bt_panel.enabled", False)
+        self.cfg.set("gate.bt_panel.domain", "panel.example.com")
+        self.assertEqual("", infer_site_domain(self.cfg))
+
+    def test_an_explicit_config_value_wins(self):
+        self.cfg.set("checks.site_availability.domain", "probe.example.com")
+        self.cfg.set("gate.bt_panel.enabled", True)
+        self.cfg.set("gate.bt_panel.domain", "other.example.com")
+        self._run("200")
+        self.assertIn("probe.example.com", " ".join(self.curl["argv"]))
+        self.assertNotIn("other.example.com", " ".join(self.curl["argv"]))
+
+class TestDoctorShowsTheRescuePath(unittest.TestCase):
+    """M14: the warning has to reach `vigil doctor`, not only the logs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def _doctor(self, whitelist):
+        import contextlib
+        import io
+        from vigil.commands import diag
+        from vigil.guards import threat as threat_mod
+        self.cfg.set("threat.whitelist", whitelist)
+        env = {
+            "system": {"distro": "example-distro", "kernel": "0.0.0",
+                       "hostname": "host.example.com", "arch": "x86_64",
+                       "python": "3.10", "cpu_count": 1, "init": "systemd"},
+            "memory_mb": 1024,
+            "nginx": {"present": False}, "bt_panel": {"present": False},
+            "php_fpm": {"sockets": []}, "web_roots": [],
+            "firewall": {"kind": "none", "active": False},
+            "auditd": {"present": False}, "malware": {"engine": "none"},
+            "fail2ban": {"present": False}, "local_mta": {"present": False},
+            "port25_open": False, "tools": {},
+            "log_sources": {"nginx_access": [], "auth": []},
+        }
+        args = type("A", (), {"json": False, "config": None})()
+        buf = io.StringIO()
+        real_local = threat_mod.local_addresses
+        threat_mod.local_addresses = lambda: {"127.0.0.1", "::1"}
+        with mock.patch.object(diag.detect, "full", lambda: env), \
+                mock.patch.object(diag.units, "list_units", lambda: []), \
+                mock.patch.object(diag, "load_config", lambda *a, **k: self.cfg), \
+                contextlib.redirect_stdout(buf):
+            try:
+                diag.cmd_doctor(args)
+            finally:
+                threat_mod.local_addresses = real_local
+        return buf.getvalue()
+
+    def test_a_loopback_only_whitelist_is_called_out(self):
+        text = self._doctor(["127.0.0.1/8", "::1"])
+        self.assertIn("救援路径检查", text, "doctor 没有给出救援路径提示")
+        self.assertIn("白名单", text)
+
+    def test_a_usable_whitelist_entry_keeps_the_section_quiet(self):
+        text = self._doctor(["127.0.0.1/8", "::1", "203.0.113.7"])
+        self.assertNotIn("救援路径检查", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

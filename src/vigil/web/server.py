@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets as pysecrets
@@ -47,6 +48,111 @@ LOGIN_WINDOW = 600
 #: Session lifetime. Short enough that a forgotten browser tab is not a
 #: permanent key to the host's operational data.
 SESSION_SECONDS = 3600
+
+#: Direct peers whose ``X-Forwarded-For`` may be believed.
+#:
+#: The service binds loopback and is proxied by the web server that is already
+#: there, so the socket peer is *always* the proxy. Rate limiting on
+#: ``client_address`` therefore collapsed every visitor into one bucket, and a
+#: stranger typing eight wrong passwords locked the operator out for ten
+#: minutes. Reading the header instead is the fix -- but only from a peer that
+#: is actually the proxy, otherwise any client can invent a fresh source
+#: address per attempt and the limit stops existing in the other direction.
+DEFAULT_TRUSTED_PROXIES = ("127.0.0.1/8", "::1")
+
+#: Guards the CSRF table. It used to be a `with threading.Lock():` *inside*
+#: :meth:`Handler._csrf_for` -- a brand-new lock per call, which excludes
+#: nothing at all. Two threads issuing a token for the same session could then
+#: race and overwrite each other, and the loser's form was rejected.
+_CSRF_LOCK = threading.Lock()
+
+
+def _norm_ip(text: str) -> str:
+    """One IP address from whatever a peer or a forwarded header looks like.
+
+    ``X-Forwarded-For`` may carry a port, brackets, or an IPv4-mapped IPv6
+    form. Anything that is not an address is dropped rather than passed
+    through: an unparsable value must never become a rate-limit key, or it
+    would be its own bypass.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("["):                      # [2001:db8::1]:443
+        raw = raw[1:].split("]", 1)[0]
+    elif raw.count(":") == 1:                    # 203.0.113.9:41234
+        raw = raw.split(":", 1)[0]
+    try:
+        addr = ipaddress.ip_address(raw)
+    except ValueError:
+        return ""
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return str(addr)
+
+
+def _trusted_peer(peer: str, trusted=None) -> bool:
+    """Is *peer* one of the reverse proxies we are allowed to believe?"""
+    addr = _norm_ip(peer)
+    if not addr:
+        return False
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    for entry in (trusted if trusted is not None
+                  else DEFAULT_TRUSTED_PROXIES):
+        try:
+            if "/" in str(entry):
+                if ip in ipaddress.ip_network(str(entry), strict=False):
+                    return True
+            elif ip == ipaddress.ip_address(str(entry)):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def client_key(peer: str, forwarded_for: str = "", trusted=None) -> str:
+    """The address a request is rate-limited against.
+
+    Two failure modes have to be avoided at once, and they pull in opposite
+    directions:
+
+    * keying on the socket peer collapses every visitor behind a reverse
+      proxy into one bucket -- eight wrong passwords from anyone locks out
+      everyone (measured on this host: the peer was always ``127.0.0.1``);
+    * believing ``X-Forwarded-For`` unconditionally lets a client mint a new
+      source address per attempt, which is not a rate limit either.
+
+    So the header is consulted **only** when the direct peer is a trusted
+    proxy. Within the header the *rightmost* entry is the one the nearest
+    proxy actually observed; everything to its left was supplied by the
+    client and is not evidence. Trusted hops are skipped from the right, so a
+    chain of proxies resolves to the first address that had to be real.
+    """
+    peer = _norm_ip(peer)
+    if not _trusted_peer(peer, trusted):
+        return peer or "unknown"
+    hops = [h.strip() for h in str(forwarded_for or "").split(",")]
+    for hop in reversed(hops):
+        addr = _norm_ip(hop)
+        if addr and not _trusted_peer(addr, trusted):
+            return addr
+    return peer or "unknown"
+
+
+_DEFAULT_LOGGER = None
+
+
+def _default_logger():
+    # Cached: this is reached on every 4xx/5xx, and constructing a Logger
+    # re-reads the logging configuration each time.
+    global _DEFAULT_LOGGER
+    if _DEFAULT_LOGGER is None:
+        from ..core.logging import get as get_logger
+        _DEFAULT_LOGGER = get_logger("web")
+    return _DEFAULT_LOGGER
 
 
 def hash_password(password: str, salt: str = "") -> tuple:
@@ -140,6 +246,16 @@ class _Attempts:
         with self._lock:
             self._d.setdefault(key, []).append(time.time())
 
+    def clear(self, key: str) -> None:
+        """Forget a source's failures after it authenticates successfully.
+
+        Otherwise an operator who mistypes a few times and then gets it right
+        still carries the strikes, and the next typo -- days later, if the
+        window is generous -- is the one that locks them out.
+        """
+        with self._lock:
+            self._d.pop(key, None)
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "vigil"
@@ -150,15 +266,58 @@ class Handler(BaseHTTPRequestHandler):
     sessions = _Sessions()
     attempts = _Attempts()
     csrf = {}
+    #: Addresses whose forwarding headers are believed. Overridden per server
+    #: from ``web.trusted_proxies`` so a proxy on a non-loopback address can be
+    #: declared; the default is loopback only, because that is where this
+    #: service is designed to sit.
+    trusted_proxies = DEFAULT_TRUSTED_PROXIES
+    #: Logger for request/auth/5xx lines. A test passes its own object so a
+    #: test run never appends to the host's real journal.
+    logger = None
 
     # -- plumbing ---------------------------------------------------------
 
+    def _log(self):
+        return type(self).logger or _default_logger()
+
+    def _client_key(self) -> str:
+        peer = ""
+        try:
+            peer = self.client_address[0]
+        except (TypeError, IndexError, AttributeError):
+            peer = ""
+        return client_key(peer, self.headers.get("X-Forwarded-For") or "",
+                          getattr(type(self), "trusted_proxies", None))
+
     def log_message(self, fmt, *args):                          # noqa: A003
-        # The default writes every request to stderr, which on a monitored host
-        # means the journal fills with page loads. Keep it to one line, and
-        # only when something went wrong enough to be worth reading.
-        if getattr(self, "_logged", False):
-            return
+        """One line per request, at a level that matches its outcome.
+
+        The previous override returned early and wrote *nothing*, so a failed
+        login and a 500 left no trace anywhere: the operator could see that
+        people were being locked out and never see who or why. Routine
+        requests stay at DEBUG (invisible at the default INFO), while a 4xx
+        or 5xx is recorded with the source it was attributed to.
+        """
+        try:
+            text = (fmt % args) if args else str(fmt)
+        except (TypeError, ValueError):
+            text = "%s %s" % (fmt, args)
+        code = 0
+        for arg in args:
+            try:
+                value = int(arg)
+            except (TypeError, ValueError):
+                continue
+            if 100 <= value <= 599:
+                code = value
+                break
+        logger = self._log()
+        if code >= 500:
+            logger.error("web %s -> %d（来源 %s）", text, code, self._client_key())
+        elif code >= 400:
+            logger.warn("web %s -> %d（来源 %s）", text, code, self._client_key())
+        else:
+            logger.debug("web %s", text)
 
     def _send(self, code: int, body: bytes, ctype: str = "text/html; charset=utf-8",
               cookies=None, extra=None):
@@ -201,7 +360,11 @@ class Handler(BaseHTTPRequestHandler):
         return self.sessions.valid(self._token())
 
     def _csrf_for(self, tok: str) -> str:
-        with threading.Lock():
+        # One lock for the table, not one per call: `with threading.Lock()`
+        # created a fresh lock each time and therefore excluded nothing, so two
+        # concurrent renders of the same session could overwrite each other's
+        # token and one of the two forms would fail its CSRF check.
+        with _CSRF_LOCK:
             v = self.csrf.get(tok)
             if not v:
                 v = pysecrets.token_urlsafe(24)
@@ -258,7 +421,11 @@ class Handler(BaseHTTPRequestHandler):
         form = parse_qs(raw)
 
         if path == "/login":
-            key = self.client_address[0]
+            # Per *source*, not per socket peer. The service is loopback-only
+            # behind nginx, so `client_address[0]` was "127.0.0.1" for every
+            # visitor on earth: eight wrong passwords from any stranger locked
+            # the operator out for ten minutes.
+            key = self._client_key()
             if self.attempts.blocked(key):
                 return self._html(HTTPStatus.TOO_MANY_REQUESTS, page_mod.login_page(
                     title="vigil · 登录", error="尝试次数过多，请稍后再试"))
@@ -268,8 +435,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.attempts.bump(key)
                 return self._html(HTTPStatus.UNAUTHORIZED, page_mod.login_page(
                     title="vigil · 登录", error="账号或密码不正确"))
+            # Success clears the strikes for this source: the failures on the
+            # way in were typos, not an attack, and leaving them counted means
+            # the next typo is the one that locks the operator out.
+            self.attempts.clear(key)
+            old = self._token()
             tok = self.sessions.new()
-            self.csrf.pop("", None)
+            with _CSRF_LOCK:
+                self.csrf.pop(old, None)
+                # The empty key was never a session; dropping it was a no-op.
+                self.csrf.pop("", None)
             return self._html(HTTPStatus.OK, page_mod.login_page(
                 title="vigil · 已登录"), cookies=[
                     "vigil_session=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d"
@@ -297,9 +472,36 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(HTTPStatus.NOT_FOUND, {"ok": False, "err": "未知路径"})
 
 
-def make_server(cfg, host: str = "127.0.0.1", port: int = None) -> ThreadingHTTPServer:
-    bind_port = int(port or (cfg.get("web.port", 9177) if cfg else 9177))
-    handler = type("BoundHandler", (Handler,), {"cfg": cfg})
+def _trusted_from_cfg(cfg) -> tuple:
+    """``web.trusted_proxies`` if set, else the loopback-only default."""
+    try:
+        entries = list(cfg.get("web.trusted_proxies",
+                               list(DEFAULT_TRUSTED_PROXIES)) or [])
+    except AttributeError:
+        return DEFAULT_TRUSTED_PROXIES
+    return tuple(entries) or DEFAULT_TRUSTED_PROXIES
+
+
+def make_server(cfg, host: str = "127.0.0.1", port: int = None,
+                logger=None) -> ThreadingHTTPServer:
+    if port is None:
+        bind_port = int(cfg.get("web.port", 9177) if cfg else 9177)
+    else:
+        # `port=0` must mean "any free port" (the test suite uses it); the old
+        # `port or default` turned it into the configured port instead.
+        bind_port = int(port)
+    # Fresh rate-limit / session / CSRF state per server. These used to be
+    # shared class attributes, so two servers in one process -- or two tests
+    # in one suite -- counted each other's logins and a token issued by one
+    # was accepted by the other.
+    handler = type("BoundHandler", (Handler,), {
+        "cfg": cfg,
+        "sessions": _Sessions(),
+        "attempts": _Attempts(),
+        "csrf": {},
+        "trusted_proxies": _trusted_from_cfg(cfg),
+        "logger": logger,
+    })
     srv = ThreadingHTTPServer((host, bind_port), handler)
     srv.daemon_threads = True
     return srv

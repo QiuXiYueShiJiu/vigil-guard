@@ -245,6 +245,87 @@ def evolve_adopted() -> list:
     return out
 
 
+#: Paths that are plausibly **real** application routes on some deployment.
+#:
+#: The curated list contains `/login`, `/graphql`, `/actuator/health` and
+#: friends because a scanner asking for them is suspicious on *most* hosts.
+#: But a Spring Boot host really serves `/actuator/health`, an OIDC host
+#: really serves `/login`, and a GraphQL host really serves `/graphql`. When
+#: the screening below cannot prove the path is absent (the template lives
+#: outside the webroot, or the webroot is empty), installing `location =`
+#: for it turns the operator's own health check or monitoring probe into a
+#: seven-day ban on its first request. So these are *observed* rather than
+#: punished on sight: repeated hits from one source still ban, a first hit
+#: from a monitor does not.
+_LIVE_ROUTE_PATTERNS = re.compile(r"""^(?:
+      /actuator(?:/|$)
+    | /graphql$
+    | /login$
+    | /user/login$
+    | /api/
+    | /mcp/?$
+    | /sse$
+    | /swagger-ui\.html$
+    | /wp-login\.php$
+    | /wp-admin/
+    | /xmlrpc\.php$
+    | /admin/?
+    | /admin\.php$
+    | /administrator/
+    | /manager/html$
+    | /phpmyadmin/
+    | /adminer\.php$
+    | /cgi-bin/luci$
+    | /index\.php$
+    | /server-status$
+    | /\.well-known/
+)""", re.X)
+
+
+def live_route_risk(path: str) -> bool:
+    """Could this decoy path be somebody's *working* endpoint?"""
+    text = str(path or "").split("?")[0].strip()
+    return bool(text) and bool(_LIVE_ROUTE_PATTERNS.match(text))
+
+
+#: `location` directives, in the shapes a vhost actually uses. Regex
+#: locations (`~`, `~*`) are skipped: evaluating them is guesswork, and a
+#: guess that rejects a decoy is the safe direction anyway.
+_LOCATION_RE = re.compile(
+    r"^\s*location\s+(?:(=|\^~)\s+)?([^\s{;]+)", re.M)
+
+
+def parse_locations(text: str) -> set:
+    """Path prefixes/exacts declared by `location` in an nginx config."""
+    found = set()
+    for _mod, token in _LOCATION_RE.findall(str(text or "")):
+        token = token.strip()
+        if not token.startswith("/"):
+            continue                      # regex, named, @prefix -- not a path
+        if token in ("/", ""):
+            continue                      # the catch-all covers everything
+        found.add(token.rstrip("/") or "/")
+    return found
+
+
+def route_covered(routes, path: str) -> bool:
+    """Does one of *routes* already serve *path*?
+
+    A prefix location (`location /app/`) covers everything under it; an exact
+    location (`location = /health`) covers one path. Anything the site
+    actually declares is by definition not a decoy, whatever the disk and the
+    site text say.
+    """
+    want = str(path or "").rstrip("/") or "/"
+    for route in routes or ():
+        candidate = str(route or "").rstrip("/") or "/"
+        if candidate == "/":
+            continue
+        if want == candidate or want.startswith(candidate + "/"):
+            return True
+    return False
+
+
 def candidate_decoys() -> list:
     """Curated decoys, the lure canary, and anything the learning pass adopted.
 
@@ -400,7 +481,8 @@ def corpus(webroot: str, cap: int = _CORPUS_CAP) -> str:
     return "\n".join(chunks).lower()
 
 
-def screen(webroot: str, candidates=None, text: str = None) -> tuple:
+def screen(webroot: str, candidates=None, text: str = None,
+           routes=None) -> tuple:
     """Split candidates into (safe, rejected).
 
     A decoy is rejected when it is not actually a decoy:
@@ -408,7 +490,17 @@ def screen(webroot: str, candidates=None, text: str = None) -> tuple:
     * the path exists on disk -- then it is a real file, and banning people
       for requesting a real file is a self-inflicted outage;
     * the site's own content mentions it -- then a legitimate link could lead
-      a visitor (or a crawler) straight into a ban.
+      a visitor (or a crawler) straight into a ban;
+    * the site's nginx config declares a `location` for it -- then it is a
+      live route, and the health check or monitor that requests it would be
+      banned on its first call. That is the failure this screening exists to
+      prevent: a real Spring Boot `/actuator/health`, an OIDC `/login` or a
+      `/graphql` endpoint, on a host where the template lives outside the
+      webroot so the disk check cannot see it.
+
+    ``routes`` is supplied by the caller (from the site's own configuration)
+    rather than read from the host here, so this function stays a pure
+    predicate and a test never depends on the machine it runs on.
 
     Rejected candidates are reported with the reason, never silently dropped:
     "we installed 18 of 20 decoys" is information, "20 decoys" is a claim.
@@ -433,8 +525,52 @@ def screen(webroot: str, candidates=None, text: str = None) -> tuple:
         if token.lower() in text:
             rejected.append((path, "站点内容里引用了它（可能是正常链接）"))
             continue
+        if route_covered(routes, path):
+            rejected.append((path, "本机 nginx 配置里已有这个 location"
+                                   "（是活路由，不是诱饵）"))
+            continue
         safe.append(entry)
     return safe, rejected
+
+
+def site_routes(cfg=None) -> set:
+    """`location` paths declared by the site this program is protecting.
+
+    Read from the site's vhost and its include directory. Our own generated
+    snippets are skipped: they define `location` for the gate and for the
+    decoys themselves, and counting those would make every decoy reject
+    itself on the next install.
+    """
+    texts = []
+    domain = ""
+    include_dir = None
+    try:
+        from ..gates import demo
+        domain, _webroot = _site(cfg)
+        if domain:
+            conf = demo._find_site_conf(_ascii(domain))
+            if conf:
+                texts.append(Path(conf).read_text(encoding="utf-8",
+                                                  errors="replace"))
+        include_dir = _include_dir(domain) if domain else None
+    except Exception:                                       # noqa: BLE001
+        return set()
+    if include_dir:
+        try:
+            for path in sorted(Path(include_dir).glob("*.conf")):
+                if path.name.startswith("vigil-"):
+                    continue                                # ours, not the site's
+                try:
+                    texts.append(path.read_text(encoding="utf-8",
+                                                errors="replace"))
+                except OSError:
+                    continue
+        except OSError:
+            pass
+    routes = set()
+    for text in texts:
+        routes |= parse_locations(text)
+    return routes
 
 
 def render(paths) -> str:
@@ -627,7 +763,7 @@ def install(cfg=None, dry_run: bool = False) -> dict:
         out["problems"].append("找不到站点根目录，无法确认诱饵路径是否安全")
         return out
 
-    safe, rejected = screen(webroot)
+    safe, rejected = screen(webroot, routes=site_routes(cfg))
     out["rejected"] = rejected
     out["paths"] = [p for p, _t, _w in safe]
     if not safe:

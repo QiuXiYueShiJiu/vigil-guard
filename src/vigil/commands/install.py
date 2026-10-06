@@ -341,6 +341,34 @@ def cmd_uninstall(args) -> int:
     else:
         ui.note("没有发现需要撤回的网页配置")
 
+    # 撤回自己写进防火墙的东西：本程序自己的 ipset 集合与 INPUT 规则，
+    # 按**名字**精确删除。以前这里什么都不做，理由是「退出时别动防火墙」——
+    # 那条理由对别人的规则成立，对自己的规则不成立，代价是重装后叠加一条
+    # 重复的 DROP 规则、重排逻辑从此要管两份。删除只匹配我们自己的集合名，
+    # 不可能碰到别人的规则。
+    try:
+        from ..guards.threat import remove_firewall_artifacts
+        fw = (remove_firewall_artifacts(dry_run=True) if args.dry_run
+              else remove_firewall_artifacts())
+        if args.dry_run:
+            for item in fw.get("would") or []:
+                ui.out("    将删除：%s" % item)
+            ui.note("预演：未改动防火墙规则")
+        else:
+            removed = len(fw.get("rules") or []) + len(fw.get("sets") or [])
+            if removed:
+                ui.success("已删除本程序自己的防火墙对象 %d 个"
+                           "（规则 %d 条、ipset 集合 %d 个）"
+                           % (removed, len(fw.get("rules") or []),
+                              len(fw.get("sets") or [])))
+            else:
+                ui.note("没有发现本程序自己的防火墙规则或 ipset 集合")
+        for err in fw.get("errors") or []:
+            ui.warning("防火墙清理未完成：%s" % err)
+    except Exception as e:                                     # noqa: BLE001
+        # 清理失败不能中断卸载 —— 但必须说出来，否则「看起来干净」是假的。
+        ui.warning("未能清理防火墙残留（请手动检查）：%s" % str(e)[:160])
+
     from ..core import paths
 
     # 删配置之前，先把白名单**留在会被保留的地方并念出来**。
@@ -372,11 +400,8 @@ def cmd_uninstall(args) -> int:
     inst.remove_code()
     ui.success("已移除程序文件与命令")
 
-    # Leave the firewall alone: our bans live in an ipset that expires on
-    # its own, and touching the firewall on the way out is how you lock
-    # yourself out of a machine.
+    # 防火墙对象已在上面按名字清除（见 remove_firewall_artifacts）。
     ui.out()
-    ui.note("未改动防火墙规则（封禁条目会按各自超时自动失效）。")
     if not args.purge:
         ui.hint("如需彻底清除：vigil uninstall --purge")
     return 0

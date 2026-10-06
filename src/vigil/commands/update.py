@@ -372,7 +372,9 @@ def _refresh_hygiene(dry_run: bool) -> None:
     """
     try:
         from ..guards import hygiene
-        st = hygiene.status()
+        from ..core.config import load as load_config
+        cfg = load_config()
+        st = hygiene.status(cfg)
     except Exception:                                  # noqa: BLE001
         return
     # Presence, not currency. Keying this on `installed` (content matches)
@@ -384,7 +386,7 @@ def _refresh_hygiene(dry_run: bool) -> None:
     if dry_run:
         ui.note("预演：将重新生成请求卫生片段")
         return
-    ok, msg = hygiene.install()
+    ok, msg = hygiene.install(cfg=cfg)
     if ok:
         ui.success("请求卫生已按新版本重新生成")
     else:

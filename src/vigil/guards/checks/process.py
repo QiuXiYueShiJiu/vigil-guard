@@ -35,6 +35,32 @@ _GATE_CODES = ("401", "403")
 _FAILURE_CODES = ("500", "501", "502", "503", "504", "505", "507", "508")
 
 
+def infer_site_domain(cfg) -> str:
+    """The domain to probe when the operator never named one.
+
+    `checks.site_availability.domain` defaults to empty, and the check then
+    reported "未配置站点域名，跳过" -- so the availability check, whose whole
+    job is noticing a site that is down, was monitoring nothing at all. The
+    domain is already known to this program: it is the one the gate it
+    installed answers for. Read it from the live configuration, and treat an
+    empty `domain` (several gate sections carry `""` by default) as "keep
+    looking" rather than as a value.
+    """
+    for section in ("bt_panel", "dsh_gate"):
+        if not cfg.get("gate.%s.enabled" % section, False):
+            continue
+        for key in ("domain", "server_name"):
+            value = str(cfg.get("gate.%s.%s" % (section, key), "") or "")
+            for name in value.split():
+                name = name.strip().strip(";").strip()
+                if not name or name in ("_", "-"):
+                    continue
+                if name.startswith("*") or name.startswith("."):
+                    continue          # a wildcard is not a name to probe
+                return name
+    return ""
+
+
 def gate_for_site(cfg, domain: str) -> dict:
     """Is *domain* behind one of this program's own login gates?
 
@@ -445,12 +471,13 @@ class SiteAvailability(Check):
 
         domain = (ctx.copt("site_availability", "domain", "") or "").strip()
         if not domain:
-            domain = (ctx.cfg.get("gate.dsh_gate.domain", "") or "").strip()
+            # 未显式配置时，从已安装的闸门推断 —— 否则这个检查默认什么都不监控，
+            # 而它存在的意义正是「站点挂了要能发现」。
+            domain = infer_site_domain(ctx.cfg)
         if not domain:
-            domain = (ctx.cfg.get("gate.bt_panel.domain", "") or "").strip()
-        if not domain:
-            return CheckResult(OK, "未配置站点域名（checks.site_availability.domain 或 "
-                                   "gate.*.domain），跳过网站可用性检查")
+            return CheckResult(WARN, "未配置站点域名（checks.site_availability.domain），"
+                                     "且没有已启用的登录闸门可供推断 —— "
+                                     "网站可用性检查当前不会监控任何站点")
         gate = gate_for_site(ctx.cfg, domain)
 
         problems = []

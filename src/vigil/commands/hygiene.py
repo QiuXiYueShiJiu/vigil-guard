@@ -2,23 +2,26 @@
 from __future__ import annotations
 
 from .. import ui
+from ..core.config import load as load_config
 from ..guards import hygiene as hyg
 
 
 def cmd_install(args) -> int:
+    cfg = load_config(args.config or None)
     ui.header("请求卫生", "在 server{} 作用域收紧请求行与 Host 头的大小")
     ui.kv("URI 上限", "%d 字节（超出回 414）" % hyg.MAX_URI)
     ui.kv("Host 上限", "%d 字节（超出断开 444）" % hyg.MAX_HOST)
+    ui.kv("允许的方法", "、".join(hyg.allowed_methods(cfg)))
 
     if args.dry_run:
-        st = hyg.status()
+        st = hyg.status(cfg)
         for _site, conf in hyg.targets():
             ui.out("    %s" % conf)
         ui.out()
         ui.note("预演结束：共 %d 个站点，未写入任何文件" % st["sites"])
         return 0
 
-    ok, msg = hyg.install()
+    ok, msg = hyg.install(cfg=cfg)
     if not ok:
         ui.failure(msg)
         return 1
@@ -36,12 +39,14 @@ def cmd_uninstall(args) -> int:
 
 
 def cmd_status(args) -> int:
-    st = hyg.status()
+    cfg = load_config(args.config or None)
+    st = hyg.status(cfg)
     ui.header("请求卫生", "限制请求行与 Host 头")
     ui.kv("受保护站点", "%d 个" % st["sites"])
     ui.kv("已生效", "%d 个" % st["installed"])
     ui.kv("URI 上限", "%d 字节" % st["max_uri"])
     ui.kv("Host 上限", "%d 字节" % st["max_host"])
+    ui.kv("允许的方法", "、".join(st.get("allowed_methods") or []))
     if st["stale"]:
         ui.section("未安装或内容已过期")
         for p in st["stale"]:

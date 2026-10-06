@@ -146,7 +146,12 @@ def evidence(cfg=None) -> dict:
     for o in obs:
         path = str(o.get("path") or "")
         status = int(o.get("status") or 0)
-        if status not in (403, 404, 444):
+        # 404/444 only. 403 was in this set and does not belong there: a 403
+        # (or 401) is a live endpoint refusing an unauthenticated request, so
+        # treating it as "this path does not exist" let the loop adopt a real
+        # authenticated interface as a seven-day decoy -- and then ban the
+        # legitimate client that used it.
+        if status not in (404, 444):
             continue
         if not _SAFE_PATH.match(path):
             continue

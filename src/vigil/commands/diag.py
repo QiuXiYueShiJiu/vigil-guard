@@ -103,6 +103,7 @@ def cmd_doctor(args) -> int:
     installed = Path("/usr/local/lib/vigil/vigil").is_dir()
     ui.kv("安装状态", "已安装" if installed else "未安装",
           "green" if installed else "yellow")
+    cfg = None
     if installed:
         ui.kv("版本", __version__)
         cfg = load_config(args.config or None)
@@ -114,6 +115,24 @@ def cmd_doctor(args) -> int:
         for unit, active, enabled in units.list_units():
             style = "green" if active == "active" else "yellow"
             ui.kv(unit, "%s / %s" % (active, enabled), style)
+
+    # -- rescue path -------------------------------------------------------
+    # 本程序的 DROP 规则排在 INPUT 第 1 条、ufw 之前，白名单因此是唯一
+    # 「把我自己放回来」的路径。曾有一次全站超时就是白名单为空导致的，
+    # 所以这条自检必须显眼，而不是埋在风控状态的一行注释里。
+    rescue_gap = ""
+    try:
+        from ..guards import threat as threat_mod
+        rescue_gap = threat_mod.whitelist_rescue_gap(
+            cfg if cfg is not None else load_config(args.config or None))
+    except Exception as e:                              # noqa: BLE001
+        rescue_gap = ""
+        _ = e
+    if rescue_gap:
+        ui.out()
+        ui.section("救援路径检查")
+        ui.problems_block([rescue_gap])
+        ui.hint("添加：vigil threat whitelist add <你的固定出口地址>")
 
     # -- recommendations ---------------------------------------------------
     recs = []

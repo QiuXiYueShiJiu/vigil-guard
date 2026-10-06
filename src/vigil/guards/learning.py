@@ -62,6 +62,21 @@ MIN_DISTINCT = 3
 #: legitimate", and the corpus gate enforces it; this is a second net.
 MAX_LEGIT_HITS = 0
 
+#: Statuses that mean "the resource is there but you may not have it".
+#:
+#: These are **not** evidence of a path nobody uses: an API that answers 401
+#: to an unauthenticated request is a working endpoint. Treating them as
+#: suspicious is how the self-learning pass adopted a real authenticated
+#: interface as a seven-day decoy trap -- the operator's own tooling would
+#: then have been banned by the tripwire built from its traffic.
+AUTH_STATUSES = (401, 403)
+
+#: A candidate must show this much "the path really is not there" evidence
+#: (404/444 from independent sources) before it may be adopted. This is the
+#: hard gate that keeps a popular broken link or an auth-protected route from
+#: becoming a tripwire without a human looking at it.
+MIN_NOTFOUND = 1
+
 
 def observations_path() -> Path:
     return paths.STATE_STATE / "observations.jsonl"
@@ -222,7 +237,14 @@ def legitimate_corpus(cfg=None, max_files: int = 40) -> set:
 
 
 def _successful_paths(log_path: str, max_lines: int = 4000) -> set:
-    """Every path that got a 2xx/3xx from the access log."""
+    """Every path the access log shows as reachable.
+
+    A 2xx/3xx is obviously reachable. A 401/403 is reachable too -- the
+    server found something there and asked for credentials -- so those count
+    as legitimate corpus as well. Omitting them made "this endpoint requires
+    authentication" look identical to "nobody ever asked for this", which is
+    exactly the confusion the adoption gate must not have.
+    """
     out = set()
     try:
         with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
@@ -230,10 +252,12 @@ def _successful_paths(log_path: str, max_lines: int = 4000) -> set:
     except OSError:
         return out
     for line in lines:
-        match = re.search(r'"(?:GET|HEAD|POST) (\S+) [^"]*" (\d{3})', line)
+        match = re.search(r'"(?:GET|HEAD|POST|PUT|DELETE|OPTIONS|PATCH) '
+                          r'(\S+) [^"]*" (\d{3})', line)
         if not match:
             continue
-        if not match.group(2).startswith(("2", "3")):
+        code = match.group(2)
+        if not (code.startswith(("2", "3")) or int(code) in AUTH_STATUSES):
             continue
         path = match.group(1).split("?")[0]
         if not path.startswith("/"):
@@ -259,13 +283,17 @@ def mine(observations=None, min_distinct: int = MIN_DISTINCT) -> list:
         ip = str(rec.get("ip", ""))
         status = int(rec.get("status", 0) or 0)
         for token in tokens_for(path):
-            entry = stats.setdefault(token, {"ips": set(), "ok": 0,
+            entry = stats.setdefault(token, {"ips": set(), "ok": 0, "auth": 0,
                                              "notfound": 0, "last": 0})
             if ip:
                 entry["ips"].add(ip)
-            if 200 <= status < 400:
+            # 401/403 mean "there is something here, you may not have it" --
+            # a working authenticated endpoint, not a path nobody uses.
+            if 200 <= status < 400 or status in AUTH_STATUSES:
                 entry["ok"] += 1
-            elif status in (403, 404):
+                if status in AUTH_STATUSES:
+                    entry["auth"] += 1
+            elif status == 404:
                 entry["notfound"] += 1
             entry["last"] = max(entry["last"], float(rec.get("ts", 0) or 0))
     candidates = []
@@ -277,6 +305,7 @@ def mine(observations=None, min_distinct: int = MIN_DISTINCT) -> list:
             "token": token,
             "distinct_ips": distinct,
             "served_ok": entry["ok"],
+            "auth_hits": entry["auth"],
             "not_found": entry["notfound"],
             "last_seen": entry["last"],
         })
@@ -297,10 +326,29 @@ def evaluate(candidate: dict, legit: set, webroot: str = "") -> dict:
     if len(bare) < MIN_TOKEN:
         out.update(verdict="reject", confidence=0.0, reason="token 过短")
         return out
+    if candidate.get("auth_hits", 0) > 0:
+        # 401/403 is a *live* endpoint asking for credentials. It is not
+        # evidence that nobody legitimately uses the path, so it can never be
+        # the basis of a tripwire: the next legitimate authenticated request
+        # would be banned by a decoy built from its own traffic. Checked
+        # before the generic "served successfully" gate so the reason names
+        # the real problem.
+        out.update(verdict="reject", confidence=0.0,
+                   reason="曾以 401/403 应答 %d 次（需要鉴权），不能证明"
+                          "该路径无人合法访问" % candidate["auth_hits"])
+        return out
     if candidate.get("served_ok", 0) > MAX_LEGIT_HITS:
         out.update(verdict="reject", confidence=0.0,
                    reason="曾被成功访问过 %d 次，说明是正常资源"
                           % candidate["served_ok"])
+        return out
+    if candidate.get("not_found", 0) < MIN_NOTFOUND:
+        # No evidence that the path is absent at all -- only "nobody sent a
+        # credential". Adopting on that basis is guessing, and the guess is
+        # installed as a trap.
+        out.update(verdict="reject", confidence=0.0,
+                   reason="缺少「路径不存在」的证据（404/444 命中 %d 次）"
+                          % candidate.get("not_found", 0))
         return out
     if token.lower() in legit or bare in legit:
         out.update(verdict="reject", confidence=0.0,
