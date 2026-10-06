@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vigil-guard"
-version = "3.2.3"
+version = "3.3.0"
 description = "Server security, integrity and alerting guard"
 readme = "README.md"
 license = { file = "LICENSE" }
