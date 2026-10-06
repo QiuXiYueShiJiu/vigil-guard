@@ -373,6 +373,13 @@ def verify(limit: int = 200, cfg=None) -> dict:
             # and never used to excuse a change (see `attribute`).
             out["legacy"] += 1
             out["entries"].append(entry)
+            # Reset the chain to "" *because that is what the writer did*:
+            # `_last_mac()` looks at the final line of the file, sees no MAC
+            # there, and writes the next record with `prev: ""`. The verifier
+            # has to model the writer, or the two disagree on the very first
+            # record after any legacy run -- which is precisely the state a
+            # host is in the moment it is upgraded.
+            prev = ""
             continue
 
         seen_any = True

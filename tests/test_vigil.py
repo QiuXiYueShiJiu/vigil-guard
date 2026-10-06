@@ -9251,6 +9251,80 @@ class TestPackaging(unittest.TestCase):
                       (ROOT / "pyproject.toml").read_text())
 
 
+class TestSuiteDoesNotWriteOutsideItsTemporaryRoots(unittest.TestCase):
+    """The suite must not touch the host it runs on.
+
+    This is not hypothetical. While adding the audit chain, `procresponse`'s
+    mirror write and two un-isolated tests appended to the *real*
+    ``/var/lib/vigil/state/`` (and, worse, a test that rebuilt the ledger from
+    a temporary tree truncated it). A test run is supposed to be a rehearsal
+    against fictional hosts, not a write to the one it is running on.
+
+    The assertions here are structural rather than a log of what happened:
+    every ledger path a test can reach is checked to be inside a temporary
+    directory, and the module-level paths that would let a stray write escape
+    are asserted to be patched by the fixtures that need them.
+    """
+
+    def test_the_isolation_helper_covers_both_ledgers(self):
+        from vigil.evolve import ledger as evolve_ledger
+        from vigil.guards.checks import procresponse
+        case = _FakeCase()
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        saved = _isolate_autoresponse_ledgers(case, root)
+        try:
+            self.assertNotEqual(str(procresponse.LEDGER), str(saved[0]))
+            self.assertNotEqual(str(evolve_ledger.LEDGER), str(saved[1]))
+            self.assertTrue(str(procresponse.LEDGER).startswith(str(root)))
+            self.assertTrue(str(evolve_ledger.LEDGER).startswith(str(root)))
+        finally:
+            for func in case.cleanups:
+                func()
+
+    def test_the_helper_restores_the_original_paths(self):
+        """Every redirection must be undone, or it leaks into later tests.
+
+        `paths.STATE_STATE` and the ledger paths are read at *call* time, so a
+        fixture that reassigns one and forgets to restore it changes the
+        behaviour of every test that runs afterwards in the same process --
+        including tests that were passing for the wrong reason.
+        """
+        from vigil.evolve import ledger as evolve_ledger
+        from vigil.guards.checks import procresponse
+        before = (procresponse.LEDGER, evolve_ledger.LEDGER)
+        case = _FakeCase()
+        root = Path(tempfile.mkdtemp())
+        _isolate_autoresponse_ledgers(case, root)
+        for func in case.cleanups:
+            func()
+        self.assertEqual(before, (procresponse.LEDGER, evolve_ledger.LEDGER))
+        shutil.rmtree(root, True)
+
+    def test_the_deploy_ledger_write_only_fires_for_the_installed_tree(self):
+        """A rehearsal deploy must not be recorded as a deployment.
+
+        `deploy.json` is a fact about the tree; the audit ledger answers "did
+        this program's own code change because it was upgraded", and a
+        temporary tree is neither. This also keeps test deploys out of the
+        real ledger even if a fixture forgets to redirect it.
+        """
+        from vigil.core import installer as inst
+        self.assertTrue(inst._is_installed_tree(str(inst.paths.LIB / "vigil")))
+        self.assertFalse(inst._is_installed_tree("/tmp/some/tree/vigil"))
+        self.assertFalse(inst._is_installed_tree(""))
+
+
+class _FakeCase:
+    """Minimal stand-in for unittest.TestCase's cleanup registry."""
+
+    def __init__(self):
+        self.cleanups = []
+
+    def addCleanup(self, func, *args, **kwargs):
+        self.cleanups.append(lambda: func(*args, **kwargs))
+
+
 class TestConfigSchemaConsistency(unittest.TestCase):
     """Every key `vigil config` shows must be the key the code reads.
 
