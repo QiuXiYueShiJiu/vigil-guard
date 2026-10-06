@@ -48,8 +48,41 @@ sudo vigil config set checks.disk.paths '["/", "/data"]'   # JSON 值
 }
 ```
 
-完整字段见 `examples/config.typical.json`，或读
-`src/vigil/core/config.py` 里的 `DEFAULTS`（那是唯一权威）。
+**完整字段以 `src/vigil/core/config.py` 里的 `DEFAULTS` 为唯一权威** —— 用
+`vigil config get/set` 可以读写其中任何一个键。`examples/config.typical.json`
+是一份**常见项的示例骨架，不是完整字段清单**：它只覆盖日常真会去调的那些，
+包括 v3.3.0 新增的自动响应、自检归因、内存阈值，以及被提到顶层的 `bouncer` /
+`evolve`。示例里的值一律照实现的默认值写，**不会给出比默认更危险的配置**。
+
+> 示例**不参与运行**：程序读的是 `/etc/vigil/config.json`（密钥在
+> `secrets.json`）。示例只是给人抄的形状，改它不会影响任何一台机器上跑着的
+> 程序。
+
+改动示例文件或本文档的配置表之后，在仓库根目录跑一下这条，确认两者没有漂移
+（它只核对「本文档提到的键在示例里有没有」，不核对取值 —— 也**还没有接进 CI**）：
+
+```sh
+PYTHONPATH=src python3 - <<'PY'
+import json, re, pathlib
+from vigil.core.config import DEFAULTS
+
+def has(d, dotted):
+    cur = d
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False
+        cur = cur[part]
+    return True
+
+doc = pathlib.Path("docs/CONFIGURATION.md").read_text("utf-8")
+ex = json.loads(pathlib.Path("examples/config.typical.json").read_text("utf-8"))
+keys = {m.group(1) for m in
+        re.finditer(r"`([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)`", doc)}
+need = sorted(k for k in keys if has(DEFAULTS, k))
+missing = [k for k in need if not has(ex, k)]
+print("本文档列出的配置键 %d 个，示例里缺：%s" % (len(need), missing or "无"))
+PY
+```
 
 ### 展示出来的键必须真的有人读
 

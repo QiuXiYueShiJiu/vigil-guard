@@ -6,7 +6,6 @@
       {
         "provider": "resend",
         "api_key": "",
-        "secret": true,
         "from_address": "alerts@mail.example.com",
         "from_name": "Server Monitor"
       },
@@ -31,7 +30,14 @@
     "from_address": "",
     "from_name": "Server Monitor",
     "reply_to": "",
-    "language": "zh"
+    "language": "zh",
+    "digest_min_items": 5,
+    "digest_max_wait": 1800
+  },
+  "alerts": {
+    "mode": "attacks",
+    "renotify_seconds": 21600,
+    "recovery_quiet_seconds": 600
   },
   "threat": {
     "enabled": true,
@@ -64,10 +70,50 @@
         86400
       ]
     },
-    "recidivist_bans": 3
+    "recidivist_bans": 3,
+    "autoresponse": {
+      "enabled": false,
+      "action": "stop",
+      "observe_seconds": 120,
+      "resume_window_seconds": 600,
+      "after_observe": "hold",
+      "terminate_signal": "SIGTERM",
+      "max_per_hour": 2,
+      "allowlist": [],
+      "evidence_dir": ""
+    }
+  },
+  "bouncer": {
+    "enabled": false,
+    "sync_seconds": 60
+  },
+  "evolve": {
+    "enabled": false,
+    "allow_code_edits": false,
+    "source_root": "",
+    "run_tests": true,
+    "test_target": "",
+    "max_code_edits_per_day": 3,
+    "max_patch_lines": 40,
+    "max_adopted": 200,
+    "max_per_run": 5,
+    "min_hits": 8,
+    "min_ips": 3,
+    "memory_pct": 5.0,
+    "memory_floor_mb": 96,
+    "load_ratio": 0.7,
+    "time_budget": 120,
+    "report_enabled": true,
+    "report_url": ""
   },
   "checks": {
     "enabled": true,
+    "memory": {
+      "warn_available_pct": 20,
+      "crit_available_pct": 10,
+      "warn_available_mb": 0,
+      "crit_available_mb": 0
+    },
     "disk": {
       "warn_pct": 80,
       "crit_pct": 90,
@@ -101,6 +147,27 @@
       "dirs": [
         "/www/server/panel/vhost/cert"
       ]
+    },
+    "process_anomaly": {
+      "cpu_warn": 80,
+      "count_warn": 600,
+      "whitelist": [],
+      "build_dirs": []
+    },
+    "site_availability": {
+      "domain": "",
+      "port": 443,
+      "warn_5xx_pct": 5,
+      "crit_5xx_pct": 20,
+      "log_lines": 200
+    },
+    "self_integrity": {
+      "paths": [],
+      "auto_recover": true,
+      "heal_window_seconds": 1800,
+      "heal_max_attempts": 3,
+      "attribution_window_seconds": 86400,
+      "deploy_window_seconds": 900
     }
   },
   "gate": {
