@@ -46,7 +46,288 @@ from ...core import detect, paths
 _FILE_CAP = 4000
 
 #: Format version for the stored baseline. Bump when the shape changes.
-_BASELINE_V = 1
+#: v2 adds the attribution pass (see :func:`attribute`): the baseline itself
+#: is unchanged, but the *meaning* of a difference is, and a v1 state file has
+#: no ledger fingerprint to work from.
+_BASELINE_V = 2
+
+#: Ledger kinds that mean "this program changed one of its own files on
+#: purpose", and the field carrying the hash of the file afterwards.
+_EDIT_KINDS = ("code-edited", "applied")
+
+#: Peer hashes that are not hashes and must never be compared as one.
+_NOT_A_HASH = ("", "missing", "too-big", "unreadable", "not-recorded")
+
+
+def _is_hash(value) -> bool:
+    text = str(value or "")
+    if text in _NOT_A_HASH or text.startswith(("too-big:", "unreadable:")):
+        return False
+    return len(text) == 64
+
+
+def attribute(paths_changed, cur, package_root, cfg, now=None,
+              ledger_entries=None, ledger_verdict=None) -> dict:
+    """Decide *why* each changed file changed, by hash, before crying wolf.
+
+    The failure this fixes is real and it ran in both directions. ``evolve``
+    is allowed to edit one source file on purpose (``decoy.py``, the decoy
+    table); every such edit made ``self_integrity`` report CRIT, so the
+    finding that matters -- "somebody rewrote the code that decides what to
+    ban" -- was buried in a stream of legitimate self-modification. And the
+    opposite mistake is worse: accepting any change because "we changed
+    something recently" hands an attacker the perfect cover.
+
+    So the judge is a **hash**, never a timestamp and never "there is a
+    record in the ledger":
+
+      * a ledger record whose recorded post-edit hash equals the file's hash
+        *now* -> ``self`` (self-modification, recorded);
+      * a ledger record for this file whose hash does **not** match -> a
+        mismatch, reported as suspected tampering with both hashes. This is
+        the case that matters most: the file was recorded once and is not the
+        file that was recorded;
+      * no record, but the change happened while ``vigil update`` was
+        deploying -> ``deploy``;
+      * anything else -> ``unattributed``, reported as CRIT.
+
+    Two further guards, both about not being fooled by the ledger itself:
+
+    * the ledger must pass its own integrity check (:func:`vigil.evolve.
+      ledger.verify`). A broken chain means the file was edited, so *nothing*
+      in it is trusted and the break is named in the report;
+    * records must be recent (``attribution_window_seconds``). A
+      self-modification from three months ago cannot excuse today's edit --
+      otherwise every later change hides in its shadow forever.
+    """
+    now = time.time() if now is None else float(now)
+    window = _int_cfg(cfg, "checks.self_integrity.attribution_window_seconds",
+                      86400, minimum=1)
+
+    entries, verdict = _ledger(ledger_entries, ledger_verdict, cfg)
+    out = {"self": [], "deploy": [], "mismatch": [], "unattributed": [],
+           "ledger_ok": bool(verdict.get("ok", True)), "ledger": verdict,
+           "window": window}
+    if not verdict.get("ok", True):
+        # Fail closed, and say where. Every file becomes suspicious; the
+        # report explains that the reason is the ledger, not the files.
+        for path in sorted(paths_changed):
+            out["unattributed"].append({
+                "path": path, "why": "台账链校验失败（%s），台账不可信"
+                                     % verdict.get("break_reason", "原因未知")})
+        return out
+
+    recent = []
+    for entry in entries or ():
+        try:
+            ts = float(entry.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if now - ts <= window:
+            recent.append(entry)
+
+    deploy = _deploy_window(cfg, now)
+    for path in sorted(paths_changed):
+        digest = cur.get(path)
+        match, mismatched = _match_by_hash(path, digest, recent,
+                                           package_root, cur)
+        if match:
+            out["self"].append({"path": path, "entry": match})
+            continue
+        if mismatched:
+            out["mismatch"].append({"path": path, "entry": mismatched,
+                                    "expected": mismatched.get("after", ""),
+                                    "actual": digest})
+            continue
+        if deploy and _in_package(path, package_root):
+            stamp = _mtime(path)
+            if stamp and deploy[0] - deploy[1] <= stamp <= deploy[0] + 60:
+                out["deploy"].append({"path": path,
+                                      "version": deploy[2] or "?",
+                                      "at": deploy[0]})
+                continue
+        out["unattributed"].append({
+            "path": path,
+            "why": _why_not(recent, path, package_root, deploy, now, window)})
+    return out
+
+
+def _int_cfg(cfg, key: str, default: int, minimum: int = 0) -> int:
+    try:
+        value = int(cfg.get(key, default))
+    except (TypeError, ValueError, AttributeError):
+        value = default
+    return max(minimum, value)
+
+
+def _ledger(entries, verdict, cfg):
+    """``(entries, verdict)``, read from disk unless the caller supplied it."""
+    if entries is not None and verdict is not None:
+        return entries, verdict
+    try:
+        from ...evolve import ledger
+        # `cfg` is passed through because the chain's HMAC key lives in
+        # secrets.json, and this call may run before the config was loaded
+        # for any other purpose.
+        got = ledger.verify(limit=ledger.MAX_LINES, cfg=cfg)
+        return got.get("entries") or [], got
+    except Exception as exc:                                # noqa: BLE001
+        return [], {"ok": False, "break_reason":
+                    "无法读取台账：%s: %s" % (type(exc).__name__, exc)}
+
+
+def _match_by_hash(path, digest, entries, package_root, cur):
+    """Find the ledger record that produced *this exact content*.
+
+    Returns ``(matching_entry, mismatching_entry)``. The path test comes
+    first because a hash match on a *different* file is coincidence, not
+    attribution -- and the attacker controls neither the hash of the file
+    they want excused nor our ability to compare paths.
+
+    The path is compared three ways: absolute (what ``applied`` records),
+    relative to the source root (what a source checkout produces), and by
+    basename *only when it is unique among the changed files* -- a basename
+    alone must never let one file claim another's record.
+    """
+    if not _is_hash(digest):
+        return None, None
+    names = [os.path.basename(str(p)) for p in (cur or {})]
+    basename_unique = names.count(os.path.basename(str(path))) == 1
+    source_root = ""
+    try:
+        source_root = str(package_root or "")
+    except Exception:                                       # noqa: BLE001
+        source_root = ""
+    mismatch = None
+    for entry in reversed(entries or ()):
+        if entry.get("kind") not in _EDIT_KINDS:
+            continue
+        recorded = str(entry.get("after") or "")
+        if recorded in _NOT_A_HASH:
+            continue
+        target = str(entry.get("file") or entry.get("path") or "")
+        if not _same_file(path, target, source_root, basename_unique):
+            continue
+        if recorded == str(digest):
+            return entry, None
+        if mismatch is None:
+            mismatch = entry
+    return None, mismatch
+
+
+def _same_file(path, recorded, source_root, basename_unique: bool) -> bool:
+    if not recorded:
+        return False
+    real, rec = os.path.abspath(str(path)), os.path.abspath(str(recorded))
+    if real == rec:
+        return True
+    if source_root:
+        if rec == os.path.abspath(os.path.join(source_root, str(recorded))):
+            return True
+        rel = os.path.relpath(real, os.path.abspath(source_root))
+        if not rel.startswith("..") and rel == str(recorded):
+            return True
+    if basename_unique and os.path.basename(real) == os.path.basename(rec):
+        # Only reachable when the changed set contains exactly one file with
+        # this name, so it cannot be used to make one file vouch for another.
+        return True
+    return False
+
+
+def _in_package(path, package_root) -> bool:
+    if not package_root:
+        return False
+    real = os.path.abspath(str(path))
+    root = os.path.abspath(str(package_root))
+    return real == root or real.startswith(root.rstrip("/") + "/")
+
+
+def _deploy_window(cfg, now):
+    """``(timestamp, window, version)`` of the last deploy, or ``None``.
+
+    Read from ``deploy.json``, which ``vigil update`` already writes for
+    ``vigil rollback``. It is a second, independent source: an update changes
+    the installed package and nothing in the evolve ledger, so without this
+    an upgrade would look exactly like an intrusion.
+    """
+    try:
+        from ...core.state import read_json
+        rec = read_json(paths.STATE_STATE / "deploy.json", {}) or {}
+    except Exception:                                       # noqa: BLE001
+        return None
+    try:
+        at = float(rec.get("current_at") or 0)
+    except (TypeError, ValueError):
+        return None
+    if at <= 0:
+        return None
+    window = _int_cfg(cfg, "checks.self_integrity.deploy_window_seconds",
+                      900, minimum=30)
+    return at, window, str(rec.get("current") or "")
+
+
+def _mtime(path) -> float:
+    try:
+        return os.path.getmtime(str(path))
+    except OSError:
+        return 0.0
+
+
+def _why_not(entries, path, package_root, deploy, now, window) -> str:
+    """One honest sentence for the report, saying what was looked at."""
+    bits = []
+    if _in_package(path, package_root):
+        bits.append("它在本程序源码树内（源码永不自动还原，静默回滚会掩盖入侵）")
+    else:
+        bits.append("它是本程序之外的文件" if not _in_package(path, package_root)
+                    else "")
+    if deploy:
+        age = now - deploy[0]
+        bits.append("最近一次部署在 %.0f 秒前、窗口 %d 秒" % (age, deploy[1]))
+    else:
+        bits.append("没有可用的部署记录")
+    bits.append("台账里 %d 条记录都在 %d 秒窗口内，没有一条的「改动后哈希」"
+                "等于该文件当前的哈希" % (len(entries or ()), window))
+    return "；".join(b for b in bits if b)
+
+
+def _attribution_report(attr: dict) -> str:
+    """The "why we did / did not call this malicious" block, or ``""``.
+
+    Reported even when the verdict is "self-modification": the operator must
+    be able to see *which* ledger entry was accepted and *why*, otherwise the
+    attribution is a black box that could be excusing anything.
+    """
+    if not attr:
+        return ""
+    lines = []
+    if not attr.get("ledger_ok", True):
+        verdict = attr.get("ledger") or {}
+        lines.append("⚠️ 台账链校验**失败**：%s\n"
+                     "          因此不以台账为任何改动背书，全部按疑似恶意处理。"
+                     % verdict.get("break_reason", "原因未知"))
+    for entry in attr.get("self", [])[:6]:
+        rec = entry.get("entry") or {}
+        lines.append("✅ 自修正（已记录）: %s\n"
+                     "          台账条目 kind=%s ts=%s id=%s，"
+                     "记录的改动后哈希与当前文件一致"
+                     % (entry["path"], rec.get("kind"), rec.get("ts"),
+                        rec.get("id") or "-"))
+    for entry in attr.get("deploy", [])[:6]:
+        lines.append("✅ 部署（vigil update %s）: %s"
+                     % (entry.get("version") or "?", entry["path"]))
+    for entry in attr.get("mismatch", [])[:6]:
+        lines.append("❌ 台账里有该文件的记录，但**哈希不匹配** —— 疑似恶意更改: %s\n"
+                     "          台账期望 %s… / 实际 %s…（台账 id=%s）"
+                     % (entry["path"], str(entry.get("expected"))[:12],
+                        str(entry.get("actual"))[:12],
+                        (entry.get("entry") or {}).get("id") or "-"))
+    for entry in attr.get("unattributed", [])[:6]:
+        lines.append("❌ 无归因: %s\n          %s"
+                     % (entry["path"], entry.get("why", "")))
+    if not lines:
+        return ""
+    return "\n       ".join(lines)
 
 
 def digest_file(path: str, cap: int = 8 * 1024 * 1024) -> str:
@@ -146,24 +427,142 @@ class SelfIntegrity(Check):
             return CheckResult(OK, "程序自身与生成物均未改动（共校验 %d 个文件）"
                                    % len(cur))
 
+        # -- respond, before reporting ------------------------------------
+        # Detection without a response is how a deleted shield snippet got
+        # reported 55 times and rebuilt zero times. So the recoverable class
+        # is repaired here, and every repair is reported below whether it
+        # worked or not. See `guards/selfheal.py` for the boundary: only
+        # files this program generated, never its own source, never the
+        # operator's files.
+        heal_result = {}
+        if removed or changed:
+            try:
+                from .. import selfheal
+                heal_result = selfheal.heal(
+                    ctx.cfg, removed=removed, changed=changed, baseline=prev,
+                    healstate=ctx.state.setdefault(
+                        selfheal.HEAL_STATE_KEY, {}))
+            except Exception as exc:                        # noqa: BLE001
+                heal_result = {"enabled": True, "attempted": 0, "healed": [],
+                               "unhealed": [], "limited": [],
+                               "unsupported": [], "changed_baseline": {},
+                               "err": "%s: %s" % (type(exc).__name__, exc)}
+        healed = heal_result.get("changed_baseline") or {}
+        if healed:
+            # The stored baseline moves for exactly the files a rebuild
+            # *proved* it restored. Not for the others: a file that is still
+            # wrong must keep failing until a human looks at it, and a file
+            # we merely wrote must not be blessed by implication.
+            fresh = dict(prev)
+            fresh.update(healed)
+            ctx.state["self_integrity"] = fresh
+            prev = fresh
+
+        report = ""
+        try:
+            from .. import selfheal as _sh
+            report = _sh.describe(heal_result)
+        except Exception:                                   # noqa: BLE001
+            report = ""
+        if heal_result.get("err"):
+            # A response that could not even be attempted is still something
+            # the operator has to be told about -- "the auto-recovery itself
+            # is broken" is a finding, not a silence.
+            report = ("自动重建未能执行：%s" % heal_result["err"]) + (
+                "\n       " + report if report else "")
+
+        # Recompute the finding *after* the response. A file that came back
+        # is no longer a finding; one that did not is still one.
+        changed = [p for p in changed if p not in healed]
+        removed = [p for p in removed if p not in healed]
+        unresolved = bool(added or changed or removed)
+
+        # -- attribute, before calling anything malicious ------------------
+        # `evolve` is *allowed* to edit one source file on purpose; treating
+        # that as an intrusion buried the real finding, and treating every
+        # change as self-modification would hide the real one. The judge is
+        # the hash in the ledger, and only the hash -- see `attribute`.
+        attribution = {"self": [], "deploy": [], "mismatch": [],
+                       "unattributed": [], "ledger_ok": True, "ledger": {}}
+        if changed:
+            try:
+                attribution = attribute(changed, cur, _package_root(), ctx.cfg)
+            except Exception as exc:                        # noqa: BLE001
+                # An attribution pass that crashes must not become "no
+                # attribution needed". Fail closed and say so.
+                attribution = {
+                    "self": [], "deploy": [], "mismatch": [],
+                    "unattributed": [{"path": p,
+                                      "why": "归因过程异常：%s: %s"
+                                             % (type(exc).__name__, exc)}
+                                     for p in changed],
+                    "ledger_ok": False, "ledger": {}}
+        self_ok = {e["path"] for e in attribution.get("self", [])}
+        deploy_ok = {e["path"] for e in attribution.get("deploy", [])}
+        mismatched = {e["path"] for e in attribution.get("mismatch", [])}
+        attributed = self_ok | deploy_ok
+        malicious = [p for p in changed if p not in attributed]
+
+        attr_report = _attribution_report(attribution)
+
         blocks = []
-        for label, items in (("被修改", changed), ("被删除", removed),
+        for label, items in (("被修改", malicious), ("被删除", removed),
                              ("新增", added)):
             for path in items[:4]:
                 blocks.append("%s: %s" % (label, path))
-        extra = (len(changed) + len(removed) + len(added)) - len(blocks)
+        extra = (len(malicious) + len(removed) + len(added)) - len(blocks)
         if extra > 0:
             blocks.append("…… 另有 %d 个文件未展开" % extra)
 
+        sections = [s for s in (attr_report, report) if s]
+        notes = ("\n       " + "\n       ".join(sections)) if sections else ""
+
+        if not unresolved:
+            # Everything that changed was something this program generates,
+            # and it has been put back. That is still news -- the operator is
+            # told exactly which file was rebuilt and why -- but it is not a
+            # compromise of the program.
+            return CheckResult(
+                OK,
+                "程序自身的生成物曾被改动，已自动重建并复核通过：%s"
+                % (notes or "（无详情）"))
+
+        if not malicious and not removed and not added:
+            # Every remaining difference is either a recorded self-edit or a
+            # deploy. This is the case that used to produce a false CRIT on
+            # every single `evolve` run.
+            return CheckResult(
+                OK,
+                "程序自身有 %d 处变化，全部已归因，不作为篡改：%s"
+                % (len(attributed), notes))
+
+        if not blocks:
+            blocks.append("（没有可展开的未解决项）")
+        # Severity ladder for what is left. A file this program generates but
+        # deliberately will not rewrite on its own (see `guards/selfheal.py`)
+        # needs a human but is not evidence of an intrusion; a deleted
+        # *source* file, or a brute-force rewrite of a watched artifact, is.
+        severity = CRIT
+        leftovers = list(removed) + list(added)
+        if not malicious and leftovers and all(
+                _unrepairable_artifact(p) for p in leftovers):
+            severity = WARN
+            if heal_result.get("limited"):
+                # Repeated deletion/modification of the same artifact is not
+                # drift -- it is the signature of something actively fighting
+                # the repair. Escalated rather than filed as a warning.
+                severity = CRIT
         return CheckResult(
-            CRIT,
-            "程序自身或它生成的配置发生了变化：**%d 个**（改动 %d / 删除 %d / "
-            "新增 %d）\n       %s\n"
-            "       如果这不是你刚刚执行的 `vigil update`，说明有人动了安全程序"
-            "本身——优先核查这些文件的内容与改动者（auditd 有记录）。\n"
+            severity,
+            "%s程序自身或它生成的配置发生了变化：**%d 个**（改动 %d / 删除 %d / "
+            "新增 %d）\n       %s\n%s"
+            "       不在自动重建范围内的文件（重建会覆盖手改内容或运行时数据）"
+            "只报告；源码与生成物被改动一律按疑似篡改处理。\n"
             "       确认无误后重建基线：`vigil health rebaseline self_integrity`"
-            % (len(changed) + len(removed) + len(added), len(changed),
-               len(removed), len(added), "\n       ".join(blocks)))
+            % ("**疑似恶意更改**：" if severity == CRIT else "",
+               len(malicious) + len(removed) + len(added), len(malicious),
+               len(removed), len(added), "\n       ".join(blocks), notes))
+
 
     def _targets(self, ctx: CheckContext) -> list:
         out = {}
@@ -589,3 +988,27 @@ class VigilWatchdog(Check):
         if age < self._interval_minutes(ctx) * 60 * 3:
             return None
         return age / 3600.0
+
+
+def _unrepairable_artifact(path) -> bool:
+    """Is this a generated file that selfheal deliberately will not rewrite?
+
+    The distinction decides the severity: "the shield snippet was deleted and
+    we could not rebuild it" is a critical loss of protection, while "the
+    gate's config.php was deleted and we refuse to rewrite it because that
+    would drop your hand-edits" is a warning that needs a human. Only files
+    that are *in* the generated-artifact set count; anything else -- source
+    files especially -- stays critical.
+    """
+    try:
+        from ...gates import generated_artifacts
+        from .. import selfheal
+        known = {str(p) for p in generated_artifacts()}
+    except Exception:                                       # noqa: BLE001
+        return False
+    if str(path) not in known:
+        return False
+    try:
+        return not selfheal.supported(str(path))
+    except Exception:                                       # noqa: BLE001
+        return False
