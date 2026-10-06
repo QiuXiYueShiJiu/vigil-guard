@@ -354,6 +354,7 @@ def apply(cfg=None, prop=None, dry_run: bool = False, log=None) -> dict:
 
     # ---- Tier 2: the sanctioned source edit ----------------------------
     code_note, code_ok = "", False
+    code = {}
     if want_code:
         code = _code_edit(cfg, source_root, [prop])
         code_note = code.get("detail", "")
@@ -364,12 +365,19 @@ def apply(cfg=None, prop=None, dry_run: bool = False, log=None) -> dict:
             ledger.record("code-edit-skipped", id=prop["id"],
                           err=code.get("err"), detail=code.get("detail"))
         else:
+            # `after` is the hash of the file *as this edit left it*. It is
+            # what makes attribution checkable instead of archaeological:
+            # `self_integrity` accepts "self-modification" only when the hash
+            # on disk equals the hash the ledger recorded for that write. A
+            # ledger entry on its own would otherwise be enough to excuse any
+            # later edit to the same file -- see `guards/checks/selfcheck.py`.
             ledger.record("code-edited", id=prop["id"],
                           file=SAFE_CODE_FILES[0], backup=code.get("backup"),
-                          detail=code.get("detail"))
+                          after=code.get("after"), detail=code.get("detail"))
 
     ledger.record("applied", id=prop["id"], proposal=kind, path=path, tier=1,
-                  code_edited=code_ok)
+                  code_edited=code_ok, after=(code or {}).get("after") if code_ok
+                  else "")
     # 改完也要上报一份：只写本地台账的话，经验传不回上游，也就无法沉淀成
     # 下个版本里所有人都能拿到的东西 —— 那是这个通道存在的全部理由。
     sent = report_mod.send_report(cfg, {
@@ -431,8 +439,27 @@ def _code_edit(cfg, source_root, props) -> dict:
     if not ok:
         ledger.restore(bak, target)
         return {"ok": False, "err": detail, "detail": "（已自动还原）", "backup": bak}
-    return {"ok": True, "backup": bak,
+    return {"ok": True, "backup": bak, "after": _file_hash(target),
             "detail": "已改 %s（+%d 行，%s）" % (SAFE_CODE_FILES[0], added, detail)}
+
+
+def _file_hash(path) -> str:
+    """sha256 of a file, or "" when it cannot be read.
+
+    Local mirror of the helper in ``guards/checks/selfcheck.py`` rather than
+    an import: ``evolve`` is imported *by* the checks package, and a cycle
+    between "the thing that edits the code" and "the thing that verifies the
+    code" is not worth the two saved lines.
+    """
+    import hashlib
+    try:
+        h = hashlib.sha256()
+        with open(str(path), "rb") as fh:
+            for chunk in iter(lambda: fh.read(131072), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
 
 
 def rollback(cfg=None, change_id=None, notify: bool = True, log=None) -> dict:

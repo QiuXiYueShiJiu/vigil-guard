@@ -822,6 +822,24 @@ class Installer:
         rec["rollback_available"] = prev.is_dir()
         rec["rollback_version"] = rec["previous"]
         write_json(DEPLOY_STATE, rec, mode=0o640)
+        # Also write the deploy into the audit ledger. `self_integrity` uses
+        # it to tell "the code changed because this program was upgraded"
+        # apart from "the code changed", and the ledger is the record of every
+        # sanctioned change to this program's own files -- a deploy is the
+        # largest of them. Written after the state file so that file stays the
+        # source of truth for `vigil rollback`.
+        try:
+            from ..evolve import ledger as _ledger
+            _ledger.record("deployed", cfg=self.cfg, file=str(pkg),
+                           version=rec["current"],
+                           previous=rec["previous"],
+                           rollback_available=rec["rollback_available"])
+        except Exception as exc:                            # noqa: BLE001
+            # Reported, not swallowed: `self_integrity` reads this ledger to
+            # tell an upgrade apart from an intrusion, so a silent failure
+            # here would quietly make every later upgrade look suspicious.
+            if self.log:
+                self.log.warn("写入部署台账失败：%s: %s" % (type(exc).__name__, exc))
 
     @staticmethod
     def _version_of(tree) -> str:
