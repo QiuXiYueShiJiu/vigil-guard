@@ -5833,6 +5833,153 @@ class TestWebStatusPage(unittest.TestCase):
         self.assertIn("noindex", body)
 
 
+class TestWebInstallDoesNotClobber(unittest.TestCase):
+    """`vigil web install` must not silently replace somebody else's vhost.
+
+    A real accident: running `vigil web install --domain <domain>` replaced the
+    vhost another program had generated for that domain -- hand-tuned by the
+    operator -- with the status-page proxy, and the page changed under them.
+    The directory is shared and the filename is just `<domain>.conf`, which a
+    panel would pick too, so the name proves nothing. Only the generated marker
+    does.
+
+    These tests point ``CONF_DIRS`` at a temporary directory and stub the nginx
+    calls, so nothing here touches the host's real configuration.
+    """
+
+    DOMAIN = "status.example.com"
+
+    def setUp(self):
+        import contextlib
+        import io
+        from vigil.commands import web as web_mod
+        self.web = web_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.confdir = self.root / "vhost"
+        self.confdir.mkdir()
+        self.cfg = vconfig.Config(path=self.root / "config.json",
+                                  secrets_path=self.root / "secrets.json")
+        self.cfg.set("web.domain", self.DOMAIN)
+        self.cfg.save()
+        self._patched = []
+        self._patch(web_mod, "CONF_DIRS", (str(self.confdir),))
+        self._patch(web_mod.shell, "run", lambda *a, **k: (True, "", ""))
+        self._patch(web_mod.shell, "systemd_reload", lambda *a, **k: None)
+        self._buf = io.StringIO()
+        self._redirect = contextlib.redirect_stdout(self._buf)
+        self._redirect.__enter__()
+        self.addCleanup(lambda: self._redirect.__exit__(None, None, None))
+
+    def tearDown(self):
+        for obj, name, old in reversed(self._patched):
+            setattr(obj, name, old)
+        self.tmp.cleanup()
+
+    def _patch(self, obj, name, value):
+        self._patched.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def _args(self, domain=None, force=False):
+        args = type("Args", (), {})()
+        args.domain = self.DOMAIN if domain is None else domain
+        # A Path, not str: `load_config` does not coerce, and `cfg.save()`
+        # calls `self.path.exists()`.
+        args.config = self.cfg.path
+        args.force = force
+        return args
+
+    def _target(self):
+        return self.confdir / ("%s.conf" % self.DOMAIN)
+
+    # -- install ----------------------------------------------------------
+
+    def test_it_refuses_to_overwrite_a_foreign_vhost(self):
+        target = self._target()
+        foreign = ("server {\n    listen 80;\n"
+                   "    server_name example.org;\n}\n")
+        target.write_text(foreign, encoding="utf-8")
+        rc = self.web.cmd_install(self._args())
+        self.assertEqual(1, rc, "必须拒绝覆盖别人的配置")
+        self.assertEqual(foreign, target.read_text(encoding="utf-8"),
+                         "被拒绝时目标文件必须一个字节都没动")
+        out = self._buf.getvalue()
+        self.assertIn("拒绝覆盖", out)
+        self.assertIn(str(target), out, "提示里必须给出路径")
+        self.assertIn("--force", out, "提示里必须说明如何强制覆盖")
+
+    def test_it_overwrites_its_own_vhost(self):
+        target = self._target()
+        target.write_text(self.web.render_conf(self.cfg), encoding="utf-8")
+        self.assertEqual(0, self.web.cmd_install(self._args()))
+        first = target.read_text(encoding="utf-8")
+        self.assertTrue(first.startswith(self.web.CONF_BEGIN))
+        self.assertIn(self.DOMAIN, first)
+        # 幂等：自己的文件再装一次还是同一份。
+        self.assertEqual(0, self.web.cmd_install(self._args()))
+        self.assertEqual(first, target.read_text(encoding="utf-8"))
+
+    def test_it_writes_when_the_target_does_not_exist(self):
+        target = self._target()
+        self.assertFalse(target.exists())
+        self.assertEqual(0, self.web.cmd_install(self._args()))
+        self.assertTrue(target.is_file())
+        self.assertIn(self.web.CONF_BEGIN,
+                      target.read_text(encoding="utf-8"))
+
+    def test_force_is_the_explicit_way_past_the_guard(self):
+        target = self._target()
+        target.write_text("server { listen 80; }\n", encoding="utf-8")
+        self.assertEqual(0, self.web.cmd_install(self._args(force=True)))
+        self.assertIn(self.web.CONF_BEGIN,
+                      target.read_text(encoding="utf-8"))
+
+    def test_a_rejected_config_restores_what_was_there(self):
+        target = self._target()
+        foreign = "server { listen 80; server_name example.org; }\n"
+        target.write_text(foreign, encoding="utf-8")
+        self._patch(self.web.shell, "run",
+                    lambda *a, **k: (False, "", "[emerg] unknown directive"))
+        self.assertEqual(1, self.web.cmd_install(self._args(force=True)))
+        self.assertEqual(foreign, target.read_text(encoding="utf-8"),
+                         "nginx 拒绝时必须还原原文件，而不是直接删掉")
+
+    # -- uninstall --------------------------------------------------------
+
+    def test_uninstall_never_deletes_a_foreign_vhost(self):
+        target = self._target()
+        foreign = "server { listen 80; server_name example.org; }\n"
+        target.write_text(foreign, encoding="utf-8")
+        self.assertEqual(0, self.web.cmd_uninstall(self._args()))
+        self.assertTrue(target.is_file(), "非本程序生成的 vhost 绝不能被删除")
+        self.assertEqual(foreign, target.read_text(encoding="utf-8"))
+        self.assertIn("未删除", self._buf.getvalue())
+
+    def test_uninstall_removes_its_own_vhost(self):
+        target = self._target()
+        target.write_text(self.web.render_conf(self.cfg), encoding="utf-8")
+        self.assertEqual(0, self.web.cmd_uninstall(self._args()))
+        self.assertFalse(target.exists())
+
+    # -- the marker itself ------------------------------------------------
+
+    def test_a_file_without_both_markers_is_not_ours(self):
+        begin_only = self.root / "begin.conf"
+        begin_only.write_text(self.web.CONF_BEGIN + "\nserver {}\n",
+                              encoding="utf-8")
+        self.assertFalse(self.web._generated_vhost(begin_only))
+        end_only = self.root / "end.conf"
+        end_only.write_text("server {}\n" + self.web.CONF_END + "\n",
+                            encoding="utf-8")
+        self.assertFalse(self.web._generated_vhost(end_only))
+        ours = self.root / "ours.conf"
+        ours.write_text("\n" + self.web.render_conf(self.cfg) + "\n",
+                        encoding="utf-8")
+        self.assertTrue(self.web._generated_vhost(ours))
+        self.assertFalse(self.web._generated_vhost(self.root / "missing.conf"))
+
+
 class TestOneBurstIsOneOffence(unittest.TestCase):
     """One incident must count as one incident.
 

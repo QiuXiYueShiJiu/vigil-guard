@@ -19,6 +19,43 @@ from ..web import status as web_status
 
 SNIPPET = "vigil-web.conf"
 
+#: Marks a vhost this program wrote. Before overwriting or deleting anything in
+#: a web server's configuration directory we check for these two lines: the
+#: directory also holds files other programs and the operator generated, and
+#: there is no way to tell "mine" from "theirs" by filename -- they are all
+#: ``<domain>.conf``. A real accident: `vigil web install --domain X` silently
+#: replaced a carefully tuned vhost another program had made for X.
+CONF_BEGIN = "# >>> vigil web (generated; do not edit) >>>"
+CONF_END = "# <<< vigil web <<<"
+
+#: Where a reverse-proxy vhost is written. The first directory that exists
+#: wins: the panel's own vhost directory when there is one, /etc/nginx/conf.d
+#: otherwise. A module constant rather than inline literals so a test can point
+#: the command at a temporary directory instead of the host's real config.
+CONF_DIRS = ("/www/server/panel/vhost/nginx", "/etc/nginx/conf.d")
+
+
+def _generated_vhost(path) -> bool:
+    """Did *this* program write the file at *path*?
+
+    Deliberately strict and cheap: the begin marker must be its own line (the
+    first non-empty one), and the end marker must still be present. A file
+    whose header was edited, or whose footer was cut off, is treated as
+    somebody else's -- refusing to overwrite a file we are not sure about is
+    the safe direction, and the operator can always pass ``--force``.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if CONF_END not in text:
+        return False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        return line.strip() == CONF_BEGIN
+    return False
+
 
 def _ask_password() -> str:
     if not sys.stdin.isatty():                    # pragma: no cover - 交互路径
@@ -102,8 +139,7 @@ def render_conf(cfg) -> str:
     listen = str(cfg.get("web.listen", "127.0.0.1") or "127.0.0.1")
     port = int(cfg.get("web.port", 9177) or 9177)
     server_name = domain or "_"
-    return """# >>> vigil web (generated; do not edit) >>>
-# 状态页反代。上游只监听本机，TLS 由这一层负责。
+    body = """# 状态页反代。上游只监听本机，TLS 由这一层负责。
 server {
     listen 80;
     server_name %(name)s;
@@ -121,8 +157,8 @@ server {
     }
     access_log /www/wwwlogs/vigil-web.log;
 }
-# <<< vigil web <<<
 """ % {"name": server_name, "up": listen, "port": port}
+    return "%s\n%s%s\n" % (CONF_BEGIN, body, CONF_END)
 
 
 def cmd_install(args) -> int:
@@ -139,19 +175,44 @@ def cmd_install(args) -> int:
     ui.header("安装状态页", "生成反代配置并接入本机现有 Web 服务")
 
     target = None
-    for cand in ("/www/server/panel/vhost/nginx", "/etc/nginx/conf.d"):
-        if paths_path(cand).is_dir():
-            target = paths_path(cand) / ("%s.conf" % domain)
+    for cand in CONF_DIRS:
+        d = paths_path(cand)
+        if d.is_dir():
+            target = d / ("%s.conf" % domain)
             break
     if target is None:
         ui.failure("找不到可用的 nginx 配置目录")
         return 1
+
+    # Never silently overwrite somebody else's vhost. The panel writes
+    # `<domain>.conf` too, so the filename proves nothing; only the marker
+    # does. Refusing is the default, and `--force` is the explicit way past it.
+    previous = None
+    if target.exists():
+        if not _generated_vhost(target):
+            if not getattr(args, "force", False):
+                ui.failure("目标已存在，且不是本程序生成的配置，拒绝覆盖")
+                ui.kv("路径", str(target))
+                ui.note("它可能是面板或另一个程序生成的、你手工调过的 vhost。"
+                        "vigil 不会静默覆盖别人的配置。")
+                ui.hint("确认要用状态页反代替换它，请加 --force 重跑本命令。")
+                return 1
+            previous = target.read_text(encoding="utf-8", errors="replace")
+            ui.warning("--force：将覆盖不是本程序生成的配置 %s" % target)
+        else:
+            previous = target.read_text(encoding="utf-8", errors="replace")
+
     target.write_text(render_conf(cfg), encoding="utf-8")
     ui.success("已写入 %s" % target)
 
     ok, out, err = shell.run(["nginx", "-t"], timeout=20)
     if not ok:
-        target.unlink(missing_ok=True)
+        # Put back exactly what was there: deleting the file outright would
+        # destroy a vhost the operator had before this command ran.
+        if previous is None:
+            target.unlink(missing_ok=True)
+        else:
+            target.write_text(previous, encoding="utf-8")
         ui.failure("nginx 拒绝新配置，已撤回：%s" % (err or out).strip()[:200])
         return 1
     ui.success("nginx 配置检查通过")
@@ -175,12 +236,29 @@ def cmd_uninstall(args) -> int:
     cfg = load_config(args.config or None)
     domain = args.domain or str(cfg.get("web.domain", "") or "")
     from pathlib import Path
-    for cand in ("/www/server/panel/vhost/nginx", "/etc/nginx/conf.d"):
+    removed, skipped = [], []
+    for cand in CONF_DIRS:
         f = Path(cand) / ("%s.conf" % domain)
-        if f.is_file():
-            f.unlink()
-            ui.success("已移除 %s" % f)
-    shell.run(["systemctl", "reload", "nginx"], timeout=30)
+        if not f.is_file():
+            continue
+        # Absolutely never delete a vhost this program did not write. The
+        # directory is shared, and `<domain>.conf` is exactly the name a panel
+        # would pick, so deleting by name would remove somebody else's site.
+        if not _generated_vhost(f):
+            skipped.append(f)
+            continue
+        f.unlink()
+        removed.append(f)
+        ui.success("已移除 %s" % f)
+    if skipped:
+        ui.warning("以下配置不是本程序生成的，未删除：")
+        for f in skipped:
+            ui.out("  " + str(f))
+        ui.note("vigil 只删除自己生成的文件；如果它确实该删，请自行确认后手动删除。")
+    if not removed and not skipped:
+        ui.note("没有找到 %s 对应的反代配置" % domain)
+    if removed:
+        shell.run(["systemctl", "reload", "nginx"], timeout=30)
     return 0
 
 
@@ -227,6 +305,9 @@ def register(sub) -> None:
 
     sp = ps.add_parser("install", help="生成反代配置并接入现有 Web 服务")
     sp.add_argument("--domain", help="对外域名，例如 status.example.com")
+    sp.add_argument("--force", action="store_true",
+                    help="目标已有一个不是本程序生成的配置时，仍然覆盖它"
+                         "（默认拒绝覆盖，避免踩掉别人调好的 vhost）")
     sp.add_argument("--config")
     sp.set_defaults(func=cmd_install)
 
