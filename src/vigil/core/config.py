@@ -63,6 +63,16 @@ DEFAULTS: dict = {
         # How many parked digest files to replay per run. One keeps the
         # replay gentle on a metered provider after an outage.
         "overflow_per_run": 1,
+        # 普通事件攒够这么多条就发一次；不足则等到 digest_max_wait 秒再说。
+        # 重要事件（SEV_CRIT 或带 immediate 的）不受这两个值约束，立即发出。
+        #
+        # 这两项**属于 mail 段**，因为决定的是邮件怎么发。它们曾经被写在
+        # `threat` 段里，而读取路径一直是 `mail.digest_min_items` —— 于是
+        # `vigil config` 展示一个永远没人读的 `threat.digest_min_items`，
+        # 真正生效的 `mail.*` 反而看不见。展示得出来却没人读的键比缺一个键
+        # 更坏：它让人以为配上了。展示的键必须就是读取的键。
+        "digest_min_items": 5,
+        "digest_max_wait": 1800,
         # Inbound mailbox for the reply-command channel. Left empty, it is
         # inferred from the SMTP channel (the mailbox that sends the alerts
         # is almost always the one that receives the replies).
@@ -162,43 +172,7 @@ DEFAULTS: dict = {
         "lure": {
             "sitemap": "auto",
         },
-        # -- 自修正循环 ------------------------------------------------------
-        # 默认关闭。开启后它会读本机真实流量、采纳新的诱饵路径，并把每次
-        # 改动写进台账、改前发邮件、改后上报。
-        #
-        # 它**不会**随意改源码：只有 `source_root` 指向一个真实的源码检出、
-        # 且 `allow_code_edits` 显式打开时，才允许改动唯一一个被许可的文件
-        # （诱饵表），并且仍有行数上限、每日次数上限、备份与「测试不过就还原」。
-        "evolve": {
-            "enabled": False,
-            "allow_code_edits": False,       # 源码自改总开关，默认关
-            "source_root": "",               # 真实源码检出路径；空则无法自改源码
-            "run_tests": True,               # 改源码后必须跑测试
-            "test_target": "",               # 空 = 全套 discover
-            "max_code_edits_per_day": 3,
-            "max_patch_lines": 40,
-            "max_adopted": 200,              # 运行期采纳的诱饵条数上限
-            "max_per_run": 5,                # 单次最多采纳几条
-            "min_hits": 8,                   # 证据门槛：至少被请求次数
-            "min_ips": 3,                    # 证据门槛：至少几个独立来源
-            "memory_pct": 5.0,               # 只取**可用**内存的这个百分比
-            "memory_floor_mb": 96,           # 可用内存低于此值就不开工
-            "load_ratio": 0.7,               # 负载超过 核数×此值 就不开工
-            "time_budget": 120,              # 单次运行的墙钟上限（秒）
-            "report_enabled": True,
-            # 留空 = 只写本地台账，不外发。指向你自己的收集端即可启用上报。
-            "report_url": "",
-        },
-        # -- second enforcement point: the web server ----------------------
-    # Renders the active ban list into an nginx snippet, so a ban is
-    # enforced even on a host without ipset, and so what is blocked can be
-    # read and audited as a file. Off by default: it edits nginx
-    # configuration, and that is an operator's decision, not a default.
-    "bouncer": {
-        "enabled": False,
-        "sync_seconds": 60,
-    },
-    # -- netblock escalation --------------------------------------------
+        # -- netblock escalation --------------------------------------------
     # Escalating from an address to its network is the most dangerous
     # automatic decision in this program: one host scans you and bystanders
     # on the same /24 lose service. It is enabled because a coordinated
@@ -308,10 +282,6 @@ DEFAULTS: dict = {
         "min_flush_interval": 30,
         "event_flush_interval": 60,
         "event_queue_max": 1000,
-        # 普通事件攒够这么多条就发一次；不足则等到 digest_max_wait 秒再说。
-        # 重要事件（SEV_CRIT 或带 immediate 的）不受这两个值约束，立即发出。
-        "digest_min_items": 5,
-        "digest_max_wait": 1800,
         "strict_flag_ttl": 5,
         "strict_factor": 0.5,
         "max_tracked_ips": 20000,
@@ -323,6 +293,90 @@ DEFAULTS: dict = {
         # rewriting another tool's config behind its back produces two
         # divergent lists and a confusing support story.
         "auto_sync_fail2ban": False,
+
+        # -- 可疑进程自动响应 ------------------------------------------------
+        # 这是本程序里唯一会**动别的进程**的功能，所以它的护栏比功能本身重要。
+        #
+        # 取舍写在最前面：**宁可漏处置，也绝不误杀**。一次误判的自动杀进程
+        # 会直接把服务器搞挂 —— 那比放过一个攻击者严重得多。所有默认值都是
+        # 按这个取舍选的：默认关闭、默认只做可逆的 SIGSTOP、默认先观察。
+        "autoresponse": {
+            # 默认**关闭**。开启它意味着允许本程序暂停系统上的任意进程，
+            # 必须是一个显式的决定。
+            "enabled": False,
+            # "stop" = SIGSTOP（可逆，默认；随后继续观察，证据被推翻就
+            #          SIGCONT 恢复）；"terminate" = 按 terminate_signal 处置。
+            "action": "stop",
+            # 判定成立后先观察这么久（秒），期间任何豁免信号出现即放弃。
+            # 快照一瞬可疑不足以动手：要求可疑特征在时间上持续。
+            "observe_seconds": 120,
+            # SIGSTOP 之后继续观察这么久（秒），证据被推翻就自动 SIGCONT。
+            "resume_window_seconds": 600,
+            # 观察期结束后证据仍然成立，且 action=stop 时怎么办：
+            #   "hold"      -- 保持暂停，只报告，等操作者决定（默认，最保守）
+            #   "terminate" -- 升级为 terminate_signal
+            "after_observe": "hold",
+            # 直接终止时用的信号。先 SIGTERM 让它自己收尾；SIGKILL 不可挽回，
+            # 需要显式配置。
+            "terminate_signal": "SIGTERM",
+            # 限频：每小时最多处置几个进程，超过只报告并说明已达上限。
+            "max_per_hour": 2,
+            # 操作者允许清单。命中的进程**永不处置**。与
+            # checks.process_anomaly.whitelist（只影响报告）是两件事：
+            # 这一条是硬豁免，会写进"永不处置"清单。
+            "allowlist": [],
+            # 证据落盘目录。内存马一杀证据就没了，所以证据先写盘再动手。
+            "evidence_dir": "",
+        },
+    },
+
+    # -- second enforcement point: the web server -------------------------
+    # Renders the active ban list into an nginx snippet, so a ban is
+    # enforced even on a host without ipset, and so what is blocked can be
+    # read and audited as a file. Off by default: it edits nginx
+    # configuration, and that is an operator's decision, not a default.
+    #
+    # 这一段与 `evolve` 都属于**顶层**，不属于 `threat`：它们的读取路径一直
+    # 是 `bouncer.*` / `evolve.*`（bouncer.py、units.py、evolve/*.py）。
+    # 早先把它们写在 `threat` 段里，于是 `vigil config` 展示
+    # `threat.bouncer.enabled`、代码却读 `bouncer.enabled` —— 一个「看得见、
+    # 配了不生效」的键，比缺一个键更坏，因为它让人以为配上了。
+    "bouncer": {
+        "enabled": False,
+        "sync_seconds": 60,
+    },
+
+    # -- 自修正循环 --------------------------------------------------------
+    # 默认关闭。开启后它会读本机真实流量、采纳新的诱饵路径，并把每次改动写进
+    # 台账、改前发邮件、改后上报。
+    #
+    # 它**不会**随意改源码：只有 `source_root` 指向一个真实的源码检出、且
+    # `allow_code_edits` 显式打开时，才允许改动唯一一个被许可的文件（诱饵表），
+    # 并且仍有行数上限、每日次数上限、备份与「测试不过就还原」。
+    "evolve": {
+        "enabled": False,
+        "allow_code_edits": False,       # 源码自改总开关，默认关
+        "source_root": "",               # 真实源码检出路径；空则无法自改源码
+        "run_tests": True,               # 改源码后必须跑测试
+        "test_target": "",               # 空 = 全套 discover
+        "max_code_edits_per_day": 3,
+        "max_patch_lines": 40,
+        "max_adopted": 200,              # 运行期采纳的诱饵条数上限
+        "max_per_run": 5,                # 单次最多采纳几条
+        "min_hits": 8,                   # 证据门槛：至少被请求次数
+        "min_ips": 3,                    # 证据门槛：至少几个独立来源
+        "memory_pct": 5.0,               # 只取**可用**内存的这个百分比
+        "memory_floor_mb": 96,           # 可用内存低于此值就不开工
+        "load_ratio": 0.7,               # 负载超过 核数×此值 就不开工
+        "time_budget": 120,              # 单次运行的墙钟上限（秒）
+        "report_enabled": True,
+        # 留空 = 只写本地台账，不外发。指向你自己的收集端即可启用上报。
+        "report_url": "",
+        # 台账链的 HMAC 密钥。名字里含 "key"，所以 core.config 会把它写进
+        # secrets.json（0600）而不是 config.json —— 这正是它有意义的前提：
+        # 台账要用来区分「自修正」与「恶意更改」，就必须**不可伪造**，
+        # 而没有密钥的哈希链谁都能重算。留空时首次写入自动生成。
+        "ledger_mac_key": "",
     },
 
     # -- load shedding ---------------------------------------------------
@@ -402,7 +456,28 @@ DEFAULTS: dict = {
         # edit: the nginx snippets that decide what reaches the login gate,
         # the gate's own config, the audit rules file. The installed package
         # is always covered and does not need listing. Populated at install.
-        "self_integrity": {"paths": []},
+        #
+        # 被删/被改的**生成物**会被自动重建（见 guards/selfheal.py）：那是
+        # 本程序自己的输出，重写不会丢操作者的数据。本程序自己的源码与操作者的
+        # 文件永不自动还原 —— 静默回滚会掩盖真实入侵，报告必须留给人看。
+        "self_integrity": {
+            "paths": [],
+            # 默认开启：重建本程序自己的文件没有风险，而「发现了却没人去重建」
+            # 正是这个功能存在的原因（shield 片段被删后连报 55 次，文件一直是缺的）。
+            "auto_recover": True,
+            # 限频：同一路径在窗口内最多重建几次，超过后只报警。防的是
+            # 「重建→又被删→再重建」的循环：那种循环会烧 CPU、刷满审计日志，
+            # 并且掩盖「有东西正在删这个文件」这件本身最值得追查的事。
+            "heal_window_seconds": 1800,
+            "heal_max_attempts": 3,
+            # 归因时间窗口（秒）：台账记录必须**新近**才能为今天的改动背书。
+            # 三个月前的一次自修正不该解释今天的改动 —— 那正是「躲在自修正
+            # 影子里」的做法。超出窗口的改动按未归因处理。
+            "attribution_window_seconds": 86400,
+            # `vigil update` 写 deploy.json 前后多久内的源码改动算「部署」。
+            # 这是比哈希匹配弱的判据（见代码注释），所以窗口给得保守。
+            "deploy_window_seconds": 900,
+        },
         "audit_rules": {"rules_file": ""},
         "suid_files": {"extra_dirs": []},
         "reboot": {"min_drop_seconds": 60},

@@ -241,10 +241,15 @@ _BINARY_AUTH_LOGS = ("wtmp", "btmp", "lastlog", "utmp")
 class Settings:
     """Resolved ``threat`` settings, with an audit trail of every key read.
 
-    Every value comes from ``cfg.get("threat...", default)``.  Values marked
-    ``in_schema=False`` are extension keys: the schema in ``core/config.py``
-    does not define them yet, so the built-in default applies unless the
-    operator adds them (see ``--show-config`` and the port report).
+    Every value comes from ``cfg.get("threat...", default)``.  The
+    ``in_schema`` flag on each read says whether ``core/config.py``'s
+    ``DEFAULTS`` defines that key: ``False`` marks an extension key that only
+    exists because the operator added it, and ``vigil-threatd --print-config``
+    lists those separately.  The flag is therefore a *claim*, and it is only
+    as good as the schema: a key that is in ``DEFAULTS`` but marked ``False``
+    shows up as an extension the operator never wrote, and a key that the
+    code reads but the schema lacks is invisible in ``vigil config``.  Both
+    directions are asserted in the test suite.
     """
 
     def __init__(self, cfg):
@@ -257,7 +262,7 @@ class Settings:
         self.whitelist = list(self._r("threat.whitelist",
                                       ["127.0.0.1/8", "::1"]) or [])
         self.auto_whitelist_local = bool(
-            self._r("threat.auto_whitelist_local", True, in_schema=False))
+            self._r("threat.auto_whitelist_local", True))
         self.notify_bans = bool(self._r("threat.notify_bans", True))
         self.notify_ssh_success = bool(self._r("threat.notify_ssh_success", True))
         self.max_bans_per_hour = _int(self._r("threat.max_bans_per_hour", 60), 60,
@@ -283,7 +288,7 @@ class Settings:
         self.ssh_invalid_threshold = _int(
             self._r("threat.ssh.invalid_user_threshold",
                     max(self.ssh_max_failures, int(round(self.ssh_max_failures * 1.6))),
-                    in_schema=False),
+                    ),
             max(self.ssh_max_failures, int(round(self.ssh_max_failures * 1.6))),
             minimum=1)
 
@@ -317,17 +322,19 @@ class Settings:
         # Low-confidence probing: schema's http.max_attacks/window is the
         # intended knob; the original's 3/300 is the fallback for the window.
         self.exploit_low_hits = _int(self._rf(["threat.http.exploit_low_hits"],
-                                              self.http_max_attacks), 
+                                              self.http_max_attacks,
+                                              in_schema=True),
                                      self.http_max_attacks, minimum=1)
         self.exploit_low_window = _int(self._rf(["threat.http.exploit_low_window"],
-                                                self.http_window),
+                                                self.http_window, in_schema=True),
                                        self.http_window, minimum=1)
-        # Burst / flood thresholds have no schema key; original tuning kept.
+        # Burst / flood thresholds are in the schema (`threat.http.*`);
+        # the original tuning is kept as the default.
         self.http_burst_threshold = _int(
-            self._rf(["threat.http.burst_threshold"], 100), 100, minimum=1)
+            self._rf(["threat.http.burst_threshold"], 100, in_schema=True), 100, minimum=1)
         self.http_burst_window = _int(
-            self._rf(["threat.http.burst_window"], 60), 60, minimum=1)
-        _flood = self._rf(["threat.http.flood_threshold"], 1200)
+            self._rf(["threat.http.burst_window"], 60, in_schema=True), 60, minimum=1)
+        _flood = self._rf(["threat.http.flood_threshold"], 1200, in_schema=True)
         # M13：旧版本的默认值会被 save() 写进 config.json，于是「改默认值」这类
         # 修复对已装好的机器**永远不生效**（实测线上仍是 500，而新默认是 1200）。
         # 值恰好等于旧默认值时，按「从未被显式设置」处理，迁移到新默认。
@@ -338,7 +345,7 @@ class Settings:
             pass
         self.http_flood_threshold = _int(_flood, 1200, minimum=1)
         self.http_flood_window = _int(
-            self._rf(["threat.http.flood_window"], 60), 60, minimum=1)
+            self._rf(["threat.http.flood_window"], 60, in_schema=True), 60, minimum=1)
 
         # -- port scan (schema section; the original had no detector) ----
         self.portscan_enabled = bool(self._r("threat.portscan.enabled", True))
@@ -404,7 +411,7 @@ class Settings:
         derived_instant = max(max(self.ssh_ban_seconds), max(self.http_ban_seconds))
         self.instant_ban_seconds = _clamp_seconds(_int(
             self._r("threat.instant_ban_seconds", derived_instant,
-                    in_schema=False),
+                    ),
             derived_instant, minimum=1))
         # 两次「升级」之间至少间隔这么久；同一轮突发只算一次违规。
         self.escalation_interval = _int(
@@ -417,72 +424,76 @@ class Settings:
         self.flood_floor = _int(
             self._r("threat.http.flood_floor", 600), 600, minimum=1)
         self.offense_decay = _int(
-            self._r("threat.offense_decay", 86400, in_schema=False), 86400,
+            self._r("threat.offense_decay", 86400), 86400,
             minimum=60)
         self.alert_cooldown = _int(
-            self._r("threat.alert_cooldown", 600, in_schema=False), 600,
+            self._r("threat.alert_cooldown", 600), 600,
             minimum=0)
 
         # -- operations --------------------------------------------------
         self.selfheal_interval = _int(
-            self._r("threat.selfheal_interval", 30, in_schema=False), 30,
+            self._r("threat.selfheal_interval", 30), 30,
             minimum=5)
         self.housekeeping_interval = _int(
-            self._r("threat.housekeeping_interval", 300, in_schema=False), 300,
+            self._r("threat.housekeeping_interval", 300), 300,
             minimum=30)
         self.min_flush_interval = _int(
-            self._r("threat.min_flush_interval", 30, in_schema=False), 30,
+            self._r("threat.min_flush_interval", 30), 30,
             minimum=0)
         self.event_flush_interval = _int(
-            self._r("threat.event_flush_interval", 60, in_schema=False), 60,
+            self._r("threat.event_flush_interval", 60), 60,
             minimum=1)
         # 普通事件的合并门槛：攒够 digest_min_items 条、或最老的一条等了
         # digest_max_wait 秒，才发出去。这一条是为了不把收件箱搞炸 —— 实测一天
         # 190 封里绝大多数是逐条发出的普通事件（封禁、登录、异常恢复），而真正
         # 需要立刻知道的（爆破成功、熔断、白名单命中、网段封禁）本来就带
         # immediate，不受这里约束。
+        #
+        # `in_schema` 不再传 False：这两项已经补进 `DEFAULTS["mail"]`，
+        # 所以 `vigil-threatd --print-config` 的 missing_from_schema 不该再
+        # 列出它们。判据是「vigil config 展示的键 == 实际读取的键」。
         self.digest_min_items = _int(
-            self._r("mail.digest_min_items", 5, in_schema=False), 5, minimum=1)
+            self._r("mail.digest_min_items", 5), 5, minimum=1)
         self.digest_max_wait = _int(
-            self._r("mail.digest_max_wait", 1800, in_schema=False), 1800, minimum=0)
+            self._r("mail.digest_max_wait", 1800), 1800, minimum=0)
         self.event_queue_max = _int(
-            self._r("threat.event_queue_max", 1000, in_schema=False), 1000,
+            self._r("threat.event_queue_max", 1000), 1000,
             minimum=10)
         self.strict_flag_ttl = _num(
-            self._r("threat.strict_flag_ttl", 5, in_schema=False), 5, minimum=0.5)
+            self._r("threat.strict_flag_ttl", 5), 5, minimum=0.5)
         self.strict_factor = _num(
-            self._r("threat.strict_factor", 0.5, in_schema=False), 0.5,
+            self._r("threat.strict_factor", 0.5), 0.5,
             minimum=0.05)
         self.max_tracked_ips = _int(
-            self._r("threat.max_tracked_ips", 20000, in_schema=False), 20000,
+            self._r("threat.max_tracked_ips", 20000), 20000,
             minimum=100)
         self.behavior_max_ips = _int(
-            self._r("threat.behavior_max_ips", 4000, in_schema=False), 4000,
+            self._r("threat.behavior_max_ips", 4000), 4000,
             minimum=100)
         self.behavior_max_uris = _int(
-            self._r("threat.behavior_max_uris", 8, in_schema=False), 8,
+            self._r("threat.behavior_max_uris", 8), 8,
             minimum=1)
         self.track_idle_ttl = _int(
-            self._r("threat.track_idle_ttl", 3600, in_schema=False), 3600,
+            self._r("threat.track_idle_ttl", 3600), 3600,
             minimum=60)
 
         # -- enforcement (names are configuration, never hardcoded) ------
         self.ipset_set = str(self._r("threat.ipset_set", "vigil_threat",
-                                     in_schema=False))
+                                     ))
         self.iptables_chain = str(self._r("threat.iptables_chain", "INPUT",
-                                          in_schema=False))
+                                          ))
         self.ipset_program = str(self._r("threat.ipset_program", "ipset",
-                                         in_schema=False))
+                                         ))
         self.iptables_program = str(self._r("threat.iptables_program", "iptables",
-                                            in_schema=False))
+                                            ))
 
         # -- distributed brute force -------------------------------------
         self.distributed_window = _int(
-            self._rf(["threat.distributed.window"], 300), 300, minimum=10)
+            self._rf(["threat.distributed.window"], 300, in_schema=True), 300, minimum=10)
         self.distributed_min_ips = _int(
-            self._rf(["threat.distributed.min_ips"], 15), 15, minimum=2)
+            self._rf(["threat.distributed.min_ips"], 15, in_schema=True), 15, minimum=2)
         self.distributed_min_fails = _int(
-            self._rf(["threat.distributed.min_fails"], 20), 20, minimum=2)
+            self._rf(["threat.distributed.min_fails"], 20, in_schema=True), 20, minimum=2)
 
         # -- log sources -------------------------------------------------
         self.log_sources = self._resolve_log_sources()
