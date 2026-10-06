@@ -300,6 +300,131 @@ class TestNoHardcodedHostData(unittest.TestCase):
         self.assertTrue(any("recipients" in p for p in problems))
 
 
+class TestSourceAuditDecodesEscapes(unittest.TestCase):
+    """A forbidden literal hidden behind ``\\uXXXX`` is still forbidden.
+
+    A real operator account name sat in the admin page as
+    ``"\\u79cb\\u5915..."``. Grep, the local forbid list and every shape rule
+    were blind to it, because all three compared the raw bytes. The escape
+    forms below are the ones Python, JavaScript, PHP and JSON share.
+
+    Every escape in this file is built at run time, never written literally:
+    the test suite ships, so a literal escape here would make the guard flag
+    its own test -- which is exactly the blindness being fixed, inverted.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    @staticmethod
+    def _esc_u(text):
+        return "".join("\\u%04x" % ord(ch) for ch in text)
+
+    @staticmethod
+    def _esc_big_u(text):
+        return "".join("\\U%08x" % ord(ch) for ch in text)
+
+    @staticmethod
+    def _esc_x(text):
+        return "".join("\\x%02x" % ord(ch) for ch in text)
+
+    def _forbid(self, value):
+        (self.tmp / "tools").mkdir(exist_ok=True)
+        (self.tmp / "tools" / "source-forbid.txt").write_text(
+            value + ":project code\n", encoding="utf-8")
+
+    def test_an_escaped_literal_is_decoded_and_reported(self):
+        from vigil.core import sourceaudit
+        secret = "ProjectCobalt"          # no shape; only the local list knows
+        self._forbid(secret)
+        for name, escaped in (("a_u.py", self._esc_u(secret)),
+                              ("b_bigu.py", self._esc_big_u(secret)),
+                              ("c_x.py", self._esc_x(secret))):
+            (self.tmp / name).write_text('LABEL = "%s"\n' % escaped,
+                                         encoding="utf-8")
+        found = sourceaudit.scan(self.tmp)
+        self.assertEqual(["a_u.py", "b_bigu.py", "c_x.py"],
+                         sorted(f["path"] for f in found))
+        for f in found:
+            self.assertEqual(1, f["line"])
+            self.assertEqual(secret, f["text"])
+
+    def test_a_generic_rule_also_sees_the_decoded_text(self):
+        """Not just the local list -- the shipped shapes are decoded too."""
+        from vigil.core import sourceaudit
+        # A personal mailbox written only in escapes.
+        address = "ops" + "@" + "qq.com"
+        (self.tmp / "page.py").write_text(
+            'CONTACT = "%s"\n' % self._esc_u(address), encoding="utf-8")
+        found = sourceaudit.scan(self.tmp)
+        self.assertEqual(1, len(found), found)
+        self.assertEqual(address, found[0]["text"])
+        self.assertIn("mailbox", found[0]["why"])
+
+    def test_the_reported_line_is_the_line_in_the_file(self):
+        from vigil.core import sourceaudit
+        secret = "ProjectCobalt"
+        self._forbid(secret)
+        (self.tmp / "app.py").write_text(
+            "# header\n\nNAME = \"%s\"\n" % self._esc_u(secret),
+            encoding="utf-8")
+        found = sourceaudit.scan(self.tmp)
+        self.assertEqual(1, len(found), found)
+        self.assertEqual(3, found[0]["line"])
+
+    def test_the_same_literal_raw_and_escaped_is_not_counted_twice(self):
+        from vigil.core import sourceaudit
+        secret = "ProjectCobalt"
+        self._forbid(secret)
+        (self.tmp / "both.py").write_text(
+            'X = "%s" + "%s"\n' % (secret, self._esc_u(secret)),
+            encoding="utf-8")
+        found = sourceaudit.scan(self.tmp)
+        # 这一行两种写法都在。报一次就够 —— 跑了两遍规则不该让同一行翻倍，
+        # 而文件仍然被标记，没有漏报。
+        self.assertEqual(1, len(found), found)
+
+    def test_ordinary_escapes_and_regexes_are_not_false_positives(self):
+        """``\\n``, ``\\t`` and a regex's ``\\d`` are not these escapes."""
+        from vigil.core import sourceaudit
+        secret = "ProjectCobalt"
+        self._forbid(secret)                 # the list exists but is not hit
+        (self.tmp / "normal.py").write_text(
+            'NEWLINE = "\\n"\n'
+            'TAB = "\\t"\n'
+            'PATTERN = r"\\d{4}-\\d{2}-\\d{2}"\n'
+            'WORD = r"\\w+"\n'
+            'BYTES = b"\\x41\\x42"\n'
+            'QUOTED = "\\\\u0050rojectCobalt"\n',
+            encoding="utf-8")
+        self.assertEqual([], sourceaudit.scan(self.tmp))
+
+    def test_an_escape_is_not_decoded_inside_source_that_is_already_readable(self):
+        from vigil.core import sourceaudit
+        secret = "ProjectCobalt"
+        self._forbid(secret)
+        # `"\\u0050rojectCobalt"` (double backslash) is the literal text
+        # `\u0050rojectCobalt`, not the string. Decoding it would invent a
+        # finding in any file that quotes an escape.
+        (self.tmp / "quoted.py").write_text(
+            'HELP = "write it as \\\\u0050rojectCobalt"\n', encoding="utf-8")
+        self.assertEqual([], sourceaudit.scan(self.tmp))
+
+    def test_invalid_or_surrogate_escapes_are_left_alone(self):
+        from vigil.core import sourceaudit
+        for raw in ("\\ud800", "\\U00110000", "\\uZZZZ", "\\x4"):
+            self.assertEqual(raw, sourceaudit.decode_escapes(raw), raw)
+
+    def test_decoding_is_bounded(self):
+        from vigil.core import sourceaudit
+        text = "\\u0041" * 500
+        out = sourceaudit.decode_escapes(text, limit=10)
+        self.assertEqual(10, out.count("A"))
+        self.assertIn("\\u0041", out, "超出预算的部分原样保留")
+        self.assertLess(len(out), len(text) + 1)
+
+
 # --------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------

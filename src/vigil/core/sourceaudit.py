@@ -157,8 +157,65 @@ def _is_test(rel: str) -> bool:
     return rel.startswith("tests/") or "/tests/" in rel
 
 
+#: The three string escapes that let a forbidden literal hide from a plain
+#: grep: ``\uXXXX``, ``\UXXXXXXXX`` and ``\xXX``. They are the same in Python,
+#: JavaScript, PHP and JSON, so a rule table that only reads the raw bytes is
+#: blind in every one of them.
+#:
+#: The lookbehind is deliberate: an escape is a single backslash. ``"\\u79cb"``
+#: is the *literal text* ``\u79cb``, not the character, so it must not be
+#: decoded -- doing so would invent findings in files that legitimately quote
+#: an escape (a test fixture, this project's own documentation).
+_ESCAPE_RX = re.compile(
+    r"(?<!\\)\\u([0-9a-fA-F]{4})"
+    r"|(?<!\\)\\U([0-9a-fA-F]{8})"
+    r"|(?<!\\)\\x([0-9a-fA-F]{2})")
+
+#: Most escapes decoded per line. Decoding only ever *shortens* the text
+#: (ten characters in, one out), so this bounds CPU, not memory: without it a
+#: deliberately constructed file with hundreds of thousands of escapes would
+#: turn a publish check into a wait. Hitting the cap is not an error -- the
+#: undecoded tail is simply left as-is, and the raw pass still covers it.
+ESCAPE_DECODE_LIMIT = 20000
+
+
+def decode_escapes(text: str, limit: int = ESCAPE_DECODE_LIMIT) -> str:
+    """Decode ``\\uXXXX`` / ``\\UXXXXXXXX`` / ``\\xXX`` once.
+
+    Only those three, and only once: ``\\n``, ``\\t`` and a regex's ``\\d`` are
+    not escapes this function understands, so ordinary code is unchanged by
+    this pass. Surrogate halves (``U+D800``-``U+DFFF``) and codepoints outside
+    Unicode are left exactly as written -- half a surrogate pair has no
+    meaning, and handing one to a regex is how a guard invents a finding.
+    """
+    budget = [0]
+
+    def _one(match):
+        if budget[0] >= limit:
+            return match.group(0)
+        budget[0] += 1
+        try:
+            cp = int(match.group(1) or match.group(2) or match.group(3), 16)
+        except (TypeError, ValueError):                 # pragma: no cover
+            return match.group(0)
+        if cp > 0x10FFFF or 0xD800 <= cp <= 0xDFFF:
+            return match.group(0)
+        return chr(cp)
+
+    return _ESCAPE_RX.sub(_one, text)
+
+
 def scan(root) -> list:
-    """Findings as dicts: path, line, text, why."""
+    """Findings as dicts: path, line, text, why.
+
+    Rules run twice over the text: once as written, and once after decoding
+    string escapes. The second pass exists because a real leaked account name
+    sat in the admin page as ``"\\u79cb\\u5915..."`` -- a literal that plain
+    grep, the local forbid list and the shape rules were all blind to. It is
+    line-by-line so the reported line is the line in the file, not a position
+    in a re-encoded copy, and it is skipped entirely for files with nothing to
+    decode.
+    """
     root = Path(root)
     product_only = [(re.compile(p), why) for p, why in RULES_NOT_IN_TESTS]
     local = [(re.compile(re.escape(v)), why) for v, why in local_forbid(root)]
@@ -174,14 +231,41 @@ def scan(root) -> list:
         if not _is_test(rel):
             compiled += product_only
         compiled += local
+        seen = set()
         for rx, why in compiled:
             for m in rx.finditer(text):
+                snippet = m.group(0)[:80]
+                line = text.count("\n", 0, m.start()) + 1
+                seen.add((line, snippet, why))
                 findings.append({
-                    "path": str(path.relative_to(root)),
-                    "line": text.count("\n", 0, m.start()) + 1,
-                    "text": m.group(0)[:80],
+                    "path": rel,
+                    "line": line,
+                    "text": snippet,
                     "why": why,
                 })
+        # Second pass: the same rules, on the decoded line. Skipped unless the
+        # file actually contains one of the three escapes.
+        if not _ESCAPE_RX.search(text):
+            continue
+        for lineno, raw in enumerate(text.splitlines(), 1):
+            decoded = decode_escapes(raw)
+            if decoded == raw:
+                continue
+            for rx, why in compiled:
+                for m in rx.finditer(decoded):
+                    snippet = m.group(0)[:80]
+                    # A literal that is present raw *and* survives decoding
+                    # was already reported; do not count the same line twice.
+                    # No false negative: that line has the finding either way.
+                    if (lineno, snippet, why) in seen:
+                        continue
+                    seen.add((lineno, snippet, why))
+                    findings.append({
+                        "path": rel,
+                        "line": lineno,
+                        "text": snippet,
+                        "why": why,
+                    })
     return findings
 
 
