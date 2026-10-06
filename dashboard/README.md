@@ -63,6 +63,12 @@ sudo bash dashboard/deploy/install.sh --host status.example.com --site-name "状
 | 实时态势主页 | `https://<public_host>/` | 游客免登录 |
 | 管理控制台 | `https://<public_host>/admin.html` | 管理员登录 |
 
+**页面由 nginx 直接静态提供。** 安装脚本把 `frontend/` 下的页面与资源复制到
+`config.json` 里的 webroot，并给资源算内容哈希、改写 HTML 里的引用；只有
+`/api/` 反代到 `127.0.0.1:9310` 的那个 Python 服务。所以**改完前端只需要重新
+执行一次 `deploy/install.sh`**（幂等，会重算哈希并替换资源），不需要重启服务；
+反过来，重启服务**不会**更新静态页面。这份文档只说明它做什么，不代替你执行它。
+
 **登录账号与口令都不在源码里。** 账号来自配置 `console_account`（默认
 `vigil`，故意不叫 `admin` —— 登录页显示的是诱饵占位符，猜常见名字的人该猜错）；
 口令用 `vigil-dash set-password` 设置，服务端只保存摘要
@@ -185,8 +191,8 @@ bash dashboard/deploy/install.sh      # 重新部署（幂等）
   `none` 的话，关掉手势会连页面本身的滚动一起拖不动。同理，画布上没有
   拖拽手势了，`:active` 的 `cursor: grabbing` 也一并去掉 —— 别给不存在的
   操作做宣传。
-- 部署（`deploy/install.sh`）把静态资源交给 nginx 直接提供；改完前端只需
-  重新执行一次安装脚本（幂等），不必重启服务。本文档只说，不代替你执行。
+- **代价说清楚**：手势停用之后，地图只能靠按钮与四个取景预设改变视野，不能
+  自由拖动平移。这是刻意的收敛结果。
 
 ## 6. 安全
 

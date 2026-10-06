@@ -36,9 +36,11 @@ sudo vigil config set checks.disk.paths '["/", "/data"]'   # JSON 值
   "hostname": "",              // 留空则用系统主机名
   "mail":       { /* 见 MAIL.md */ },
   "alerts":     { /* 告警节奏与迟滞，见下文 */ },
-  "threat":     { /* 实时风控与自动封禁 */ },
+  "threat":     { /* 实时风控与自动封禁；可疑进程自动响应也在这里 */ },
+  "bouncer":    { /* nginx 侧封禁（顶层，不在 threat 下） */ },
+  "evolve":     { /* 自修正（顶层，不在 threat 下） */ },
   "loadshed":   { /* 高负载时限流 */ },
-  "checks":     { /* 安全巡检项 */ },
+  "checks":     { /* 安全巡检项：阈值、自检、可用性 */ },
   "malware":    { /* 恶意文件扫描 */ },
   "gate":       { /* 登录界面防护，见 GATE.md */ },
   "auditd":     { /* 内核审计规则 */ },
@@ -48,6 +50,16 @@ sudo vigil config set checks.disk.paths '["/", "/data"]'   # JSON 值
 
 完整字段见 `examples/config.typical.json`，或读
 `src/vigil/core/config.py` 里的 `DEFAULTS`（那是唯一权威）。
+
+### 展示出来的键必须真的有人读
+
+一个「看起来能配、实际没人读」的键，比缺一个键**更坏**：它让人以为配上了。
+v3.3.0 修掉了这类错位 —— 包括一个展示为 `netblock.digest_min_items`、实际读取
+`mail.digest_min_items` 的键，`bouncer` / `evolve` 两段的整体错位（它们属于
+**顶层**，不属于 `threat`），以及 29 处把 schema 内的键误标成「扩展键」的标注。
+
+现在有一条从真实的「键被读取」日志出发的**双向**测试：既不虚报扩展键，也不隐藏
+schema 键；另有一项扫描「整个源码从未提到过的 `DEFAULTS` 叶子键」。
 
 ## 告警节奏与迟滞
 
@@ -146,6 +158,106 @@ sudo vigil config set evolve.report_url https://你的收集端/evolve/report.ph
 `vigil evolve novel`（用整族未见过命名习惯考它）、
 `vigil evolve outcomes`（回看自己的改动有没有用）。
 完整设计见 [EVOLVE.md](EVOLVE.md)。
+
+## 可疑进程的自动响应（默认关闭）
+
+这是本程序里唯一会**动别的进程**的功能：默认关闭，打开后默认只做**可逆的**
+`SIGSTOP`，并且会自动撤销。完整设计、置信判据、永不处置清单与证据落盘见
+[AUTORESPONSE.md](AUTORESPONSE.md)。
+
+```sh
+sudo vigil config set threat.autoresponse.enabled true    # 显式决定
+sudo vigil autoresponse status           # 暂停 / 观察了哪些进程，依据是什么
+sudo vigil autoresponse resume --all     # 一键恢复（功能关闭时也能用）
+sudo vigil autoresponse log              # 处置台账：何时、依据什么、何时恢复
+```
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `threat.autoresponse.enabled` | `false` | 总开关。**默认关闭** |
+| `threat.autoresponse.action` | `stop` | `stop` = `SIGSTOP`（可逆）；`terminate` = 按 `terminate_signal` |
+| `threat.autoresponse.observe_seconds` | 120 | 判定成立后先观察这么久，期间出现豁免证据即放弃 |
+| `threat.autoresponse.resume_window_seconds` | 600 | 暂停后继续观察这么久，证据被推翻就自动恢复 |
+| `threat.autoresponse.after_observe` | `hold` | 恢复观察窗结束后：`hold` 保持暂停等操作者；`terminate` 升级为终止信号 |
+| `threat.autoresponse.terminate_signal` | `SIGTERM` | 直接终止时用的信号；`SIGKILL` 不可挽回，需显式配置 |
+| `threat.autoresponse.max_per_hour` | 2 | 每小时最多处置几个（上限 10） |
+| `threat.autoresponse.allowlist` | `[]` | 允许清单：命中的进程**永不处置** |
+| `threat.autoresponse.evidence_dir` | 空 | 留空则用 `/var/lib/vigil/state/autoresponse-evidence` |
+
+> `threat.autoresponse.allowlist` 与 `checks.process_anomaly.whitelist` 是两件事：
+> 后者只影响**报告**，前者是**硬豁免**，会写进「永不处置」清单。
+
+## 程序自身完整性：自动重建与归因
+
+`checks.self_integrity.paths` 是自检对象（安装时会填入本程序生成物，也可以自己
+加）。发现变化时先**归因**，再决定报什么、动不动手。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `checks.self_integrity.paths` | `[]` | 额外的自检路径 |
+| `checks.self_integrity.auto_recover` | `true` | 本程序**生成物**被删 / 被改时自动重新生成、复检并报告 |
+| `checks.self_integrity.heal_window_seconds` | 1800 | 同一路径的重建限频窗口 |
+| `checks.self_integrity.heal_max_attempts` | 3 | 窗口内最多重建几次，超过只报警（防「重建→又被删」的循环） |
+| `checks.self_integrity.attribution_window_seconds` | 86400 | 台账记录必须新近到这个程度，才能为一次改动背书 |
+| `checks.self_integrity.deploy_window_seconds` | 900 | `vigil update` 写 `deploy.json` 前后多久算「部署」 |
+
+- **自动重建只动本程序生成的文件。** 本程序源码**绝不**自动还原（静默回滚会掩盖
+  真实入侵），操作者的文件**绝不**触碰 —— 只报告并给出手工命令。
+- 归因判据是**哈希**：台账里的改动后哈希 == 当前哈希 → 自修正；有记录但哈希不符
+  → CRIT；无记录但落在部署窗口内 → 部署；其余 → CRIT。
+- 台账是**链式 HMAC**（密钥在 `secrets.json`，`0600`）。链断了就**所有**改动都
+  按未归因处理，并报出断点。边界见 [EVOLVE.md](EVOLVE.md)。
+
+```sh
+sudo vigil config set checks.self_integrity.auto_recover false            # 只报告，不自动重建
+sudo vigil config set checks.self_integrity.attribution_window_seconds 3600
+sudo vigil config set checks.self_integrity.heal_max_attempts 1
+```
+
+## 判定智能化：别把正常当异常
+
+三条修正，判据全部落在**结构性特征**上，而不是名字或单一比例。
+
+### 内存阈值按机器规模
+
+`checks.memory` 同时看**比例**与**绝对量**：只看比例在小内存机器上是常态误报 ——
+一台 2 GB 的机器跑一次构建就会掉到 20% 以下，而它一切正常。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `checks.memory.warn_available_pct` | 20 | 可用内存比例低于它**且**低于绝对下限才报；默认值在小机器上自动放宽（≤4 GB → 16%，≤2 GB → 12%） |
+| `checks.memory.crit_available_pct` | 10 | 严重线，同样按机器规模放宽 |
+| `checks.memory.warn_available_mb` | 0 | 绝对下限（MB）。**0 = 按总内存缩放**：取约 8%，同时不小于「总内存 5%、下限 256 MB、上限 3277 MB」那一档 |
+| `checks.memory.crit_available_mb` | 0 | 同上，取约 3%，同档的一半 |
+
+**操作者显式写下的值绝不被改写**：只要 `warn_available_mb` / `crit_available_mb`
+是正数，它就完全替代自动缩放出来的下限，连那条「总量上限」也不再参与 —— 你已经
+告诉我们你的工作负载需要多少，再去猜一遍只会让这个键变得没用。
+
+### 高占用按类别判断
+
+`checks.process_anomaly.cpu_warn`（默认 80）本身**不是**可疑特征：编译、测试、扫描
+必然如此。降级依据是结构性的（属于某个 systemd 单元 / 可执行文件由包管理器提供
+**且**不是在跑内联代码 / 持有控制终端或父进程是交互式 shell / 命令行指向已登记的
+工作目录）。**光凭进程名叫 `node`、`python3` 不降级** —— `node -e <payload>` 正是
+要继续报的形状。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `checks.process_anomaly.whitelist` | `[]` | 额外豁免的进程模式。只影响**报告**，不是永不处置清单 |
+| `checks.process_anomaly.build_dirs` | `[]` | 构建 / 测试目录；命令行指向这里的进程自动降级。空表示只用站点根目录与结构判据 |
+
+### 可用性检查理解认证闸门
+
+站点装了登录闸门时，`401` / `403` / `302 → 验证页`都是**设计行为**，不再报故障。
+但闸门站点**连验证页都打不开**（5xx / 超时）照常报 CRIT —— 一个发不出自己验证页的
+闸门，比一个坏站点更值得慌。没配域名时这个检查直接跳过（会依次回退到
+`gate.*.domain`）：
+
+```sh
+sudo vigil config set checks.site_availability.domain status.example.com
+sudo vigil config set checks.site_availability.port 443
+```
 
 ## 配置校验
 
