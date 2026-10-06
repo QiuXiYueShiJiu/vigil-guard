@@ -35,6 +35,7 @@ sudo vigil config set checks.disk.paths '["/", "/data"]'   # JSON 值
 {
   "hostname": "",              // 留空则用系统主机名
   "mail":       { /* 见 MAIL.md */ },
+  "alerts":     { /* 告警节奏与迟滞，见下文 */ },
   "threat":     { /* 实时风控与自动封禁 */ },
   "loadshed":   { /* 高负载时限流 */ },
   "checks":     { /* 安全巡检项 */ },
@@ -47,6 +48,36 @@ sudo vigil config set checks.disk.paths '["/", "/data"]'   # JSON 值
 
 完整字段见 `examples/config.typical.json`，或读
 `src/vigil/core/config.py` 里的 `DEFAULTS`（那是唯一权威）。
+
+## 告警节奏与迟滞
+
+告警的默认目标是**少而准**：普通事件攒批发，严重事件立刻发，没发生变化的持续
+异常按间隔提醒，而不是每轮巡检都重发一封一模一样的信。
+
+| 键 | 默认 | 含义 |
+|---|---|---|
+| `mail.digest_min_items` | 5 | 普通事件攒够这么多条就发一次 |
+| `mail.digest_max_wait` | 1800 | 条数不够时，最老一条最多等这么多秒 |
+| `alerts.renotify_seconds` | 21600（6 小时） | 同一个**未变化**的异常最多这么久重复提醒一次 |
+| `alerts.recovery_quiet_seconds` | 600 | 恢复后这么久内再次变坏不重复告警 |
+
+- **严重事件（`SEV_CRIT`）与带 `immediate` 的事件不受攒批约束**，立即发出；
+  被压住的普通事件**不会丢**：条数够、时间到、或强制刷新（退出 / 积压补发）
+  都会发出。
+- `renotify_seconds` 只压「完全没变」的重复信：**新增异常项、严重度上升、异常
+  内容变化会立即发**。比对时会把 detail 里的数字（CPU%、PID 这类每轮都变的
+  部分）折叠掉，否则指纹每轮都不同，比原来还勤。
+- 迟滞期间异常**仍然**写进 `vigil health` 与 history，退出码仍为 1 ——
+  **迟滞不会让真实问题消失**，窗口一过异常仍在就照常告警。
+- 旧字段 `cooldown[id]` 的语义已被纠正：它原本表达的是「多久重复一次」而不是
+  「多久内不重复」，于是超时即重发。现在由 `alerts.renotify_seconds` 取代。
+
+```sh
+sudo vigil config set mail.digest_min_items 10          # 攒更多条再发
+sudo vigil config set mail.digest_max_wait 3600         # 最多等 1 小时
+sudo vigil config set alerts.renotify_seconds 3600      # 未变化的异常每小时最多重提一次
+sudo vigil config set alerts.recovery_quiet_seconds 0   # 0 表示关闭抖动迟滞
+```
 
 ## 白名单：最容易把自己锁在外面的一项
 

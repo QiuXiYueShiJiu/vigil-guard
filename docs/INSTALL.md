@@ -37,8 +37,15 @@ cp dashboard/config.example.json dashboard/config.json   # 填 public_host 与�
 sudo bash dashboard/deploy/install.sh
 ```
 
-`public_host` 还是模板里的占位值时脚本会拒绝安装；域名、webroot、显示名与
-地图坐标全部来自 `dashboard/config.json`，源码里没有真实值。
+**部署前必须把 `dashboard/config.json` 填好**：
+
+- `public_host` 还是模板里的占位值时，脚本**直接拒绝安装**，不会把一个连不上的
+  站点发出去；域名、webroot、显示名与地图坐标全部来自这个文件，源码里没有真实值。
+- 控制台账号来自 `console_account`（默认 `vigil`），**口令要用
+  `vigil-dash set-password` 单独设置** —— 没设口令就谁都进不去控制台。
+
+页面本身由 **nginx 直接静态提供**，只有 `/api/` 反代到 `127.0.0.1:9310` 的
+Python 服务 —— 静态资源、gzip 与 TLS 都在 nginx 上，进程只回答接口。
 
 它动的东西：
 
@@ -65,23 +72,6 @@ sudo vigil update
 `vigil update` 从当前源码目录重新部署，并重启常驻守护进程。配置、状态、
 已签发的会话都不受影响。
 
-## 卸载
-
-```sh
-sudo vigil uninstall              # 停服务、删代码，保留配置与状态
-sudo vigil uninstall --purge      # 连配置、状态、日志一起删（不可恢复）
-sudo vigil uninstall --dry-run    # 只打印将要做什么
-```
-
-卸载**不会**自动撤销已经写进系统的防护（iptables 规则、auditd 规则、nginx 接线）。
-那些是显式安装的，也要显式撤销：
-
-```sh
-sudo vigil gate uninstall bt_panel
-sudo vigil threat disable
-sudo vigil audit disable
-```
-
 ## 这台机器上它动了什么
 
 | 路径 | 内容 |
@@ -103,6 +93,7 @@ sudo vigil audit disable
 sudo vigil uninstall                # 停服务、删程序；保留配置、状态与日志
 sudo vigil uninstall --keep-logs    # 再加删配置与状态，只留 /var/log/vigil
 sudo vigil uninstall --purge        # 全部删除，不可恢复
+sudo vigil uninstall --dry-run      # 只打印将要做什么
 ```
 
 **三种方式都会撤回本程序生成的网页配置**（诱饵、诱导面、请求卫生、登录网关、
@@ -111,3 +102,29 @@ sudo vigil uninstall --purge        # 全部删除，不可恢复
 撤回是**可逆**的：脚本先把文件移到隔离区并摘掉相关的 `include` 行，跑 `nginx -t`，
 通过才真正删除；**不通过就把文件和 include 行一起搬回**。这样即使撤回逻辑本身出错，
 站点也不会因为一次卸载而无法重载。
+
+### 不会覆盖，也不会删除别人的 vhost
+
+`vigil web install --domain <域名>` 的目标文件若已存在、又不带本程序生成的标记
+（首行 `# >>> vigil web (generated; do not edit) >>>` 与结尾 `# <<< vigil web <<<`），
+它会**拒绝写入**，报出该文件路径，并提示用什么方式才覆盖：
+
+```sh
+sudo vigil web install --domain status.example.com          # 别人的 vhost → 拒绝并给出路径
+sudo vigil web install --domain status.example.com --force  # 明确接受覆盖
+```
+
+反过来，`vigil web uninstall` **绝不删除**不是本程序生成的配置：文件名
+`<域名>.conf` 是面板也会用的命名，所以只认标记、不认文件名 —— 不是自己写的就
+跳过并列出，由你自行确认后手动处理。
+
+### 已经写进系统的防护要显式撤销
+
+卸载**不会**自动撤销已经写进系统的防护（iptables 规则、auditd 规则、nginx 接线）。
+那些是显式安装的，也要显式撤销：
+
+```sh
+sudo vigil gate uninstall bt_panel
+sudo vigil threat disable
+sudo vigil audit disable
+```

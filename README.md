@@ -7,7 +7,7 @@
 检测、封禁、告警、诱饵、自修正 —— 一个不依赖第三方库、可以在锁死网络的机器上跑起来的守护程序。
 
 [![CI](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/QiuXiYueShiJiu/vigil-guard/actions/workflows/ci.yml)
-[![Version](https://img.shields.io/badge/version-3.2.0-6fa8d6.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-3.2.3-6fa8d6.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-6fa8d6.svg)](LICENSE)
 
 <img src="assets/arch.svg" alt="架构与数据流" width="820">
@@ -76,6 +76,7 @@ vigil 快速设置 / 一次问答，把管理页面配好
 | **诱饵与诱导面** | 让扫描器自己撞上诱饵端点，并衡量诱导面是否真的被找到 | `vigil decoy` · `vigil lure` |
 | **状态与反馈页** | 实时状态 + 反馈入口；只监听本机、由已有 Web 服务反代 | `vigil web` |
 | **内置管理后台** | 实时态势地图 + 管理控制台（站点开关、文件管理、审计）；自配置、随包发布 | `dashboard/deploy/install.sh` |
+| **告警节奏** | 普通事件攒批、严重事件立即发；未变化的持续异常隔一阵才重提，恢复抖动不刷信 | `vigil mail` · `vigil health` |
 | **自修正** | 自监督训练 + 泛化验证 + 闭环回看；有边界、可回滚、改前发邮件 | `vigil evolve` |
 | **请求卫生 / 完整性 / 审计** | 请求行限制、程序自身完整性基线、内核级改动归因 | `vigil hygiene` · `vigil audit` |
 | **快速设置** | 一次问答配好管理页面、反代、凭据与测试邮件 | `vigil setup` |
@@ -96,8 +97,10 @@ sudo bash dashboard/deploy/install.sh                    # 幂等：代码+静�
 ```
 
 **它是自配置的**：域名、webroot、显示名、地图坐标、控制台登录账号、后台入口
-列表全部来自 `dashboard/config.json`，源码里一个真实域名都没有。`public_host`
-还是占位值时安装脚本会**直接拒绝安装**，不会把一个连不上的站点发出去。细节见
+列表全部来自 `dashboard/config.json`，源码里一个真实域名都没有。**部署前必须
+填它**：`public_host` 还是占位值时安装脚本会**直接拒绝安装**，不会把一个连不上
+的站点发出去；控制台账号来自 `console_account`（默认 `vigil`），口令要用
+`vigil-dash set-password` 单独设置 —— **没设口令就谁都进不去控制台**。细节见
 [`dashboard/README.md`](dashboard/README.md)。
 
 ### 和 `vigil web` 的分工
@@ -108,11 +111,46 @@ sudo bash dashboard/deploy/install.sh                    # 幂等：代码+静�
 | 进程 | vigil 自己起 `vigil-web.service`（默认 9177） | 独立进程 `vigil-dashboard.service`（默认 9310） |
 | 部署 | `sudo vigil setup` / `vigil web install --domain ...` | `dashboard/deploy/install.sh`（读 `config.json`） |
 | 依赖 | 无，只用标准库 | 无，只用标准库；GeoIP 复用面板自带 mmdb |
+| 页面 | 由 `vigil-web.service` 渲染 | **nginx 直接静态提供页面**，只有 `/api/` 反代到 `127.0.0.1:9310` |
 | 对外 | 都由本机已有 Web 服务反代 | 同上 |
 | 关系 | 二者**互不依赖、互不覆盖**：端口、systemd 单元、vhost 各自独立 | 可以只装其中一个 |
 
 只想知道「机器还好吗」，装 `vigil web` 就够；要一个能看、能管的后台，
 再装 `dashboard/`。两个页面也可以同时开着，它们的配置与凭据彼此独立。
+
+## 告警：少而准
+
+告警通道最怕的不是漏发，是**发得太多以至于没人再看**。所以普通事件攒批发，
+严重事件立即发，持续异常不每轮巡检都重发：
+
+| 情形 | 行为 |
+|---|---|
+| 严重事件（爆破成功、熔断、白名单命中、网段封禁、程序自身完整性…） | **立即发送** |
+| 带 `immediate` 标志的事件 | **立即发送** |
+| 普通事件（一般封禁、SSH、登录、异常恢复） | 攒够 `mail.digest_min_items`（默认 5）条发一次；不足则等 `mail.digest_max_wait`（默认 1800 秒） |
+| 未变化的持续异常 | 最多每 `alerts.renotify_seconds`（默认 6 小时）提醒一次；**新增项、严重度上升、内容变化立即发** |
+| 恢复后短时间再次变坏 | `alerts.recovery_quiet_seconds`（默认 600 秒）内不重复告警，恢复通知也推迟到状态稳定才发 |
+
+被压住的事件**不会丢**：条数够、时间到、或强制刷新（退出 / 积压补发）都会发出。
+静默期内的异常**仍然**记录进 `vigil health` 与 history，退出码仍为 1 ——
+**迟滞不会让真实问题消失**，只是不再用同一封信反复填满收件箱。细节见
+[MAIL.md](docs/MAIL.md) 与 [CONFIGURATION.md](docs/CONFIGURATION.md)。
+
+## 拒绝比写错好
+
+三处保护都是同一个判断：**拿不准的时候，宁可不做，也不留下半套配置。**
+
+- **不覆盖别人的 vhost。** `vigil web install --domain ...` 的目标文件若已存在、
+  又不带本程序生成的标记，它会**拒绝写入**、报出该文件路径，并提示用 `--force`
+  才覆盖；`vigil web uninstall` 同样**绝不删除**不是本程序生成的配置 ——
+  文件名 `<域名>.conf` 是面板也会用的命名，所以只认标记，不认文件名。
+- **不换共享内存限流 zone 的 key。** `limit_req_zone` 同名换 key 时 `nginx -t`
+  反而通过，但此后**每一次 reload 都会失败，只有完整重启能恢复**（而完整重启会
+  断掉所有连接）。写入前检测到同名换 key 就拒绝写入；遇到 nginx 的该 `[emerg]`
+  则译成「仅靠 reload 无法生效，需要完整重启 nginx」，并报出 zone 与前后 key。
+- **审计先解码再匹配。** `core/sourceaudit.py` 在比对规则前先把 `\uXXXX` /
+  `\UXXXXXXXX` / `\xXX` 解码一次：曾有真实标识以转义形式同时躲过人工 grep、
+  本地禁止清单和所有形状规则 —— 三者都在比对原始字节。
 
 ## 自修正：它凭什么被允许改自己
 
@@ -172,7 +210,8 @@ systemd 侧另有硬上限：`CPUQuota=5%`、`Nice=19`、`IOWeight=10`、`Memory
 
 **源码与随包文件里不含任何一台机器的信息。** 这一条由 `core/sourceaudit.py`
 在发布关卡里强制检查：公网 IP、域名（含 punycode）、个人邮箱、托管商名、
-本机绝对路径，出现即构建失败。
+本机绝对路径，出现即构建失败。比对前它还会先解开 `\uXXXX` / `\UXXXXXXXX` /
+`\xXX` 转义 —— 曾有真实标识以转义形式躲过人工 grep 与全部规则（见上一节）。
 
 - 主机名、域名、端口、上游地址**全部运行时获取**；
 - 上报通道发送前脱敏，服务端再校验一次；
