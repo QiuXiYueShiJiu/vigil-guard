@@ -304,7 +304,7 @@ class TestSourceAuditDecodesEscapes(unittest.TestCase):
     """A forbidden literal hidden behind ``\\uXXXX`` is still forbidden.
 
     A real operator account name sat in the admin page as
-    ``"\\u79cb\\u5915..."``. Grep, the local forbid list and every shape rule
+    ``"\\u0061\\u0064\\u006d\\u0069\\u006e..."``. Grep, the local forbid list and every shape rule
     were blind to it, because all three compared the raw bytes. The escape
     forms below are the ones Python, JavaScript, PHP and JSON share.
 
