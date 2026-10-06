@@ -436,6 +436,15 @@ class Settings:
         self.event_flush_interval = _int(
             self._r("threat.event_flush_interval", 60, in_schema=False), 60,
             minimum=1)
+        # 普通事件的合并门槛：攒够 digest_min_items 条、或最老的一条等了
+        # digest_max_wait 秒，才发出去。这一条是为了不把收件箱搞炸 —— 实测一天
+        # 190 封里绝大多数是逐条发出的普通事件（封禁、登录、异常恢复），而真正
+        # 需要立刻知道的（爆破成功、熔断、白名单命中、网段封禁）本来就带
+        # immediate，不受这里约束。
+        self.digest_min_items = _int(
+            self._r("mail.digest_min_items", 5, in_schema=False), 5, minimum=1)
+        self.digest_max_wait = _int(
+            self._r("mail.digest_max_wait", 1800, in_schema=False), 1800, minimum=0)
         self.event_queue_max = _int(
             self._r("threat.event_queue_max", 1000, in_schema=False), 1000,
             minimum=10)
@@ -1945,11 +1954,24 @@ class EventReporter:
         now = time.time()
         # Respect the provider rate limit for ordinary batches, but never delay
         # a critical alert (the original's inline flush had the same intent).
-        if not force and severity != SEV_CRIT and \
-                now - self._last_send < self._min_interval:
-            with self._lock:
-                self._q.extendleft(reversed(items))
-            return False
+        immediate = any(e.get("immediate") for e in items)
+        if not force and severity != SEV_CRIT and not immediate:
+            if now - self._last_send < self._min_interval:
+                with self._lock:
+                    self._q.extendleft(reversed(items))
+                return False
+            # 攒批：条数不够、且最老的一条还没等够，就先压着。
+            #
+            # 重要事件（CRIT / immediate）在上面就已经放行，所以「严重异常需立即
+            # 处理」这类告警不会被这里延迟。被压住的只有普通事件 —— 实测一天
+            # 190 封邮件里，绝大部分是逐条发出的封禁/登录/异常恢复，而它们的
+            # 价值在**成批看**时才体现，逐条发只会让人把告警当噪声。
+            oldest = min(float(e.get("ts") or now) for e in items)
+            if len(items) < self.d.settings.digest_min_items and \
+                    now - oldest < self.d.settings.digest_max_wait:
+                with self._lock:
+                    self._q.extendleft(reversed(items))
+                return False
         alert = self.build_alert(items)
         self.d.log.warn(_t("event_flush", alert.title, len(items)))
         self._last_send = now

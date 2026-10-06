@@ -585,6 +585,17 @@ def _register_and_restart(cfg) -> tuple:
     """
     from ..core import shell
 
+    # `cfg` 可能是 None（调用方没传）—— 那就去读真实配置，而不是让
+    # `None.get()` 抛 AttributeError 被下面那个 except 收成一个含糊的
+    # "登记监控来源失败"。实测日志里正是这个报错：
+    #   [learn] 写入新候选失败：登记监控来源失败：'NoneType' object has no attribute 'get'
+    # 一个「看起来是配置问题、其实是没传参数」的报错，比不报错更费时间。
+    if cfg is None:
+        try:
+            from ..core.config import load as _load_cfg
+            cfg = _load_cfg()
+        except Exception as e:                                     # noqa: BLE001
+            return False, "登记监控来源失败：读不到配置（%s）" % e
     try:
         path = str(log_path())
         listed = [p for p in (cfg.get("threat.log_sources.decoy", []) or [])]

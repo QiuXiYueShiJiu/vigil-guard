@@ -5902,6 +5902,68 @@ class TestOneSignalIsOneSignal(unittest.TestCase):
         self.assertEqual(1200, d.settings.http_flood_threshold)
 
 
+class TestMailIsBatchedNotStreamed(unittest.TestCase):
+    """Ordinary events accumulate; important ones go straight out.
+
+    Measured on a real host: 190 emails in under two days, most of them single
+    routine events (a ban, a login, an alert/recovery pair) sent one at a time.
+    An inbox that fills with those stops being read -- which defeats the point
+    of alerting at all.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path as _P
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = _P(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        self.sent = []
+        self.d.deliver = lambda a: (self.sent.append(a.title), True)[1]
+        self.d.reporter._last_send = 0
+
+    def _routine(self, n=1, age=0.0):
+        for i in range(n):
+            self.d.reporter.queue({"kind": "BAN", "ip": "203.0.113.%d" % (i + 1),
+                                   "ts": time.time() - age})
+
+    def test_a_single_ordinary_event_is_held_back(self):
+        self._routine(1)
+        self.assertFalse(self.d.reporter.flush())
+        self.assertEqual(0, len(self.sent))
+        self.assertEqual(1, self.d.reporter.pending())
+
+    def test_enough_ordinary_events_make_one_email(self):
+        self._routine(self.d.settings.digest_min_items)
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent), "攒够条数应只发一封")
+
+    def test_an_important_event_is_sent_immediately(self):
+        """`immediate` must not be delayed by the batching rule."""
+        self.d.reporter.queue({"kind": "BREACH", "immediate": True,
+                               "ip": "203.0.113.9", "ts": time.time()})
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent))
+
+    def test_a_held_event_is_eventually_sent(self):
+        """Nothing may sit in the queue forever."""
+        wait = self.d.settings.digest_max_wait
+        self._routine(1, age=wait + 60)
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent))
+
+    def test_a_critical_severity_batch_bypasses_the_threshold(self):
+        self.d.reporter.queue({"kind": "BREACH", "ip": "203.0.113.9",
+                               "ts": time.time()})
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent))
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 

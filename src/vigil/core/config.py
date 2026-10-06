@@ -295,6 +295,10 @@ DEFAULTS: dict = {
         "min_flush_interval": 30,
         "event_flush_interval": 60,
         "event_queue_max": 1000,
+        # 普通事件攒够这么多条就发一次；不足则等到 digest_max_wait 秒再说。
+        # 重要事件（SEV_CRIT 或带 immediate 的）不受这两个值约束，立即发出。
+        "digest_min_items": 5,
+        "digest_max_wait": 1800,
         "strict_flag_ttl": 5,
         "strict_factor": 0.5,
         "max_tracked_ips": 20000,
