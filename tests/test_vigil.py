@@ -6573,6 +6573,66 @@ class TestMailIsBatchedNotStreamed(unittest.TestCase):
         self.assertEqual(1, len(self.sent))
 
 
+class TestDocumentationDoesNotPromiseWhatIsNotThere(unittest.TestCase):
+    """Every config key the docs list must exist in the shipped example.
+
+    The docs said "see `examples/config.typical.json` for the full field list"
+    while that file contained **none** of the keys added in the previous two
+    releases. A pointer that leads nowhere is worse than no pointer: it reads
+    as coverage. This is the same defect class as a config key that is shown
+    but never read -- the project keeps finding that shape, so it gets a test.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    #: A dotted config path as it appears inside backticks in the docs.
+    KEY_RX = re.compile(r"`([a-z][a-z0-9_]*(?:\.[a-z0-9_]+)+)`")
+
+    def _listed_keys(self) -> set:
+        text = (self.ROOT / "docs" / "CONFIGURATION.md").read_text(encoding="utf-8")
+        keys = set()
+        for m in self.KEY_RX.finditer(text):
+            key = m.group(1)
+            # Only keys that really are config paths: the first segment must be
+            # a top-level section of DEFAULTS.
+            if key.split(".")[0] in vconfig.DEFAULTS:
+                keys.add(key)
+        return keys
+
+    def _present(self, blob, dotted: str) -> bool:
+        """Walk a dotted path through the example, tolerating list elements."""
+        node = blob
+        for part in dotted.split("."):
+            if isinstance(node, list):
+                return any(self._present(x, part) if isinstance(x, (dict, list))
+                           else False for x in node)
+            if not isinstance(node, dict) or part not in node:
+                return False
+            node = node[part]
+        return True
+
+    def test_the_documented_keys_are_all_in_the_example(self):
+        blob = json.loads((self.ROOT / "examples" / "config.typical.json")
+                          .read_text(encoding="utf-8"))
+        listed = self._listed_keys()
+        self.assertGreater(len(listed), 20,
+                           "只解析出 %d 个配置键，解析逻辑可能失效" % len(listed))
+        missing = sorted(k for k in listed if not self._present(blob, k))
+        self.assertEqual([], missing,
+                         "文档列出了但示例里没有的配置键：%s" % missing)
+
+    def test_the_example_is_parseable_and_the_example_is_not_authoritative(self):
+        raw = (self.ROOT / "examples" / "config.typical.json").read_text(encoding="utf-8")
+        blob = json.loads(raw)
+        self.assertIsInstance(blob, dict)
+        # The dangerous default must never be shipped as an example to copy.
+        self.assertFalse(
+            blob.get("threat", {}).get("autoresponse", {}).get("enabled", False),
+            "示例配置把自动响应打开了 —— 示例是给人抄的，不能给更危险的默认")
+        # A secret must not sit in the example.
+        self.assertNotIn("ledger_mac_key", raw)
+
+
 class TestSecurityEnhancements(unittest.TestCase):
     """The v2.3 hardening rules, pinned so they cannot be dropped quietly."""
 
