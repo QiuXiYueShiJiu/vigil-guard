@@ -378,6 +378,32 @@ def _automation_frame(frame) -> bool:
     return any(c and _AUTOMATION_RUNTIME_RX.match(c) for c in (comm, first))
 
 
+def automation_driver(pid, depth: int = 6) -> dict:
+    """The nearest trusted automation runtime at or above *pid*, else ``{}``.
+
+    The driver of a browser is not always its direct parent. Playwright,
+    Puppeteer and Selenium launch through wrappers -- a runner script, or
+    ``bash -c`` around the interpreter -- so a legitimate tree can look like
+    ``chrome <- bash <- node``. A direct-parent test re-flags exactly that
+    tree, which is a false positive on every automation run. The walk
+    therefore consults **every** layer, nearest first, and stops at *depth*.
+
+    Shells, perl and php are deliberately **not** in the trusted set: a shell
+    in the middle only means the walk continues past it. It never makes the
+    bundle trusted on its own, because ``bash -c <payload>`` is one of the
+    most common ways to start something that should be flagged.
+
+    *depth* is 6 frames counting the process itself -- the process plus up to
+    five ancestors. That is the limit this check has always used: deep enough
+    for the wrapper chains automation actually produces, bounded so a busy
+    host cannot turn the check into an unbounded walk of ``/proc``.
+    """
+    for frame in process_chain(pid, depth):
+        if _automation_frame(frame):
+            return frame
+    return {}
+
+
 def browser_automation(pid, exe: str, depth: int = 6) -> str:
     """Describe *exe* as a browser-automation bundle, or ``""`` if it is not.
 
@@ -392,13 +418,14 @@ def browser_automation(pid, exe: str, depth: int = 6) -> str:
       * some parent directory of it names a browser distribution layout
         (``chromium-<version>``, ``chrome-linux64``, ``browsers``, ...),
         **and**
-      * an ancestor process is a known automation runtime (node, python,
-        playwright, a webdriver, ...).
+      * a trusted automation runtime is anywhere in the ancestor chain up to
+        ``depth`` -- not only the direct parent, because automation normally
+        launches through a wrapper (see :func:`automation_driver`).
 
     All three, not any one: an arbitrary ELF dropped in ``/tmp`` still warns,
     a browser binary outside a release layout still warns, and a real browser
-    bundle launched by a shell still warns. Only the shape that automation
-    actually produces is downgraded.
+    bundle launched by a shell with no runtime above it still warns. Only the
+    shape that automation actually produces is downgraded.
     """
     name = os.path.basename(str(exe).rstrip("/"))
     if name.lower() not in _BROWSER_BINARIES:
@@ -406,10 +433,10 @@ def browser_automation(pid, exe: str, depth: int = 6) -> str:
     parts = [p for p in str(exe).split("/") if p]
     if not any(_BROWSER_LAYOUT_RX.match(p) for p in parts[:-1]):
         return ""
-    for frame in process_chain(pid, depth):
-        if _automation_frame(frame):
-            return ("疑似自动化工具链：%s 浏览器发行包，由 %s(pid %s) 驱动"
-                    % (name, frame.get("comm") or "?", frame.get("pid")))
+    driver = automation_driver(pid, depth)
+    if driver:
+        return ("疑似自动化工具链：%s 浏览器发行包，由 %s(pid %s) 驱动"
+                % (name, driver.get("comm") or "?", driver.get("pid")))
     return ""
 
 

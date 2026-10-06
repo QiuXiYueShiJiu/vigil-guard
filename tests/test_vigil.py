@@ -1162,6 +1162,38 @@ class TestGateInstances(unittest.TestCase):
         self.assertIn(a.zone("req"), zones_a)
         self.assertNotIn(b.zone("req"), zones_a)
 
+    def test_the_gate_zone_file_refuses_a_key_change(self):
+        """The gate zones obey the same reload rule as the web shield.
+
+        Gate zones are always keyed on the client address today, but the rule
+        is enforced generically: if an older write keyed a zone on something
+        else, the next install must refuse rather than leave a file that
+        `nginx -t` accepts and every reload rejects.
+        """
+        from vigil.gates import installer
+        spec = gspec.GateSpec.for_kind(KIND_LOGIN, cfg=None, env=self.env,
+                                       name="gamma")
+        spec.state_dir = str(self.base / "server" / "gamma-gate")
+        spec.webroot = str(self.base / "www" / "gamma-gate")
+        spec.upstream = "http://127.0.0.1:6185"
+        spec.listen_port = 4402
+        spec.require_password = False
+        spec.fastcgi_pass = "unix:%s" % (self.base / "php.sock")
+        zones = self.base / "vigil-gate-gamma-zones.conf"
+        spec.zones_file = str(zones)
+        zones.write_text(installer.render_zones(spec).replace(
+            "$binary_remote_addr", "$some_key"), encoding="utf-8")
+        before = zones.read_text(encoding="utf-8")
+
+        res = installer.install(spec, env=self.env, log=None)
+
+        self.assertFalse(res.get("ok"))
+        self.assertIn("完整重启", res.get("error", ""))
+        self.assertEqual(before, zones.read_text(encoding="utf-8"),
+                         "拒绝时不得改动限流区文件")
+        self.assertFalse(Path(spec.state_dir).exists(),
+                         "拒绝时必须发生在写入任何网关文件之前")
+
     def test_a_port_collision_is_reported_not_forced(self):
         """A second gate must never take over another gate's port.
 
@@ -3885,9 +3917,18 @@ class TestBouncer(unittest.TestCase):
         self.b.active_bans = lambda: self._bans()
         self.b.nginx_test = lambda: (True, "ok")
         self.b.nginx_reload = lambda: None
+        # `sync` now verifies the reload through the shield helper, which
+        # probes the real error log and worker set. Point both at nothing so a
+        # unit test neither reads nor depends on the host's nginx.
+        from vigil.gates import shield as sh
+        self._saved_shield = (sh._error_log_path, sh._worker_pids)
+        sh._error_log_path = lambda: ""
+        sh._worker_pids = lambda: set()
         return target
 
     def _restore(self):
+        from vigil.gates import shield as sh
+        (sh._error_log_path, sh._worker_pids) = self._saved_shield
         (self.b.all_targets, self.b.server_scope_paths,
          self.b.http_scope_path, self.b.active_bans) = self._saved
 
@@ -3953,6 +3994,44 @@ class TestBouncer(unittest.TestCase):
             self.b.nginx_test = self._saved[-1]
             self._saved = self._saved[:-1]
             self._restore()
+
+    def test_a_reload_that_needs_a_restart_says_so_and_rolls_back(self):
+        """`nginx -t` can pass while every reload fails.
+
+        The deny list carries no zones, but a reload loads the whole config,
+        so a zone key change written earlier makes *this* reload fail too.
+        The operator must get "only a full restart can pick this up", not a
+        generic parse error -- and the list must go back to what is live.
+        """
+        target = self._isolate()
+        target.write_text("# 旧内容\ndeny 203.0.113.1;\n", encoding="utf-8")
+        self.cfg.set("bouncer.enabled", True)
+        from vigil.gates import shield as sh
+        handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        handle.write("nothing yet\n")
+        handle.close()
+        path = handle.name
+        sh._error_log_path = lambda: path
+        sh._worker_pids = lambda: {"1", "2"}
+
+        def reload_and_log():
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write('[emerg] limit_req "example_zone" uses the '
+                         '"$some_key" key while previously it used the '
+                         '"$binary_remote_addr" key\n')
+
+        self.b.nginx_reload = reload_and_log
+        try:
+            result = self.b.sync(self.cfg)
+        finally:
+            os.unlink(path)
+            self._restore()
+        self.assertFalse(result["ok"])
+        problems = " ".join(result["problems"])
+        self.assertIn("完整重启", problems, "必须给出「只有完整重启能生效」的结论")
+        self.assertIn("example_zone", problems)
+        self.assertIn("回滚", problems)
+        self.assertIn("旧内容", target.read_text(encoding="utf-8"))
 
 
 class TestLearning(unittest.TestCase):
@@ -6009,8 +6088,14 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
         return [{"pid": p, "comm": c, "cmdline": m} for p, c, m in frames]
 
     def _with_chain(self, exe, *frames):
+        """Run the check against a fake /proc chain.
+
+        The fake is truncated to `depth` exactly like ``process_chain`` is,
+        so the depth limit is exercised rather than bypassed.
+        """
         real = self.util.process_chain
-        self.util.process_chain = lambda pid, depth=6: self._chain(*frames)
+        chain = self._chain(*frames)
+        self.util.process_chain = lambda pid, depth=6: chain[:depth]
         try:
             return self.util.browser_automation(frames[0][0], exe)
         finally:
@@ -6057,6 +6142,87 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
         got = self._with_chain(exe, (10, "chrome", exe),
                                (9, "systemd", "/sbin/init"))
         self.assertEqual("", got)
+
+    # -- the ancestor-chain judgement -------------------------------------
+    #
+    # A direct-parent test re-flags `chrome <- bash <- node`, which is a real
+    # automation launch shape: the runtime is one wrapper above the browser.
+    # These four pin the chain rule and the shapes it must not weaken.
+
+    def test_a_wrapper_shell_between_browser_and_runtime_is_exempt(self):
+        """chrome <- bash <- node: the runtime is a grandparent, not the parent."""
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        got = self._with_chain(exe,
+                               (10, "chrome", exe),
+                               (9, "bash", "bash -c " + exe),
+                               (8, "node-MainThread", "node /srv/app/run.js"))
+        self.assertTrue(got, "隔一层 shell 的自动化链必须仍然豁免")
+        self.assertIn("自动化工具链", got)
+        self.assertIn("node", got, "报文要点明是哪一层运行时")
+
+    def test_a_wrapper_shell_does_not_itself_become_a_runtime(self):
+        """`chrome <- bash` with no runtime above it is the shape that warns.
+
+        The point of walking the chain is to keep looking, not to trust the
+        shell: `bash -c <payload>` is how a lot of malicious bundles start.
+        """
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        got = self._with_chain(exe,
+                               (10, "chrome", exe),
+                               (9, "bash", "bash -c " + exe),
+                               (8, "sh", "sh -c " + exe))
+        self.assertEqual("", got, "shell 本身不得被当作受信运行时")
+
+    def test_a_deleted_binary_is_never_exempt_through_the_chain(self):
+        """The chain rule must not resurrect the deleted-binary exemption.
+
+        `suspect_procs_detail` only asks about automation on the temp-dir
+        branch; this pins the same invariant from the other side -- a deleted
+        binary is reported as `deleted` and never carries an automation tag,
+        even when the chain looks like a bundle.
+        """
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        hits = [{"pid": 10, "comm": "chrome", "exe": exe,
+                 "kind": "deleted", "automation": ""}]
+        real = self.util.suspect_procs_detail
+        self.util.suspect_procs_detail = lambda *a, **k: hits
+        try:
+            from vigil.guards.checks import base, security
+            res = security.SuspiciousProcesses().safe_run(base.CheckContext(
+                cfg=None, state={}, env={}, log=_QuietLog(), now=time.time()))
+        finally:
+            self.util.suspect_procs_detail = real
+        self.assertEqual("WARN", res.status)
+        self.assertIn("已被删除", res.detail)
+
+    def test_the_runtime_must_be_within_the_depth_limit(self):
+        """Depth is 6 frames: the process plus up to five ancestors.
+
+        Deeper than that is not walked -- deliberately. The chains automation
+        produces are two or three layers; an unbounded walk would turn a busy
+        host's /proc into a cost, and every extra layer is one more process an
+        attacker could arrange to sit above a payload it launches.
+        """
+        exe = self._bundle("browsers", "chromium-1234",
+                           "chrome-linux64", "chrome")
+        # Frames: 0 chrome, 1..4 wrappers, 5 = the fifth ancestor (node).
+        at_limit = [(10, "chrome", exe)]
+        for i in range(4):
+            at_limit.append((9 - i, "bash", "bash -c wrapper%d" % i))
+        at_limit.append((5, "node", "node /srv/app/run.js"))
+        self.assertTrue(self._with_chain(exe, *at_limit),
+                        "上限之内的运行时必须能被找到")
+
+        # One layer deeper: node is now the sixth ancestor and is not seen.
+        beyond = [(10, "chrome", exe)]
+        for i in range(5):
+            beyond.append((9 - i, "bash", "bash -c wrapper%d" % i))
+        beyond.append((4, "node", "node /srv/app/run.js"))
+        self.assertEqual("", self._with_chain(exe, *beyond),
+                         "超过深度上限就不再向上找")
 
     def _run_check(self, hits):
         from vigil.guards.checks import base, security
@@ -8644,6 +8810,207 @@ class TestShieldHeaders(unittest.TestCase):
             self.assertIn(header, text)
         # `always` matters: a 403 is where sniffing attacks land.
         self.assertEqual(4, text.count("always;"))
+
+
+class TestZoneKeyChangeIsRefused(unittest.TestCase):
+    """A limit zone's key cannot change at reload time, so never write one.
+
+    nginx creates a `limit_req_zone` / `limit_conn_zone` in shared memory on
+    first load and compares the key expression on every later load. A
+    same-name/different-key change is accepted by `nginx -t` -- a fresh parse
+    sees one definition -- and refused by every reload, in the error log, for
+    as long as the master runs. The host looks hardened and is not, and only a
+    full restart fixes it. That is the outage this class pins.
+
+    The fixtures use neutral names (`example_zone`, `$some_key`,
+    `$binary_remote_addr`, `192.0.2.0/24`) on purpose: the rule is about the
+    *shape* -- same zone name, different key -- not about any one host's
+    configuration. The historical names live in the product as compatibility
+    constants; they are deliberately not the fixture here.
+    """
+
+    def setUp(self):
+        from vigil.gates import shield
+        self.sh = shield
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "nginx-conf"
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.main = self.root / "nginx.conf"
+        self.main.write_text("http {\n}\n", encoding="utf-8")
+        self.shield_file = self.root / "vigil-shield.conf"
+        self.saved = (shield.conf_dir, shield.detect.nginx, shield._nginx_test,
+                      shield._reload_verified, shield._ensure_http_include)
+        shield.conf_dir = lambda: self.root
+        shield.detect.nginx = lambda: {"conf": str(self.main),
+                                       "binary": "/nonexistent/nginx"}
+        shield._nginx_test = lambda: (True, "ok")
+        shield._reload_verified = lambda timeout=8.0: (True, "fake reload")
+        shield._ensure_http_include = lambda main, target: None
+
+    def tearDown(self):
+        (self.sh.conf_dir, self.sh.detect.nginx, self.sh._nginx_test,
+         self.sh._reload_verified, self.sh._ensure_http_include) = self.saved
+        self.tmp.cleanup()
+
+    # -- fixtures, all neutral -------------------------------------------
+
+    @staticmethod
+    def _zone(key, name="example_zone", kind="limit_req_zone"):
+        return "%s  %s zone=%s:10m rate=5r/s;\n" % (kind, key, name)
+
+    def _install_with(self, text, **kwargs):
+        """Run `install` as if `render_shield()` produced *text*."""
+        saved = self.sh.render_shield
+        self.sh.render_shield = lambda cfg=None: text
+        try:
+            return self.sh.install(**kwargs)
+        finally:
+            self.sh.render_shield = saved
+
+    # -- the parsing rule ------------------------------------------------
+
+    def test_it_reads_zone_names_and_key_expressions(self):
+        text = (self._zone("$some_key", "example_zone")
+                + self._zone("$binary_remote_addr", "example_conn",
+                             kind="limit_conn_zone"))
+        self.assertEqual({"example_zone": "$some_key",
+                          "example_conn": "$binary_remote_addr"},
+                         self.sh.parse_zone_definitions(text))
+
+    def test_same_name_same_key_is_not_a_change(self):
+        self.assertEqual([], self.sh.zone_key_changes(
+            self._zone("$some_key"), {"example_zone": "$some_key"}))
+
+    def test_same_name_different_key_is_a_change(self):
+        self.assertEqual(
+            [("example_zone", "$binary_remote_addr", "$some_key")],
+            self.sh.zone_key_changes(
+                self._zone("$some_key"),
+                {"example_zone": "$binary_remote_addr"}))
+
+    def test_a_new_zone_name_is_not_a_change(self):
+        self.assertEqual([], self.sh.zone_key_changes(
+            self._zone("$some_key", "example_new"),
+            {"example_zone": "$binary_remote_addr"}))
+
+    # -- install() behaviour ---------------------------------------------
+
+    def test_a_new_zone_name_is_written_normally(self):
+        """A name that never existed is a new shared zone: reload can add it."""
+        self.shield_file.write_text(self._zone("$binary_remote_addr"),
+                                    encoding="utf-8")
+        res = self._install_with(self._zone("$some_key", "example_new"))
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertIn("example_new", self.shield_file.read_text(encoding="utf-8"))
+
+    def test_same_key_install_is_idempotent(self):
+        self.shield_file.write_text(self._zone("$some_key"), encoding="utf-8")
+        res = self._install_with(self._zone("$some_key"))
+        self.assertTrue(res["ok"], res["problems"])
+        self.assertEqual([], res["zone_key_changes"])
+
+    def test_a_key_change_against_the_previous_shield_is_refused(self):
+        """Nothing is written, so the host keeps a config reload still likes."""
+        old = self._zone("$binary_remote_addr")
+        self.shield_file.write_text(old, encoding="utf-8")
+        res = self._install_with(self._zone("$some_key"))
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["refused"], "拒绝必须是一个明确的结论")
+        self.assertFalse(res["rolled_back"], "什么都没写，谈不上回滚")
+        self.assertEqual([], res["written"],
+                         "拒绝时不得写入任何文件")
+        self.assertEqual(
+            [{"zone": "example_zone", "from": "$binary_remote_addr",
+              "to": "$some_key"}], res["zone_key_changes"])
+        self.assertEqual(old, self.shield_file.read_text(encoding="utf-8"),
+                         "旧文件必须原样保留")
+        message = "\n".join(res["problems"])
+        for fragment in ("example_zone", "$binary_remote_addr", "$some_key",
+                         "完整重启"):
+            self.assertIn(fragment, message)
+
+    def test_the_legacy_file_being_retired_is_read_too(self):
+        """The accident's exact shape: the live key lives in the old file.
+
+        `dsh-hardening.conf` defines the zone; the install retires it and
+        writes a shield that reuses the name with a new key. Reading only the
+        new file would miss it, because at check time the old file is the one
+        nginx is running.
+        """
+        legacy = self.root / self.sh.LEGACY_NAME
+        legacy.write_text(self._zone("$binary_remote_addr"), encoding="utf-8")
+        res = self._install_with(self._zone("$some_key"))
+        self.assertFalse(res["ok"])
+        self.assertEqual([], res["written"])
+        self.assertTrue(legacy.is_file(), "拒绝时不得退役旧文件")
+        self.assertFalse((self.root / "vigil-shield.conf").exists())
+        self.assertFalse(list(self.root.glob(self.sh.LEGACY_NAME + ".retired-*")),
+                         "拒绝时不得产生退役副本")
+        self.assertIn("完整重启", "\n".join(res["problems"]))
+
+    def test_a_key_change_is_caught_on_the_second_install(self):
+        """Install, then change the key: the second run refuses, the first stands."""
+        first = self._install_with(self._zone("$binary_remote_addr"))
+        self.assertTrue(first["ok"], first["problems"])
+        second = self._install_with(self._zone("$some_key"))
+        self.assertFalse(second["ok"])
+        self.assertIn("$binary_remote_addr",
+                      self.shield_file.read_text(encoding="utf-8"))
+
+    # -- the emergency nginx writes --------------------------------------
+
+    def test_the_key_change_emerg_is_translated_to_the_real_conclusion(self):
+        line = ('[emerg] limit_req "example_zone" uses the "$some_key" key '
+                'while previously it used the "$binary_remote_addr" key')
+        got = self.sh.explain_reload_emerg(line)
+        self.assertIn("需要完整重启", got,
+                      "关键结论：reload 永远无法生效")
+        self.assertIn("reload", got)
+        for fragment in ("example_zone", "$binary_remote_addr", "$some_key"):
+            self.assertIn(fragment, got, "必须说清是哪个 zone、从哪个 key 到哪个 key")
+
+    def test_a_conn_zone_key_change_is_recognised_too(self):
+        line = ('[emerg] limit_conn "example_conn" uses the "$some_key" key '
+                'while previously it used the "$binary_remote_addr" key')
+        got = self.sh.explain_reload_emerg(line)
+        self.assertIn("需要完整重启", got)
+        self.assertIn("limit_conn_zone", got)
+
+    def test_an_unrelated_emerg_is_not_claimed_to_be_a_key_change(self):
+        self.assertEqual("", self.sh.explain_reload_emerg(
+            '[emerg] unknown directive "bogus"'))
+        self.assertEqual("", self.sh.explain_reload_emerg(""))
+
+    def test_reload_verification_reports_the_key_change_conclusion(self):
+        """End to end: the emerg in the log becomes 'needs a full restart'."""
+        import tempfile as _tempfile
+        handle = _tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        handle.write("nothing yet\n")
+        handle.close()
+        path = handle.name
+        saved = (self.sh._error_log_path, self.sh._worker_pids, self.sh._reload)
+        self.sh._error_log_path = lambda: path
+        self.sh._worker_pids = lambda: {"1", "2"}
+
+        def reload_and_log():
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write('[emerg] limit_req "example_zone" uses the '
+                         '"$some_key" key while previously it used the '
+                         '"$binary_remote_addr" key\n')
+            return True, "systemctl reload nginx"
+
+        self.sh._reload = reload_and_log
+        try:
+            ok, detail = self.sh.reload_and_verify(timeout=1.0)
+        finally:
+            (self.sh._error_log_path, self.sh._worker_pids,
+             self.sh._reload) = saved
+            os.unlink(path)
+        self.assertFalse(ok)
+        self.assertIn("需要完整重启", detail)
+        self.assertIn("example_zone", detail)
+        self.assertIn("$binary_remote_addr", detail)
+        self.assertIn("$some_key", detail)
 
 
 class TestIpProfile(unittest.TestCase):

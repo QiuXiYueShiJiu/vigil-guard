@@ -377,8 +377,14 @@ def _panel_shield(sess: Session, cfg) -> None:
         ("back", "返回上级"),
     ], default=3)
     if choice == "install":
-        shield.install(retire=True)
-        ui.success("已应用")
+        res = shield.install(retire=True)
+        if res.get("ok"):
+            ui.success("已应用")
+        else:
+            # A refusal (a zone key change that only a full restart can load)
+            # must never be reported as applied.
+            for problem in res.get("problems") or ["未知原因"]:
+                ui.failure(problem)
     elif choice == "uninstall":
         shield.uninstall()
         ui.success("已移除")

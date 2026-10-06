@@ -69,7 +69,16 @@ def cmd_shield(args) -> int:
             ui.success("Web 层防护已生效")
             ui.hint("vigil shield status")
             return 0
-        ui.failure("未生效，已回滚到改动前的状态")
+        # Three different failures, three different next actions. Saying
+        # "rolled back" when the file was written and only a restart can load
+        # it would send the operator looking in the wrong place.
+        if res.get("refused"):
+            ui.failure("已拒绝写入，磁盘保持原样")
+        elif res.get("rolled_back"):
+            ui.failure("未生效，已回滚到改动前的状态")
+        else:
+            ui.warning("文件已写入，但运行中的 nginx 没有使用它"
+                       "——需要完整重启才能生效")
         return 1
 
     if action == "uninstall":

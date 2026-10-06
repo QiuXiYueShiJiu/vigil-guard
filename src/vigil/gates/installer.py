@@ -800,6 +800,29 @@ def install(spec: GateSpec, env: dict = None, log=None,
 
     written = []
 
+    # 0. The one write a reload could never pick up: nginx refuses to change
+    #    the key of a *live* limit zone, and `nginx -t` cannot see that because
+    #    it parses one config in isolation. Checked before anything is written
+    #    so a refusal leaves the host exactly as it was -- the web shield uses
+    #    the same rule, from the same place.
+    zones_file = Path(spec.zones_file or (
+        Path(spec.nginx_conf).parent / ("vigil-gate-%s-zones.conf"
+                                        % re.sub(r"\W+", "_", spec.slug))))
+    wanted_zones = render_zones(spec)
+    from . import shield as _shield
+    previous_zones = {}
+    try:
+        if zones_file.is_file():
+            previous_zones = _shield.parse_zone_definitions(
+                zones_file.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        previous_zones = {}
+    changes = _shield.zone_key_changes(wanted_zones, previous_zones)
+    if changes:
+        return {"ok": False, "error": _shield.describe_zone_conflicts(changes),
+                "zone_key_changes": [
+                    {"zone": z, "from": o, "to": n} for z, o, n in changes]}
+
     # 1. certificate before nginx references it
     cert_msg = ""
     if spec.proxy_mode and spec.use_https:
@@ -831,14 +854,12 @@ def install(spec: GateSpec, env: dict = None, log=None,
             return {"ok": False, "error": "写入 %s 失败: %s" % (path, e)}
     fix_permissions(spec, ours=[str(p) for p in rendered_paths])
 
-    # 3. the ZONES file must land in http{} before any vhost uses it
-    zones_file = Path(spec.zones_file or (
-        Path(spec.nginx_conf).parent / ("vigil-gate-%s-zones.conf"
-                                        % re.sub(r"\W+", "_", spec.slug))))
+    # 3. the ZONES file must land in http{} before any vhost uses it. Its
+    #    safe-to-write property was established in step 0.
     try:
         if zones_file.exists():
             _backup(zones_file)
-        _atomic_write(zones_file, render_zones(spec), 0o644)
+        _atomic_write(zones_file, wanted_zones, 0o644)
         written.append(str(zones_file))
     except OSError as e:
         return {"ok": False, "error": "写入限流区文件失败: %s" % e}

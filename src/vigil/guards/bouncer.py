@@ -42,6 +42,11 @@ from ..core.state import read_json, write_json
 
 CONF_NAME = "vigil-deny.conf"
 
+#: How long a reload is given to prove the running master took the new list.
+#: Only reached when something is wrong; a healthy reload returns as soon as
+#: the worker set changes.
+RELOAD_VERIFY_TIMEOUT = 6.0
+
 #: Where the rendered list lives. Kept next to the other nginx snippets the
 #: program owns, so an operator can read it with the same habits.
 HEADER = """# vigil 封禁列表 —— 由 vigil 生成，请勿手工编辑
@@ -259,21 +264,54 @@ def sync(cfg=None, dry_run: bool = False) -> dict:
     # the only two states are "all new" and "all old".
     ok, msg = nginx_test()
     if not ok:
-        for path, old in previous.items():
-            try:
-                if old:
-                    Path(path).write_text(old, encoding="utf-8")
-                elif Path(path).is_file():
-                    Path(path).unlink()
-            except OSError:
-                pass
+        _rollback(previous)
         out["ok"] = False
         out["problems"].append("nginx 拒绝新配置，已全部回滚：%s" % msg)
         return out
 
-    nginx_reload()
+    # A passing `nginx -t` is not proof the running master took the config. A
+    # live limit zone whose key changed passes the test and is refused by every
+    # reload, and the refusal only appears in the error log -- so this path
+    # verifies the reload and reports that one case as "needs a full restart"
+    # instead of leaving the operator with a list they believe is enforced.
+    from ..gates import shield as _shield
+
+    if not nginx_binary():
+        # No server to reload: do not sit on a verification timeout for a
+        # binary that is not installed. The list is still written and ready.
+        out["enforced"] = True
+        return out
+
+    def _one_reload():
+        nginx_reload()
+        return True, "nginx -s reload"
+
+    ok, why = _shield.reload_and_verify(_one_reload,
+                                        timeout=RELOAD_VERIFY_TIMEOUT)
+    if not ok:
+        _rollback(previous)
+        out["ok"] = False
+        out["problems"].append("nginx 未能载入新配置，已全部回滚：%s" % why)
+        return out
     out["enforced"] = True
     return out
+
+
+def _rollback(previous: dict) -> None:
+    """Restore every written copy to its previous bytes.
+
+    All copies or none: a partially updated list is a set of servers with
+    different views of who is blocked, which is worse than a stale but
+    consistent one.
+    """
+    for path, old in (previous or {}).items():
+        try:
+            if old:
+                Path(path).write_text(old, encoding="utf-8")
+            elif Path(path).is_file():
+                Path(path).unlink()
+        except OSError:
+            pass
 
 
 def nginx_binary() -> str:

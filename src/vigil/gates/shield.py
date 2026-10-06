@@ -26,11 +26,32 @@ project owns, and the names stay.
 Everything here is idempotent and verified before it is applied: the new
 snippet is written first, ``nginx -t`` decides whether it is kept, and the old
 file is only retired once the replacement is proven to load.
+
+**The one change a reload cannot make.** nginx ties a shared limit zone to the
+*key expression* it was first created with. Redefining ``dsh_site_req`` with a
+different key is accepted by ``nginx -t`` -- a fresh parse sees one definition
+-- and then refused by every reload, forever, until the master is restarted.
+That is not a soft failure: ``nginx -s reload`` exits 0 while the old
+configuration keeps serving, so the host looks hardened and is not. The
+migration in this module's history did exactly that, and the emergency log
+filled with ``limit_req "..." uses the "..." key while previously it used the
+"..." key``.
+
+So the zone definitions on disk are read *before* anything is written, and a
+same-name/different-key change is refused rather than applied (see
+:func:`zone_key_changes`). The alternative -- renaming the zone so nginx
+treats it as new -- was rejected: live vhosts, which this program does not
+own, reference these historical names in their own ``limit_req`` /
+``limit_conn`` directives, so a rename either breaks every one of them at
+``nginx -t`` or has to keep the old name alive with the old key, silently
+splitting enforcement between two zones. A refusal is the only option that
+cannot leave a half-applied policy behind.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -67,6 +88,146 @@ SITE_REQ_BURST = 60
 PHP_REQ_RATE = "8r/s"
 
 LEGACY_NAME = "dsh-hardening.conf"
+
+
+# --------------------------------------------------------------------------
+# What nginx refuses to change at reload time
+# --------------------------------------------------------------------------
+#
+# A `limit_req_zone` / `limit_conn_zone` is created in shared memory the first
+# time nginx loads a config that declares it. On every later load the module
+# compares the key expression with the one the live zone was created with; a
+# difference is a fatal `[emerg]`, which a reload reports to the error log and
+# then abandons. `nginx -t` does not catch it -- it parses one config in
+# isolation and never sees the running zone -- which is what makes this worth
+# a dedicated check rather than another `nginx -t` call.
+
+#: One `limit_req_zone` / `limit_conn_zone` declaration, as written in
+#: nginx.conf. The key expression is the first token; the zone name follows
+#: `zone=` and ends at the `:` that introduces the size.
+_ZONE_DEF_RX = re.compile(
+    r"^[ \t]*(?P<kind>limit_req_zone|limit_conn_zone)[ \t]+"
+    r"(?P<key>\"[^\"]*\"|\S+)[ \t]+"
+    r"zone[ \t]*=[ \t]*(?P<zone>[^\s;:]+)",
+    re.MULTILINE | re.IGNORECASE)
+
+#: nginx's own wording for "the live zone was created with a different key".
+#: The module name is printed as `limit_req` / `limit_conn` (the zone suffix
+#: is dropped), so both spellings are accepted. This is the one config error
+#: that `nginx -t` accepts and a reload refuses, so callers must not pass it
+#: through as a generic parse failure.
+_KEY_CHANGE_EMERG_RX = re.compile(
+    r"(?P<module>limit_(?:req|conn)(?:_zone)?)[ \t]+\"?(?P<zone>[^\"\s]+)\"?[ \t]+"
+    r"uses[ \t]+the[ \t]+\"(?P<new>[^\"]+)\"[ \t]+key[ \t]+"
+    r"while[ \t]+previously[ \t]+it[ \t]+used[ \t]+the[ \t]+"
+    r"\"(?P<old>[^\"]+)\"[ \t]+key",
+    re.IGNORECASE)
+
+
+def parse_zone_definitions(text: str) -> dict:
+    """``zone name -> key expression`` for every limit zone in *text*.
+
+    Only the two directives that create a shared limit zone are considered.
+    A name defined twice in one text keeps the last definition, which mirrors
+    nginx's own "duplicate zone" error rather than hiding it.
+    """
+    out = {}
+    for m in _ZONE_DEF_RX.finditer(text or ""):
+        key = m.group("key").strip()
+        if len(key) >= 2 and key[0] == '"' and key[-1] == '"':
+            key = key[1:-1]
+        out[m.group("zone")] = key
+    return out
+
+
+def zone_key_changes(new_text: str, previous: dict) -> list:
+    """``[(zone, old_key, new_key)]`` for zones redefined with a new key.
+
+    An empty list means the change is safe to apply by reload. A non-empty one
+    means it is not, and the caller must not write the file: nginx would accept
+    it on disk and refuse it on every reload.
+    """
+    changes = []
+    for zone, new_key in parse_zone_definitions(new_text).items():
+        old_key = (previous or {}).get(zone)
+        if old_key is not None and old_key != new_key:
+            changes.append((zone, old_key, new_key))
+    return sorted(changes)
+
+
+def superseded_zone_definitions(where=None) -> dict:
+    """Zone definitions the next shield write would replace or retire.
+
+    Two files can hold them and both stop being the definition on disk during
+    an install: the previous ``vigil-shield.conf`` and the legacy hardening
+    file that is retired in the same pass. Both are read, so the check works
+    on a host whose live zones were written by an older generation of this
+    program -- which is the case that caused the outage.
+    """
+    base = Path(where) if where else conf_dir()
+    out = {}
+    # Legacy first so the current shield file wins when both exist: it is the
+    # one the main config includes once it has been written.
+    for name in (LEGACY_NAME, "vigil-shield.conf"):
+        path = base / name
+        try:
+            if path.is_file():
+                out.update(parse_zone_definitions(
+                    path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+    return out
+
+
+def describe_zone_conflicts(changes) -> str:
+    """The operator-facing explanation for a refused zone-key change."""
+    lines = ["检测到限流区同名换 key，已拒绝写入（未改动任何文件）："]
+    for zone, old, new in changes:
+        lines.append("  zone=%s：key %s → %s" % (zone, old, new))
+    lines.append(
+        "       nginx 不允许在运行期更换已有 zone 的 key：这样的文件能通过 "
+        "`nginx -t`，\n"
+        "       但从写入那一刻起，每一次 reload 都会以 [emerg] 失败，"
+        "只有完整重启才能恢复。")
+    lines.append(
+        "       处理方式（这份配置本程序不会替你写）：\n"
+        "       · 要保留原 zone 名：在维护窗口手工写入新 key，然后**完整重启**"
+        "（systemctl restart nginx，会中断现有连接）——restart 而不是 reload；\n"
+        "       · 要能 reload：把 zone 改成一个新名字，并同步更新所有引用它的 "
+        "limit_req / limit_conn。\n"
+        "       先完整重启、再重跑本操作没有帮助：只要新旧定义同名不同 key，"
+        "本程序仍会拒绝。")
+    return "\n".join(lines)
+
+
+def explain_reload_emerg(line: str) -> str:
+    """Translate nginx's zone-key-change ``[emerg]`` into what to do about it.
+
+    Returns ``""`` for every other emergency, so the caller can fall back to
+    quoting nginx verbatim. The point is the conclusion, not the translation:
+    this is the only nginx config error that no amount of reloading will fix.
+    """
+    m = _KEY_CHANGE_EMERG_RX.search(line or "")
+    if not m:
+        return ""
+    module = m.group("module").lower()
+    directive = "limit_req_zone" if module.startswith("limit_req") else \
+        "limit_conn_zone"
+    return (
+        "nginx 拒绝了新配置：仅靠 reload 无法生效，需要完整重启 nginx —— "
+        "nginx 不允许在运行期更换已有 zone 的 key（%s）。\n"
+        "       zone=%s，key 由 %s 变为 %s。\n"
+        "       请完整重启：systemctl restart nginx（会中断现有连接）；"
+        "或在维护窗口执行。\n"
+        "       nginx 原文：%s"
+        % (directive, m.group("zone"), m.group("old"), m.group("new"),
+           (line or "").strip()[:220]))
+
+
+def reload_reason(emerg: str) -> str:
+    """A reload failure as an actionable sentence."""
+    return explain_reload_emerg(emerg) or ("nginx 拒绝了新配置：%s"
+                                           % (emerg or "").strip())
 
 
 def conf_dir() -> Path:
@@ -272,8 +433,8 @@ def _new_emerg(path: str, since: int) -> str:
     return ""
 
 
-def _reload_verified(timeout: float = 8.0) -> tuple:
-    """Reload nginx and *prove* the new configuration is in use.
+def reload_and_verify(reload_fn=None, timeout: float = 8.0) -> tuple:
+    """Reload nginx through *reload_fn* and *prove* the config is in use.
 
     A return code is not evidence. `nginx -s reload` exits 0 when the master
     accepts the signal and then rejects the configuration -- the failure goes
@@ -286,31 +447,45 @@ def _reload_verified(timeout: float = 8.0) -> tuple:
     Two independent signals, because either alone can be fooled:
       * the worker set changed -- a graceful reload starts new workers, so an
         unchanged set means the master did not pick the config up;
-      * a fresh `[emerg]` in the error log -- which also says *why*.
+      * a fresh `[emerg]` in the error log -- which also says *why*, and is
+        translated by :func:`reload_reason` so a key change is reported as
+        "this needs a full restart" instead of a generic parse failure.
+
+    The error log is polled as well as checked at the deadline, so the
+    unfixable-by-reload case is reported as soon as nginx writes it rather
+    than after the full timeout.
     """
+    reload_fn = reload_fn or _reload
     log = _error_log_path()
     mark = _log_size(log)
     before = _worker_pids()
 
-    ok, how = _reload()
+    ok, how = reload_fn()
     if not ok:
         return False, how
 
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        time.sleep(0.5)
+    while True:
         if _worker_pids() != before:
             return True, "%s（worker %d -> %d）" % (how, len(before),
                                                    len(_worker_pids()))
-    emerg = _new_emerg(log, mark)
-    if emerg:
-        return False, "nginx 拒绝了新配置：%s" % emerg
+        emerg = _new_emerg(log, mark)
+        if emerg:
+            return False, reload_reason(emerg)
+        if time.time() >= deadline:
+            break
+        time.sleep(0.5)
     if before:
         return False, ("reload 后 nginx worker 未更换，新配置很可能没有生效"
                        "（需要完整重启：systemctl restart nginx）")
     # No workers visible at all: this is not nginx, or not a layout we can
     # read. Do not cry wolf about something we cannot observe.
     return True, how
+
+
+def _reload_verified(timeout: float = 8.0) -> tuple:
+    """Reload with the standard ladder, then verify. Kept as the old name."""
+    return reload_and_verify(timeout=timeout)
 
 
 def status() -> dict:
@@ -340,12 +515,31 @@ def install(retire: bool = True) -> dict:
     replacement has been proven means there is no window in which neither is
     active -- which on this host would mean the vhosts reference an undefined
     variable and nginx stops serving entirely.
+
+    The one change that is refused rather than applied is a same-name zone
+    with a different key: it is the only thing here that `nginx -t` accepts
+    and a reload can never use, so nothing is written and
+    ``result["problems"]`` carries the explanation.
     """
     result = {"written": [], "retired": "", "backup": "", "reloaded": "",
-              "problems": [], "ok": False}
+              "problems": [], "ok": False, "zone_key_changes": [],
+              "refused": False, "rolled_back": False}
     target = shield_file()
     legacy = conf_dir() / LEGACY_NAME
     main = Path(detect.nginx().get("conf", ""))
+
+    # Before a single byte is written: would this redefine a live zone with a
+    # different key? nginx accepts that on disk and refuses it on every reload,
+    # so it must not reach the disk at all. Checked here rather than after the
+    # write because "write, then discover reload cannot use it" is the failure.
+    wanted = render_shield()
+    changes = zone_key_changes(wanted, superseded_zone_definitions())
+    if changes:
+        result["refused"] = True
+        result["problems"].append(describe_zone_conflicts(changes))
+        result["zone_key_changes"] = [
+            {"zone": zone, "from": old, "to": new} for zone, old, new in changes]
+        return result
 
     before_text = main.read_text(encoding="utf-8", errors="replace") \
         if main.is_file() else ""
@@ -353,7 +547,7 @@ def install(retire: bool = True) -> dict:
         if target.is_file() else None
     before_legacy = legacy.read_bytes() if legacy.is_file() else None
 
-    _atomic_write(target, render_shield(), 0o644)
+    _atomic_write(target, wanted, 0o644)
     result["written"].append(str(target))
     _ensure_http_include(str(main), target)
 
@@ -377,6 +571,7 @@ def install(retire: bool = True) -> dict:
     good, detail = _nginx_test()
     if not good:
         result["problems"].append("nginx -t 失败：%s" % detail[:300])
+        result["rolled_back"] = True
         # Roll every file back: a failed test must leave the host exactly as
         # it was, because a broken nginx means every site is down.
         if main.is_file():
@@ -400,12 +595,14 @@ def install(retire: bool = True) -> dict:
         # Say what to do about it. A configuration that is correct on disk but
         # not in the running process is the one failure mode that makes every
         # other security change meaningless, and it is invisible from every
-        # surface except this one.
+        # surface except this one. When the reason already names the remedy
+        # (a zone key change is the case) it is not repeated.
+        hint = "" if "完整重启" in how else (
+            "\n       请完整重启：systemctl restart nginx")
         result["problems"].append(
             "nginx 未能载入新配置：%s\n"
             "       该文件在磁盘上是正确的，但**运行中的 nginx 没有使用它**"
-            "——在此之前它不会保护任何东西。\n"
-            "       请完整重启：systemctl restart nginx" % how)
+            "——在此之前它不会保护任何东西。%s" % (how, hint))
         return result
     result["ok"] = True
     return result
