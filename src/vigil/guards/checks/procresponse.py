@@ -161,7 +161,7 @@ class Runtime:
     def __init__(self, cfg=None, log=None, list_pids=None, proc_info=None,
                  connections=None, cgroup_unit=None, start_time=None,
                  is_automation=None, signal_fn=None, now=None,
-                 pid_namespace=None):
+                 pid_namespace=None, has_tty=None):
         self.cfg = cfg
         self.log = log
         self._list_pids = list_pids
@@ -173,6 +173,7 @@ class Runtime:
         self._signal_fn = signal_fn
         self._now = now
         self._pid_namespace = pid_namespace
+        self._has_tty = has_tty
         self._own_ns = None
 
     # -- process facts ----------------------------------------------------
@@ -228,6 +229,18 @@ class Runtime:
             return float(self._start_time(pid) or 0.0)
         return _start_time(pid)
 
+    def has_tty(self, pid: int) -> bool:
+        """Does this process have a controlling terminal?
+
+        Read from field 7 of ``/proc/<pid>/stat`` (the tty_nr). A process with
+        a terminal was started by someone sitting at one, which is a
+        structural fact about how a build or a test run looks -- and is
+        exactly what a daemonised implant does *not* have.
+        """
+        if self._has_tty is not None:
+            return bool(self._has_tty(pid))
+        return _has_tty(pid)
+
     def is_automation(self, pid: int, exe: str) -> str:
         """Non-empty when the process is part of a browser/automation bundle."""
         if self._is_automation is not None:
@@ -279,6 +292,17 @@ def _start_time(pid) -> float:
             return os.path.getmtime("/proc/%s" % pid)
         except OSError:
             return 0.0
+
+
+def _has_tty(pid) -> bool:
+    """Field 7 of ``/proc/<pid>/stat`` is tty_nr; 0 means "no terminal"."""
+    try:
+        with open("/proc/%s/stat" % int(pid), "r", encoding="utf-8",
+                  errors="replace") as fh:
+            data = fh.read()
+        return int(data.rsplit(") ", 1)[1].split()[4]) != 0
+    except (OSError, IndexError, ValueError):
+        return False
 
 
 def _connections_of(pid) -> list:
@@ -341,13 +365,24 @@ def _pid_namespace(pid) -> str:
 
 
 def _is_external(peer: str) -> bool:
-    """Is *peer* somewhere other than this host?
+    """Is *peer* a routable address somewhere else on the internet?
 
-    Loopback and the unspecified addresses can never be a command-and-control
-    channel, and a process talking to its own database over 127.0.0.1 is the
-    single most common shape on a web server. Treating those as "holds an
-    outbound connection" would make the high-confidence rule fire on healthy
-    daemons.
+    Deliberately narrow, because this is one of the two signals that can lead
+    to a signal being sent. Every address that is *not* a public destination
+    is excluded:
+
+    * loopback and the unspecified address -- a process talking to its own
+      database over 127.0.0.1 is the single most common shape on a web server;
+    * RFC 1918 / CGNAT / link-local -- a process talking to ``10.x`` or
+      ``192.168.x`` is talking to the operator's own infrastructure, which is
+      the normal state of affairs on any multi-host setup;
+    * the RFC 5737 documentation ranges and everything else `special_address`
+      knows about, which cannot be a real C2 endpoint and whose appearance in
+      a socket table means the data is synthetic.
+
+    The reserved-range test is delegated to ``util.special_address`` so that
+    this module and the rest of the program agree on one definition of "not a
+    real remote source", instead of two lists that will drift apart.
     """
     text = str(peer or "").strip()
     if not text:
@@ -357,13 +392,11 @@ def _is_external(peer: str) -> bool:
     else:
         host = text.rsplit(":", 1)[0] if ":" in text else text
     host = host.strip("[]").split("%")[0].lower()
-    if not host:
+    if not host or host in ("*", "localhost"):
         return False
-    if host in ("127.0.0.1", "::1", "0.0.0.0", "::", "*", "localhost"):
-        return False
-    if host.startswith("127.") or host.startswith("::ffff:127."):
-        return False
-    if host.startswith(("fe80:", "169.254.")):
+    if host.startswith("::ffff:"):
+        host = host[len("::ffff:"):]
+    if util.special_address(host):
         return False
     return True
 
@@ -1315,6 +1348,11 @@ def runtime_downgrade(pid, comm: str, cmdline: str, runtime: Runtime,
         pid = int(pid)
     except (TypeError, ValueError):
         return ""
+    if pid <= 1:
+        # init and the kernel threads are never "a busy build", whatever
+        # cgroup they report: `init.scope` would otherwise make the strongest
+        # possible signal ("this is the system") read like an ordinary unit.
+        return ""
     unit = runtime.cgroup_unit(pid)
     if unit:
         return ("属于 systemd 单元（%s），高占用由服务管理器统一管理，"
@@ -1336,8 +1374,52 @@ def runtime_downgrade(pid, comm: str, cmdline: str, runtime: Runtime,
     for word in words:
         for root in roots:
             if root and (word == root or word.startswith(root.rstrip("/") + "/")):
-                return "命令行指向本机已登记的站点目录（%s）" % root
+                return "命令行指向本机已登记的工作目录（%s）" % root
+
+    # A controlling terminal, or a shell parent, means a person or a CI runner
+    # started this in the foreground. A build or a test suite looks exactly
+    # like that, and so does nothing that daemonises itself: a background
+    # process is reparented to init and has no tty.
+    #
+    # Deliberately *not* recursive. The tempting version -- "downgrade it if
+    # its parent is a real program" -- lets `myprog &` from a shell launder a
+    # payload, because the parent is a shell and the shell is certainly a real
+    # program. So the two exceptions are pinned to the two facts that cannot
+    # survive daemonising, and a worker started by a package-managed program
+    # is covered by the package test on its own path instead.
+    if runtime.has_tty(pid):
+        return "持有控制终端，是在前台由人或 CI 直接启动的"
+    parent = _parent_of(pid, runtime)
+    if parent and _SHELL_COMM_RX.match(str(parent.get("comm") or "")):
+        return "父进程是交互式 shell（%s），属于前台作业" % parent.get("comm")
     return ""
+
+
+def _parent_of(pid: int, runtime: Runtime) -> dict:
+    """The parent process record, or ``{}``.
+
+    Read from the process's own ``ppid`` rather than by scanning, so this can
+    never accidentally describe an unrelated process that happens to share a
+    name.
+    """
+    try:
+        info = runtime.proc_info(pid) or {}
+        ppid = int(info.get("ppid") or 0)
+    except (TypeError, ValueError):
+        return {}
+    if ppid <= 0:
+        return {}
+    try:
+        return dict(runtime.proc_info(ppid) or {})
+    except Exception:                                       # noqa: BLE001
+        return {}
+
+
+#: Interactive shells. A foreground job's parent is one of these, and the
+#: process will not have that parent any more once it is daemonised.
+_SHELL_COMM_RX = re.compile(
+    r"^(?:ba|da|k|z|a|fi|c|tc)?sh$|^(?:bash|zsh|fish|dash|ksh|tcsh|csh|"
+    r"login|systemd-run|su|sudo|runuser)$", re.I)
 
 
 #: Flags that mean "run the code I am handing you" rather than "run an
@@ -1356,11 +1438,19 @@ def _inline_code(cmdline: str) -> bool:
 
 
 def _site_roots(cfg) -> list:
-    """Directories this host already serves, from the config.
+    """Directories this host already serves or builds in, from the config.
 
-    Read from ``gate.*.webroot`` rather than guessed, so "the command line
-    points at a site" means a site the operator actually registered with this
-    program. An empty list is the honest answer for a host with no gate.
+    Two sources, both operator-declared rather than guessed:
+
+    * ``gate.*.webroot`` -- a directory this program already installed a login
+      gate in front of;
+    * ``checks.process_anomaly.build_dirs`` -- build/test trees, which is how
+      an operator says "compiling here is normal" once instead of being told
+      about it every time.
+
+    Guesses are deliberately rejected: a home directory, ``/``, or an empty
+    string would make the exemption mean nothing, so they are dropped. An
+    empty list is the honest answer for a host that declared nothing.
     """
     roots = []
     for section in ("bt_panel", "dsh_gate"):
@@ -1368,9 +1458,37 @@ def _site_roots(cfg) -> list:
             value = str(cfg.get("gate.%s.webroot" % section, "") or "")
         except AttributeError:
             return roots
-        if value:
+        if _usable_root(value):
             roots.append(value)
+    try:
+        extra = cfg.get("checks.process_anomaly.build_dirs", []) or []
+    except AttributeError:
+        extra = []
+    for value in extra:
+        if _usable_root(value):
+            roots.append(str(value))
     return roots
+
+
+def _usable_root(value) -> bool:
+    text = str(value or "").strip()
+    if not text or text == "/" or not text.startswith("/"):
+        return False
+    parts = [p for p in text.rstrip("/").split("/") if p]
+    if len(parts) < 2:
+        return False
+    # A user's whole home directory is not a build tree; `/home/<user>/build`
+    # is. Same for the other broad roots: exempting them would make the
+    # exemption mean "anything the operator owns", which is not the point.
+    if parts[0] in ("home",) and len(parts) < 3:
+        return False
+    if parts[0] in ("root", "tmp", "usr", "etc", "var", "opt", "srv", "bin",
+                    "sbin", "lib") and len(parts) < 2:
+        return False
+    if text.rstrip("/") in ("/root", "/home", "/tmp", "/var/tmp", "/usr",
+                            "/etc", "/var", "/opt", "/srv"):
+        return False
+    return True
 
 
 def package_owner(exe: str) -> str:

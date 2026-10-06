@@ -153,18 +153,138 @@ class MemoryUsage(Check):
         size = "（%.1f GB / %.1f GB 可用）" % (
             avail / 1024.0 / 1024.0, total / 1024.0 / 1024.0)
 
-        if pct <= crit_pct:
+        # Both the ratio and an absolute floor, because the ratio alone is a
+        # false alarm on a small host. A 2 GB machine running one build drops
+        # below 20% available while being perfectly healthy; the same 20% on a
+        # 64 GB machine is 12 GB free, which is not a problem either. So the
+        # percentage says *how much of the machine is left*, the floor says
+        # *whether that is still enough to work with*, and a finding needs
+        # both. Crossing the floor is also not enough on its own: a machine
+        # that is simply small reports low absolute numbers all day.
+        warn_mb = _memory_floor_mb(
+            ctx.copt("memory", "warn_available_mb", 0), total, 0.08)
+        crit_mb = _memory_floor_mb(
+            ctx.copt("memory", "crit_available_mb", 0), total, 0.03)
+        avail_mb = avail / 1024.0
+        # The ratio alone is a bad proxy in both directions, so three things
+        # have to agree before a finding is raised:
+        #
+        #   1. the percentage is below the line. On a small host the line
+        #      itself is relaxed (see `_scaled_pct`) because a 2 GB machine
+        #      running one build drops below a fixed 20% while being healthy;
+        #   2. there is less than the *scaled* absolute floor left. A 64 GB
+        #      host with 300 MB free is minutes from the OOM killer; a 1.9 GB
+        #      host at the same figure is survivable, so this line scales with
+        #      the machine (`_memory_floor_mb`);
+        #   3. there is less than a headroom cap -- a percentage of the total
+        #      (`_mem_headroom_mb`). This is what stops a *large* host from
+        #      being nagged at 17% when 17% is eleven gigabytes.
+        #
+        # An operator-set MB floor replaces 2 and 3 entirely: they told us the
+        # number their workload needs, and second-guessing it would make the
+        # key useless.
+        warn_pct, _ = _scaled_pct(warn_pct, total, 20)
+        crit_pct, _ = _scaled_pct(crit_pct, total, 10)
+        head_mb = _mem_headroom_mb(total)
+        warn_floor = _memory_floor_mb(
+            ctx.copt("memory", "warn_available_mb", 0), total, 0.08)
+        crit_floor = _memory_floor_mb(
+            ctx.copt("memory", "crit_available_mb", 0), total, 0.03)
+        if not float(ctx.copt("memory", "warn_available_mb", 0) or 0):
+            warn_floor = max(warn_floor, head_mb)
+            crit_floor = max(crit_floor, head_mb / 2.0)
+        avail_mb = avail / 1024.0
+
+        if pct <= crit_pct and avail_mb <= crit_floor:
             top = util.top_procs("mem", 3)
             return CheckResult(CRIT, "可用内存严重不足：仅 **%.1f%%**%s"
                                % (pct, size)
                                + (("\n     占用最高: " + "；".join(top)) if top else "")
                                + "\n     内存耗尽会触发 OOM Killer 随机杀进程，"
                                  "数据库或 Web 服务可能被强制终止。")
-        if pct <= warn_pct:
+        elif pct <= warn_pct and avail_mb <= warn_floor:
             top = util.top_procs("mem", 3)
             return CheckResult(WARN, "可用内存偏低：%.1f%%%s" % (pct, size)
                                + (("\n     占用最高: " + "；".join(top)) if top else ""))
-        return CheckResult(OK, "可用内存 %.1f%%%s" % (pct, size))
+        # Say which of the gates held, so a machine that is *small* rather
+        # than pressured is visibly distinguished from a healthy one. Both
+        # explanations exist because either gate can be the deciding one.
+        if pct <= warn_pct:
+            return CheckResult(
+                OK, "可用内存 %.1f%%%s —— 比例虽低，但可用内存仍有 %.0f MB，"
+                    "高于本机判定下限 %.0f MB，对这台机器属于正常波动"
+                % (pct, size, avail_mb, warn_floor))
+        return CheckResult(
+            OK, "可用内存 %.1f%%%s —— 比例高于本机（小内存）换算后的告警线 "
+                "%.0f%%，且可用 %.0f MB 仍高于下限 %.0f MB，"
+                "对这台机器属于正常波动"
+            % (pct, size, warn_pct, avail_mb, warn_floor))
+
+
+def _memory_floor_mb(configured, total_kb: int, ratio: float) -> float:
+    """The absolute "still enough to work with" floor, in MB.
+
+    *configured* wins when it is a positive number -- an operator who knows
+    their workload sets it once. Otherwise it scales with the machine: a fixed
+    300 MB floor would never fire on a host with 64 GB (where 300 MB free is
+    an emergency) and would fire constantly on a 1 GB host (where 300 MB free
+    is the normal state). Scaling keeps the same *meaning* -- "this fraction
+    of the machine is all that is left" -- across sizes.
+    """
+    try:
+        value = float(configured or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    if value > 0:
+        return value
+    return max(1.0, (total_kb / 1024.0) * float(ratio))
+
+
+def _scaled_pct(configured, total_kb: int, default: float) -> tuple:
+    """``(percentage, was_scaled)`` for the available-memory thresholds.
+
+    A fixed 20% is a false alarm on a small host: a 2 GB machine running one
+    build drops below it while being perfectly healthy. So when the config
+    still holds the *default*, the line is relaxed in proportion to how small
+    the machine is. An operator-supplied value is returned untouched -- two
+    different people may have written that number for two different reasons,
+    and this function cannot tell which.
+
+    The shape is deliberately gentle: 20% normally, 16% at 4 GB, 12% at 2 GB
+    and below. The point is to stop nagging a small machine, not to stop
+    noticing when it really is out of memory -- the absolute floors below and
+    the separate `crit` threshold still fire.
+    """
+    try:
+        value = float(configured)
+    except (TypeError, ValueError):
+        value = float(default)
+    if abs(value - float(default)) > 1e-9:
+        return value, False
+    total_mb = total_kb / 1024.0
+    if total_mb <= 2048:
+        return 12.0, True
+    if total_mb <= 4096:
+        return 16.0, True
+    return value, True
+
+
+def _mem_headroom_mb(total_kb: int) -> float:
+    """The "that is still a lot of bytes" cap, in MB, from the total size.
+
+    Scaled to the machine so the same *judgement* holds everywhere: a few
+    hundred megabytes is ample on a 2 GB host and negligible on a 64 GB one.
+    Five percent of the total is the line -- 256 MB on a 2 GB box (the floor,
+    so a tiny host still gets a sane figure) and 3.2 GB on a 64 GB box (the
+    ceiling, so the cap cannot run away from the scaled floor and start
+    alerting a large host again).
+
+    In other words: "more than 5% of this machine is still free" is not
+    pressure, whatever the available-memory *percentage* threshold says. The
+    critical line is half of this, so "300 MB is a usable amount" can never
+    excuse a 64 GB host that is nearly out.
+    """
+    return min(3277.0, max(256.0, (total_kb / 1024.0) * 0.05))
 
 
 @register

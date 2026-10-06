@@ -9885,7 +9885,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- off by default ----------------------------------------------------
     def test_nothing_happens_until_it_is_switched_on(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         state = {}
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
                                 runtime=self.runtime())
@@ -9905,7 +9905,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     def test_a_temp_dir_path_alone_is_not_a_high_confidence_signal(self):
         self.add(4242, exe="/tmp/build/payload", deleted=False,
-                 conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+                 conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable()
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
                                 runtime=self.runtime())
@@ -9923,7 +9923,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- the observation window -------------------------------------------
     def test_a_snapshot_is_not_enough_but_persistence_is(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=120)
         state = {}
         first = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
@@ -9938,7 +9938,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertEqual([(4242, int(signal.SIGSTOP))], self.signals)
 
     def test_a_candidate_that_disappears_inside_the_window_is_dropped(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=120)
         state = {}
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
@@ -9951,13 +9951,13 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertEqual({}, state[self.pr.STATE_KEY]["observing"])
 
     def test_a_signal_that_changes_restarts_the_observation(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=120)
         state = {}
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
                        runtime=self.runtime())
         self.now[0] += 121
-        self.conns[4242] = [("ESTAB", "10.0.0.5:41000", "203.0.113.200:8443")]
+        self.conns[4242] = [("ESTAB", "10.0.0.5:41000", "93.184.216.35:8443")]
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
                                 runtime=self.runtime())
         self.assertEqual([], self.signals, "信号组合变了就要重新观察")
@@ -9981,7 +9981,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
                 self.conns.clear()
                 self.signals[:] = []
                 self.add(conns=[("ESTAB", "10.0.0.5:41000",
-                                 "203.0.113.9:443")], **spec)
+                                 "93.184.216.34:443")], **spec)
                 self.enable(observe_seconds=0,
                             allowlist=["payload"] if label == "allowlist" else [])
                 state = {}
@@ -9992,7 +9992,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
                 self.assertEqual([], self.signals, "%s 必须永不处置" % label)
 
     def test_the_operator_allowlist_is_respected(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0, allowlist=["/tmp/payload"])
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
                                 runtime=self.runtime())
@@ -10001,7 +10001,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- identity, right before the action --------------------------------
     def test_a_reused_pid_abandons_the_action(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
@@ -10009,14 +10009,14 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         # The pid is now a different process: new start time, new inode.
         self.add(4242, exe="/usr/sbin/nginx", deleted=False, comm="nginx",
                  start=999.0, ino=777,
-                 conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+                 conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
                                 runtime=self.runtime())
         self.assertEqual([], self.signals, "pid 复用后绝不能动手")
         self.assertTrue(any("身份" in e["why"] for e in result["abandoned"]))
 
     def test_an_execve_between_deciding_and_acting_abandons_the_action(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
@@ -10029,7 +10029,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertTrue(result["abandoned"])
 
     def test_the_namespace_check_refuses_containers(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")],
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")],
                  ns="/proc/4242/ns/pid")
         self.enable(observe_seconds=0)
         result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
@@ -10039,7 +10039,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- evidence ----------------------------------------------------------
     def test_evidence_lands_on_disk_before_the_signal(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         seen = {}
 
@@ -10063,7 +10063,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertTrue(bundle["connections"])
 
     def test_no_evidence_means_no_action(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         # An evidence directory that cannot be created (a file in the way).
         blocked = self.root / "blocked"
@@ -10080,7 +10080,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- the reversible action, and undoing it ----------------------------
     def test_the_default_action_is_reversible_stop_not_kill(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         rt = self.runtime()
@@ -10093,7 +10093,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     def test_a_stopped_process_is_released_when_it_joins_a_unit(self):
         """Reversibility is only real if something actually reverses it."""
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         rt = self.runtime()
@@ -10112,7 +10112,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertIn("action-resumed", kinds, "撤销必须进台账")
 
     def test_a_stopped_process_is_released_when_put_on_the_allowlist(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         rt = self.runtime()
@@ -10125,7 +10125,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertEqual((4242, int(signal.SIGCONT)), self.signals[-1])
 
     def test_held_stop_is_reported_rather_than_silently_kept(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0, resume_window_seconds=60,
                     after_observe="hold")
         state = {}
@@ -10141,7 +10141,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertIn("保持暂停", self.pr.describe(result))
 
     def test_terminate_is_only_reachable_by_explicit_configuration(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0, resume_window_seconds=0,
                     after_observe="terminate", terminate_signal="SIGTERM")
         state = {}
@@ -10160,7 +10160,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         rt = self.runtime()
         for pid in (4242, 4243):
             self.add(pid, conns=[("ESTAB", "10.0.0.5:41000",
-                                  "203.0.113.9:443")])
+                                  "93.184.216.34:443")])
             self.pr.handle(self.hits(pid), cfg=self.cfg, state=state, runtime=rt)
             self.now[0] += 1
             self.pr.handle(self.hits(pid), cfg=self.cfg, state=state, runtime=rt)
@@ -10182,12 +10182,12 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.enable(observe_seconds=0, max_per_hour=1)
         state = {}
         rt = self.runtime()
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
         self.now[0] += 1
         self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
         state[self.pr.STATE_KEY]["action_stamps"] = [self.now[0] - 7200]
-        self.add(4243, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4243, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.pr.handle(self.hits(4243), cfg=self.cfg, state=state, runtime=rt)
         self.now[0] += 1
         self.pr.handle(self.hits(4243), cfg=self.cfg, state=state, runtime=rt)
@@ -10195,7 +10195,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- the loop that must not happen ------------------------------------
     def test_an_already_handled_process_is_not_re_decided(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         rt = self.runtime()
@@ -10211,7 +10211,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
 
     # -- the report --------------------------------------------------------
     def test_the_report_carries_the_tradeoff_and_the_undo(self):
-        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")])
         self.enable(observe_seconds=0)
         state = {}
         rt = self.runtime()
@@ -10240,7 +10240,7 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.assertEqual(self.pr.DECISION_REPORT, verdict["decision"])
         info["exe_deleted"] = True
         verdict = self.pr.classify(
-            info, [("ESTAB", "10.0.0.5:1", "203.0.113.9:443")], rt, [])
+            info, [("ESTAB", "10.0.0.5:1", "93.184.216.34:443")], rt, [])
         self.assertEqual(self.pr.DECISION_RESPOND, verdict["decision"])
 
 
@@ -10438,7 +10438,7 @@ class TestAutomationVerdictsAreAutomaticAndRecorded(unittest.TestCase):
         # connection: without the automation verdict this is exactly the
         # high-confidence shape that may be stopped.
         self.add(551002, exe, deleted=True, comm="chrome")
-        self.conns[551002] = [("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")]
+        self.conns[551002] = [("ESTAB", "10.0.0.5:41000", "93.184.216.34:443")]
         self.cfg.set("threat.autoresponse.enabled", True)
         self.cfg.set("threat.autoresponse.observe_seconds", 0)
         self.cfg.set("threat.autoresponse.evidence_dir",
@@ -10524,7 +10524,7 @@ class TestTrustedRuntimeDowngrade(unittest.TestCase):
         why = self.pr.runtime_downgrade(
             1234, "node", "node /srv/site/public/node_modules/.bin/vue-tsc",
             rt, self.cfg)
-        self.assertIn("站点目录", why)
+        self.assertIn("已登记的工作目录", why)
 
     def test_a_runtime_name_alone_is_not_enough(self):
         """`node -e <payload>` is a common implant shape; it must keep warning."""
@@ -10551,6 +10551,321 @@ class TestTrustedRuntimeDowngrade(unittest.TestCase):
         self.assertNotIn("signal.SIG", body)
         self.assertNotIn("apply_action", body)
         self.assertNotIn("_send_alert", body)
+
+
+
+
+class TestSiteAvailabilityUnderstandsAGate(unittest.TestCase):
+    """A gated site answering 401 is working, not broken.
+
+    This was the most frequent false alert in the project's history: a site
+    with a login gate returned 401 to the availability probe, and the check
+    reported "站点首页返回异常 HTTP 401（期望 200/3xx）" every ~31 minutes for
+    more than a day. The gate is this program's own front door, so the
+    judgement has to be joint: what the site answers *and* whether a gate was
+    deliberately placed in front of it.
+
+    The exemption has to stay narrow in the other direction too -- a gate that
+    cannot serve its own challenge is *more* alarming than a broken site,
+    because the protected thing looks protected.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.cfg.set("checks.site_availability.domain", "probe.example.com")
+        self.cfg.set("gate.dsh_gate.enabled", True)
+        self.cfg.set("gate.dsh_gate.domain", "probe.example.com")
+        self.cfg.set("gate.dsh_gate.entry_path", "/__vigil_login")
+
+    def _run(self, code, curl_ok=True):
+        from vigil.guards.checks import base, process
+        real_have = process.shell.have
+        real_run = process.shell.run
+        process.shell.have = lambda name: True
+        process.shell.run = lambda argv, **kw: (
+            (curl_ok, code, "") if argv and argv[0] == "curl" else (True, "", ""))
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return process.SiteAvailability().safe_run(ctx)
+        finally:
+            process.shell.have = real_have
+            process.shell.run = real_run
+
+    def test_a_gated_site_returning_401_is_not_a_fault(self):
+        res = self._run("401")
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("登录闸门", res.detail)
+
+    def test_a_gated_site_returning_403_is_not_a_fault(self):
+        self.assertEqual("OK", self._run("403").status)
+
+    def test_a_gated_site_returning_302_is_not_a_fault(self):
+        res = self._run("302")
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("登录闸门", res.detail)
+
+    def test_a_gated_site_returning_500_is_still_critical(self):
+        """The exemption must not hide a real outage behind the gate."""
+        res = self._run("500")
+        self.assertEqual("CRIT", res.status)
+        self.assertIn("500", res.detail)
+        self.assertIn("验证页", res.detail, "要说明是闸门自己坏了，而不是站点没问题")
+
+    def test_a_gated_site_that_cannot_be_reached_is_still_critical(self):
+        res = self._run("000", curl_ok=False)
+        self.assertEqual("CRIT", res.status)
+        self.assertIn("无响应", res.detail)
+
+    def test_a_gated_site_returning_503_is_still_critical(self):
+        self.assertEqual("CRIT", self._run("503").status)
+
+    def test_an_ungated_site_returning_401_is_still_reported(self):
+        """Without a gate, a 401 is somebody's authentication appearing."""
+        self.cfg.set("gate.dsh_gate.enabled", False)
+        res = self._run("401")
+        self.assertEqual("WARN", res.status)
+        self.assertIn("401", res.detail)
+
+    def test_the_gate_is_matched_by_domain_exactly(self):
+        from vigil.guards.checks.process import gate_for_site
+        self.assertTrue(gate_for_site(self.cfg, "probe.example.com"))
+        self.assertEqual({}, gate_for_site(self.cfg, "other.example.com"))
+        self.assertEqual({}, gate_for_site(self.cfg, "ample.com"),
+                         "后缀匹配会让一个站点的闸门替另一个站点解释故障")
+        self.assertEqual({}, gate_for_site(self.cfg, ""))
+
+    def test_a_disabled_gate_does_not_explain_anything(self):
+        from vigil.guards.checks.process import gate_for_site
+        self.cfg.set("gate.bt_panel.enabled", False)
+        self.cfg.set("gate.bt_panel.domain", "panel.example.com")
+        self.assertEqual({}, gate_for_site(self.cfg, "panel.example.com"))
+
+
+class TestMemoryThresholdsScaleWithTheMachine(unittest.TestCase):
+    """A fixed percentage is a false alarm on a small host.
+
+    Measured on the machine this was written for: 1.9 GB total, where any
+    build drops the available share below the fixed 20% warning while the host
+    is perfectly healthy. The fix is that the line is set from the *machine*:
+    a small host gets a relaxed percentage and a small absolute floor, a large
+    one keeps the percentage and gets both a scaled floor and a headroom cap
+    (11 GB free is not pressure, whatever the percentage says).
+
+    Every case below is a real reading shape, and the point of the table is
+    that the *same number* means different things on different machines.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import resource
+        self.res = resource
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def _run(self, total_mb, avail_mb, copt=None):
+        from vigil.guards.checks import base
+        for key, value in (copt or {}).items():
+            self.cfg.set("checks.memory.%s" % key, value)
+        real = self.res._meminfo
+        self.res._meminfo = lambda: {"MemTotal": int(total_mb * 1024),
+                                     "MemAvailable": int(avail_mb * 1024)}
+        real_top = self.res.util.top_procs
+        self.res.util.top_procs = lambda *a, **k: []
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return self.res.MemoryUsage().safe_run(ctx)
+        finally:
+            self.res._meminfo = real
+            self.res.util.top_procs = real_top
+
+    def test_a_small_host_in_normal_use_is_not_reported(self):
+        """1.9 GB with 340 MB free is 17.9% -- and completely normal there."""
+        res = self._run(1900, 340)
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("正常波动", res.detail, "要说明为什么比例低却不报")
+
+    def test_a_big_host_with_gigabytes_free_is_not_reported(self):
+        """17.4% of 64 GB is 11 GB. That is not pressure, whatever the ratio."""
+        res = self._run(65536, 11400)
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("正常波动", res.detail)
+
+    def test_a_small_host_genuinely_low_is_reported(self):
+        """130 MB on a 1.9 GB host: below both the scaled ratio and the floor."""
+        res = self._run(1900, 130)
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("偏低", res.detail)
+
+    def test_a_small_host_out_of_memory_is_critical(self):
+        res = self._run(1900, 30)
+        self.assertEqual("CRIT", res.status)
+        self.assertIn("严重不足", res.detail)
+
+    def test_a_big_host_out_of_memory_is_critical_too(self):
+        # ~2 GB left on a 64 GB host is below the scaled critical floor.
+        res = self._run(65536, 1400)
+        self.assertEqual("CRIT", res.status, res.detail)
+
+    def test_the_same_reading_is_judged_by_the_size_of_the_machine(self):
+        """300 MB free: ordinary on 1.9 GB, minutes from the OOM killer on 64 GB.
+
+        This is the whole point of the change -- the identical number is a
+        different fact depending on the machine it was measured on, and every
+        gate above is a way of encoding that.
+        """
+        small = self._run(1900, 300)
+        big = self._run(65536, 300)
+        self.assertEqual("OK", small.status, small.detail)
+        self.assertEqual("CRIT", big.status, big.detail)
+        self.assertIn("正常波动", small.detail)
+
+    def test_the_percentage_can_be_set_explicitly(self):
+        # Raising the percentage line does not remove the absolute floor: the
+        # operator has to say "and 340 MB really is too little" as well.
+        res = self._run(1900, 340, {"warn_available_pct": 25,
+                                    "warn_available_mb": 400})
+        self.assertEqual("WARN", res.status, res.detail)
+
+    def test_the_floor_can_be_set_explicitly(self):
+        # "400 MB is still fine for this workload" -> 380 MB is not reported.
+        res = self._run(1900, 380, {"warn_available_mb": 400})
+        self.assertEqual("OK", res.status, res.detail)
+        # And the same host under the default floor does report it.
+        res = self._run(1900, 130)
+        self.assertEqual("WARN", res.status, res.detail)
+
+    def test_the_floor_scales_with_total_memory(self):
+        self.assertGreater(self.res._memory_floor_mb(0, 65536 * 1024, 0.08),
+                           self.res._memory_floor_mb(0, 1900 * 1024, 0.08))
+        self.assertEqual(512.0, self.res._memory_floor_mb(512, 1024 * 1024,
+                                                          0.08))
+
+    def test_the_percentage_scales_only_when_left_at_its_default(self):
+        self.assertEqual((12.0, True), self.res._scaled_pct(20, 1900 * 1024, 20))
+        self.assertEqual((16.0, True), self.res._scaled_pct(20, 4096 * 1024, 20))
+        self.assertEqual((20.0, True),
+                         self.res._scaled_pct(20, 65536 * 1024, 20))
+        self.assertEqual((25.0, False),
+                         self.res._scaled_pct(25, 1900 * 1024, 20),
+                         "操作者显式写下的阈值绝不被改写")
+
+
+class TestBusyIsNotTheSameAsSuspicious(unittest.TestCase):
+    """A build, a test run and a scanner are all pinned at 100% by design.
+
+    "CPU >= 80%" is not a suspicious characteristic, and reporting it as one is
+    what made `process_anomaly` the second-largest source of false alerts.
+    The downgrade needs structural evidence -- a unit, a package-managed
+    binary, a terminal, or an operator-declared work directory -- and never
+    the process's name.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import procresponse
+        self.pr = procresponse
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def _rt(self, unit="", exe="/usr/local/bin/buildtool", tty=False, ppid=1,
+            parent_comm=""):
+        procs = {
+            500: {"pid": 500, "exe": exe, "exe_deleted": False, "ppid": ppid,
+                  "cmdline": exe, "comm": os.path.basename(exe),
+                  "start_time": 1.0, "unit": unit, "exe_dev": 1, "exe_ino": 1,
+                  "ns": "/proc/1/ns/pid"},
+            ppid: {"pid": ppid, "exe": "/usr/local/bin/" + (parent_comm or "init"),
+                   "exe_deleted": False, "ppid": 1,
+                   "cmdline": parent_comm or "/sbin/init",
+                   "comm": parent_comm or "systemd", "start_time": 0.5,
+                   "unit": "", "exe_dev": 1, "exe_ino": 2,
+                   "ns": "/proc/1/ns/pid"},
+        }
+        return self.pr.Runtime(
+            cfg=self.cfg, proc_info=lambda pid: dict(procs.get(int(pid)) or {}),
+            connections=lambda pid: [], cgroup_unit=lambda pid: unit,
+            start_time=lambda pid: 1.0, is_automation=lambda pid, e: "",
+            signal_fn=lambda pid, sig: (True, ""), now=lambda: 1.0,
+            pid_namespace=lambda pid: "/proc/1/ns/pid",
+            has_tty=lambda pid: bool(tty))
+
+    def test_a_build_in_a_declared_directory_is_downgraded(self):
+        self.cfg.set("checks.process_anomaly.build_dirs", ["/srv/app/build"])
+        why = self.pr.runtime_downgrade(
+            500, "buildtool", "/usr/local/bin/buildtool -C /srv/app/build all",
+            self._rt(), self.cfg)
+        self.assertTrue(why)
+        self.assertIn("/srv/app/build", why)
+
+    def test_a_front_ground_job_with_a_terminal_is_downgraded(self):
+        why = self.pr.runtime_downgrade(
+            500, "buildtool", "/usr/local/bin/buildtool all",
+            self._rt(tty=True), self.cfg)
+        self.assertIn("控制终端", why)
+
+    def test_a_child_of_a_shell_is_downgraded(self):
+        why = self.pr.runtime_downgrade(
+            500, "buildtool", "/usr/local/bin/buildtool -j4",
+            self._rt(ppid=900, parent_comm="bash"), self.cfg)
+        self.assertIn("交互式 shell", why)
+
+    def test_an_unattributed_high_cpu_process_is_still_reported(self):
+        """No unit, no package, no tty, no declared directory -> report it."""
+        why = self.pr.runtime_downgrade(
+            500, "mine", "", self._rt(exe="/tmp/mine"), self.cfg)
+        self.assertEqual("", why, "没有结构性依据就不能降级")
+
+    def test_a_daemonised_payload_does_not_inherit_a_shell_downgrade(self):
+        """`payload &` is reparented to init and keeps no terminal.
+
+        This is the bypass the shell test would have created if it were
+        recursive ("the parent is a real program, so the child is fine").
+        """
+        why = self.pr.runtime_downgrade(
+            500, "mine", "", self._rt(exe="/tmp/mine", ppid=1,
+                                      parent_comm="systemd"), self.cfg)
+        self.assertEqual("", why)
+
+    def test_empty_or_broad_build_dirs_are_ignored(self):
+        for bad in ("", "/", "/root", "/home/user", "/etc"):
+            self.assertFalse(self.pr._usable_root(bad),
+                             "%r 不该被当作构建目录" % bad)
+        self.assertTrue(self.pr._usable_root("/srv/app"))
+        self.assertTrue(self.pr._usable_root("/home/user/project"))
+
+    def test_pid_one_is_never_downgraded(self):
+        """`init.scope` must not read like an ordinary unit."""
+        self.assertEqual("", self.pr.runtime_downgrade(
+            1, "systemd", "/sbin/init", self._rt(unit="init.scope"), self.cfg))
+
+    def test_the_check_says_what_it_downgraded_and_why(self):
+        from vigil.guards.checks import base, process
+        # A fake `ps` with one hot process that has no structural owner: it
+        # must still be reported, which is the invariant this test protects.
+        real_run = process.shell.run
+        real_have = process.shell.have
+        process.shell.have = lambda name: False
+        process.shell.run = lambda argv, **kw: (
+            (True, " 99.0  1.0  500 root mine\n", "")
+            if argv and argv[0] == "ps" else (True, "", ""))
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            res = process.ProcessAnomaly().safe_run(ctx)
+        finally:
+            process.shell.run = real_run
+            process.shell.have = real_have
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("500", res.detail)
 
 
 if __name__ == "__main__":

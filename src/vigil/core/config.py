@@ -407,7 +407,17 @@ DEFAULTS: dict = {
         "enabled": True,
         "interval": 120,
         "cpu": {"warn": 85, "crit": 95, "sustain": 3},
-        "memory": {"warn_available_pct": 20, "crit_available_pct": 10},
+        # 内存阈值同时看**比例**与**绝对量**。
+        #
+        # 只看比例在小内存机器上是常态误报：一台总内存 2 GB 的机器在做一次
+        # 构建时，可用内存很容易掉到 20% 以下，而那台机器一切正常。所以比例
+        # 之外还要「可用内存绝对值低于下限」同时成立才报；若整机可用内存本身
+        # 就高于 warn_available_mb，无论百分比多低都不报。
+        #
+        # 下限默认按总内存缩放（见 checks/resource.py::_memory_floor_mb），
+        # 也可以在这里显式写死覆盖。
+        "memory": {"warn_available_pct": 20, "crit_available_pct": 10,
+                   "warn_available_mb": 0, "crit_available_mb": 0},
         "swap": {"warn_pct": 50, "crit_pct": 80},
         "disk": {"warn_pct": 80, "crit_pct": 90, "paths": ["/"]},
         "inode": {"warn_pct": 80, "crit_pct": 90},
@@ -434,7 +444,12 @@ DEFAULTS: dict = {
                             # built-in set that already covers this project's
                             # own daemons. See BUILTIN_WHITELIST in
                             # guards/checks/process.py.
-                            "whitelist": []},
+                            "whitelist": [],
+                            # 构建/测试目录：命令行指向这里的进程自动降级，
+                            # 因为「正在编译」「正在跑测试」必然高 CPU。
+                            # 空表示只用站点根目录与结构判据（见
+                            # guards/checks/procresponse.py::runtime_downgrade）。
+                            "build_dirs": []},
         "site_availability": {"domain": "", "port": 443, "warn_5xx_pct": 5,
                               "crit_5xx_pct": 20, "log_lines": 200},
         "web_content": {"min_score": 4, "root_thresholds": {},

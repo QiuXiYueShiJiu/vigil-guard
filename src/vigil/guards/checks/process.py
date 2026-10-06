@@ -22,6 +22,52 @@ from ...core import shell
 #: HTTP codes that still mean "the site answered".
 _HEALTHY_CODES = ("200", "204", "301", "302", "303", "307", "308")
 
+#: Codes a site with a login gate is *supposed* to answer with. The gate is
+#: this program's own front door: an unauthenticated request to a protected
+#: path is meant to be challenged (401/403) or redirected to the verification
+#: page (3xx). Reading those as "the site is broken" produced the single most
+#: frequent false alert this project has had -- one every ~31 minutes for more
+#: than a day, on a site that was working exactly as designed.
+_GATE_CODES = ("401", "403")
+
+#: Codes that are a real outage no matter what is in front of the site. A gate
+#: that cannot serve its own verification page is not protecting anything.
+_FAILURE_CODES = ("500", "501", "502", "503", "504", "505", "507", "508")
+
+
+def gate_for_site(cfg, domain: str) -> dict:
+    """Is *domain* behind one of this program's own login gates?
+
+    Read from the live configuration, not from a list: this program installed
+    the gate, so it knows which site it guards and what path the challenge
+    lives at. That is what makes the availability judgement a *joint* one --
+    "this site answers 401" means something entirely different depending on
+    whether a gate was deliberately placed in front of it.
+
+    Matching is exact on the configured ``domain`` / ``server_name`` (and the
+    reverse, so a config written with a wildcard still matches a concrete
+    probe), because a suffix match would let one site's gate explain another
+    site's outage.
+    """
+    if not domain:
+        return {}
+    want = str(domain).strip().lower().rstrip(".")
+    for section in ("bt_panel", "dsh_gate"):
+        if not cfg.get("gate.%s.enabled" % section, False):
+            continue
+        for key in ("domain", "server_name"):
+            value = str(cfg.get("gate.%s.%s" % (section, key), "") or "")
+            for name in value.split():
+                name = name.strip().lower().rstrip(".")
+                if name and name == want and name not in ("_", ""):
+                    return {"section": section,
+                            "entry": str(cfg.get("gate.%s.entry_path"
+                                                 % section, "") or ""),
+                            "kind": str(cfg.get("gate.%s.kind" % section,
+                                                section)),
+                            "matched": "%s.%s" % (section, key)}
+    return {}
+
 
 def _proc_count() -> int:
     try:
@@ -405,14 +451,19 @@ class SiteAvailability(Check):
         if not domain:
             return CheckResult(OK, "未配置站点域名（checks.site_availability.domain 或 "
                                    "gate.*.domain），跳过网站可用性检查")
+        gate = gate_for_site(ctx.cfg, domain)
 
         problems = []
         status = OK
+        # Set inside the status branch below when the site is gated and the
+        # challenge is the designed answer. Initialised here so the success
+        # paths can mention it without a `locals()` lookup.
+        gate_note = ""
+        code = ""
 
         if not shell.have("curl"):
             problems.append("未安装 curl，无法探测站点 HTTP 状态")
             status = WARN
-            code = ""
         else:
             try:
                 port = int(ctx.copt("site_availability", "port", 443) or 443)
@@ -427,17 +478,35 @@ class SiteAvailability(Check):
                  "%s://%s/" % (scheme, domain)], timeout=12)
             code = (out or "").strip() if ok else ""
             if not code or code == "000":
+                # A gate does not change this: if nothing answers, the site is
+                # down, whatever is supposed to be in front of it.
                 status = CRIT
                 problems.append("站点首页无响应（%s://%s/ 返回 %s）—— 站点可能已宕机，"
                                 "请检查 nginx 与 PHP-FPM/数据库"
                                 % (scheme, domain, code or "无响应"))
-            elif code.startswith("5"):
+            elif code in _FAILURE_CODES or code.startswith("5"):
+                # Also unchanged by a gate, and this is the distinction that
+                # keeps the exemption honest: a gate that cannot serve its own
+                # challenge is a broken gate, which is *more* alarming than a
+                # broken site -- the protected thing is exposed while looking
+                # protected. So a 5xx from a gated site is still CRIT.
                 status = CRIT
-                problems.append("站点首页返回 **HTTP %s**，后端服务可能已崩溃" % code)
+                problems.append(
+                    "站点首页返回 **HTTP %s**%s，后端服务可能已崩溃"
+                    % (code, "（该站点有登录闸门，但连验证页都打不开）"
+                       if gate else ""))
+            elif gate and code in _GATE_CODES:
+                # The designed answer from a gated path.
+                gate_note = "站点有登录闸门（%s），401/403 是设计行为" % (
+                    gate.get("matched") or gate.get("section"))
+            elif gate and code in _HEALTHY_CODES and code.startswith("3"):
+                gate_note = ("站点有登录闸门（%s），跳转到验证页是设计行为"
+                             % (gate.get("matched") or gate.get("section")))
             elif code not in _HEALTHY_CODES:
                 if status == OK:
                     status = WARN
-                problems.append("站点首页返回异常 HTTP %s（期望 200/3xx）" % code)
+                problems.append("站点首页返回异常 HTTP %s（期望 200/3xx%s）"
+                                % (code, "，或闸门的 401/403" if gate else ""))
 
         # 5xx ratio from the tail of the first nginx access log we know about.
         logs = list((ctx.env.get("log_sources") or {}).get("nginx_access") or [])
@@ -462,9 +531,12 @@ class SiteAvailability(Check):
 
         if problems:
             return CheckResult(status, "\n     ".join(problems))
+        suffix = ("；%s" % gate_note) if gate_note else ""
         if ratio_note:
-            return CheckResult(OK, "网站正常（HTTP %s）；%s" % (code, ratio_note))
-        return CheckResult(OK, "网站正常（HTTP %s，未找到可统计的访问日志）" % code)
+            return CheckResult(OK, "网站正常（HTTP %s）%s；%s"
+                               % (code, suffix, ratio_note))
+        return CheckResult(OK, "网站正常（HTTP %s%s，未找到可统计的访问日志）"
+                           % (code, "，" + gate_note if gate_note else ""))
 
     @staticmethod
     def _tail_codes(path, want: int) -> list:
