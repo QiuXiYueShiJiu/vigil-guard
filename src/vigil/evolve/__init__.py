@@ -665,7 +665,8 @@ def watchdog(cfg=None, log=None) -> dict:
         findings.append(("info", "自修正循环当前无法开工：%s" % reason))
 
     hard = [f for f in findings if f[0] == "crit"]
-    stamped = ledger.record("watchdog", findings=[f[0] for f in findings],
+    stamped = ledger.record("watchdog", cfg=cfg,
+                            findings=[f[0] for f in findings],
                             adopted=adopted_n, entries=len(entries))
     if hard:
         report_mod.mail(cfg, "自修正循环异常：%s" % hard[0][1],

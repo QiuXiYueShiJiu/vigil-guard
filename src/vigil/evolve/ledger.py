@@ -46,6 +46,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import shutil
 import time
@@ -85,35 +86,93 @@ _CHAIN_FIELDS = ("mac", "prev", "written")
 
 
 def _mac_key(cfg=None) -> bytes:
-    """The HMAC secret, created on first use and kept in ``secrets.json``.
+    """The HMAC secret, created on first use.
 
-    Creation is lazy rather than instal-time so an existing installation
-    starts chaining with its next write, without a migration step that could
-    itself be interrupted. The key is never returned to a caller that might
-    log it -- only into the MAC functions below.
+    Two homes, tried in order, because the chain must work everywhere:
+
+    1. ``evolve.ledger_mac_key`` in ``secrets.json`` (mode 0600). The name
+       contains "key", so ``core.config._is_secret`` routes it there rather
+       than into ``config.json``, and it is outside the repository. This is
+       the preferred home;
+    2. ``state/ledger-key`` beside the ledger, created mode 0600. This is the
+       fallback for the case the first one cannot serve -- no ``Config`` in
+       hand (the daemon writes records from several code paths), or a
+       relocated state directory in a test. It is *not* a weaker secret: the
+       threat the MAC answers is "somebody appended a record that looks
+       legitimate", and that somebody can already read the ledger this key
+       sits next to. What would be weaker is an *absent* key, where a record
+       silently stops being verifiable -- which is exactly how the first
+       version of this failed on a host whose ``/etc/vigil`` did not yet
+       exist.
+
+    Creation is lazy rather than install-time so an existing installation
+    starts chaining with its next write, with no migration step that could
+    itself be interrupted.
     """
-    if cfg is None:
+    if cfg is not None:
         try:
-            from ..core.config import load as load_config
-            cfg = load_config()
+            stored = str(cfg.get(MAC_KEY_PATH, "") or "")
         except Exception:                                   # noqa: BLE001
-            return b""
-    try:
-        stored = str(cfg.get(MAC_KEY_PATH, "") or "")
-    except Exception:                                       # noqa: BLE001
-        return b""
-    if len(stored) >= 32:
-        return stored.encode("utf-8")
+            stored = ""
+        if len(stored) >= 32:
+            return stored.encode("utf-8")
+    # Nothing in the config (or no config in hand). Read the state file
+    # *before* generating, so the writer and the verifier agree: getting this
+    # order wrong made every `record()` mint a fresh key, and every
+    # `verify()` compare against a different one -- the chain looked broken on
+    # every single run, which is how a tamper check like this gets switched
+    # off.
+    existing = _read_state_key()
+    if existing:
+        return existing
     fresh = secrets.token_hex(32)
+    if _write_secret_file(LEDGER.parent / "ledger-key", fresh):
+        return fresh.encode("utf-8")
+    if cfg is None:
+        return b""
     try:
         cfg.set(MAC_KEY_PATH, fresh)
         cfg.save()
+        return fresh.encode("utf-8")
     except Exception:                                       # noqa: BLE001
-        # Cannot persist a key -> do not invent an unverifiable one. A record
-        # without a MAC is honest; a record with a MAC nobody can check is
-        # worse than none, because it looks verified.
         return b""
-    return fresh.encode("utf-8")
+
+
+def _read_state_key() -> bytes:
+    """The fallback key from ``state/ledger-key``, or ``b""``."""
+    path = LEDGER.parent / "ledger-key"
+    try:
+        if path.is_file():
+            stored = path.read_text(encoding="utf-8").strip()
+            return stored.encode("utf-8") if len(stored) >= 32 else b""
+    except OSError:
+        return b""
+    return b""
+
+
+def _write_secret_file(path, value: str) -> bool:
+    """Write *value* to *path* with 0600, atomically. False on any failure."""
+    import tempfile
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".key-",
+                                   suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(value)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 def _canonical(entry: dict) -> bytes:
@@ -186,11 +245,22 @@ def record(kind: str, cfg=None, **fields) -> dict:
         prev = _last_mac()
         key = _mac_key(cfg)
         mac = compute_mac(entry, prev, key)
+    except Exception:                                       # noqa: BLE001
+        mac = ""
+        prev = ""
+    if mac:
         entry["prev"] = prev
         entry["mac"] = mac
-    except Exception:                                       # noqa: BLE001
-        entry["prev"] = ""
-        entry["mac"] = ""
+    else:
+        # No key: write the record in the *pre-HMAC shape* -- no `mac` and no
+        # `prev` at all. Not `"mac": ""`, which would be indistinguishable
+        # from a record whose signature was stripped, and would make every
+        # later verification call "tampering" on a host that had simply not
+        # created its key yet. An unchained old-format record is honest: it
+        # says "this one predates the chain and proves nothing", which is the
+        # truth, and it is why the chain may only be *added* to.
+        entry.pop("mac", None)
+        entry.pop("prev", None)
     try:
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with open(LEDGER, "a", encoding="utf-8") as fh:
@@ -270,24 +340,39 @@ def verify(limit: int = 200, cfg=None) -> dict:
             out["break_reason"] = "第 %d 行不是合法的 JSON —— 台账被截断或改写" % index
             return out
         out["checked"] += 1
-        mac = str(entry.get("mac") or "")
+        mac = entry.get("mac")
         recorded_prev = str(entry.get("prev") or "")
+        if mac is not None and not str(mac).strip():
+            # An explicit empty MAC is unambiguous: `record()` either writes a
+            # real one or leaves the field out entirely, so a present-but-empty
+            # value is a signature that was stripped. That is the narrow case
+            # this check *can* catch, and it costs nothing to catch it.
+            out["ok"] = False
+            out["break_at"] = index
+            out["break_kind"] = "stripped"
+            out["break_reason"] = (
+                "第 %d 行（kind=%s, ts=%s）的 mac 字段存在但为空 —— "
+                "本程序不会写出这种记录，说明签名被人抹掉了"
+                % (index, entry.get("kind"), entry.get("ts")))
+            return out
         if not mac:
-            if seen_any:
-                # A chained history followed by an unchained record. This is
-                # how a forged line looks: appended by something that could
-                # not produce a MAC.
-                out["ok"] = False
-                out["break_at"] = index
-                out["break_kind"] = "unchained-after-chain"
-                out["break_reason"] = (
-                    "第 %d 行（kind=%s, ts=%s）没有 MAC，却出现在已加链的记录之后 "
-                    "—— 该记录无法由本程序的密钥产生，台账自此处起不可信"
-                    % (index, entry.get("kind"), entry.get("ts")))
-                return out
+            # An unchained record is *legacy*, wherever it sits in the file --
+            # every version before this one wrote exactly this shape, and a
+            # host that has been running for a while has thousands of them
+            # interleaved with new chained records (the daemon writes while an
+            # operator runs the CLI). Treating "unchained after chained" as
+            # forgery would therefore fire on every upgrade, which is how a
+            # tamper check becomes something people turn off.
+            #
+            # The honest limit, stated here rather than implied: the chain
+            # proves that no **chained** record has been altered, deleted or
+            # reordered *relative to the next chained record*. It cannot prove
+            # that an unchained line was not appended, because the whole point
+            # of the MAC is that an appended line cannot be made to look
+            # chained. Records that cannot vouch for themselves are counted
+            # and never used to excuse a change (see `attribute`).
             out["legacy"] += 1
             out["entries"].append(entry)
-            prev = ""
             continue
 
         seen_any = True

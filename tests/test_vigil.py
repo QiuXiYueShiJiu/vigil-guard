@@ -8016,16 +8016,23 @@ class TestUpgradeSafety(unittest.TestCase):
 
     def setUp(self):
         from vigil.core import installer as inst
+        from vigil.evolve import ledger
         self.inst = inst
+        self.ledger = ledger
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
-        self.saved = (inst.paths.LIB, inst.paths.BIN)
+        self.saved = (inst.paths.LIB, inst.paths.BIN, ledger.LEDGER)
         inst.paths.LIB = self.root / "lib"
         inst.paths.BIN = self.root / "bin" / "vigil"
         inst.DEPLOY_STATE = self.root / "state" / "deploy.json"
+        # `_record_deploy` also appends to the audit ledger. A rehearsal
+        # deploy must not land in the real one, or "the code changed because
+        # the program was upgraded" accumulates entries about temporary trees.
+        ledger.LEDGER = self.root / "state" / "evolve-ledger.jsonl"
 
     def tearDown(self):
-        (self.inst.paths.LIB, self.inst.paths.BIN) = self.saved
+        (self.inst.paths.LIB, self.inst.paths.BIN,
+         self.ledger.LEDGER) = self.saved
         self.tmp.cleanup()
 
     def _tree(self, name, version, body="VALUE = 1\n"):
@@ -9434,17 +9441,37 @@ class TestEvolveLedgerChain(unittest.TestCase):
         self.assertIn("改写过", verdict["break_reason"])
 
     def test_a_forged_line_appended_by_an_attacker_is_rejected(self):
-        """The attack this exists for: append "I changed it" and walk away."""
+        """The attack this exists for: append "I changed it" and walk away.
+
+        The attacker can read the ledger and can copy a `prev` value, but
+        cannot produce a MAC over their own record without the key -- so the
+        line they append must fail verification, and the check must say which
+        line it was.
+        """
         self.ledger.record("applied", cfg=self.cfg, path="/a")
+        rows = self._raw()
         forged = {"ts": time.time(), "kind": "code-edited",
-                  "file": "src/vigil/guards/decoy.py",
-                  "after": "0" * 64, "prev": "", "mac": ""}
+                  "file": "src/vigil/guards/decoy.py", "after": "0" * 64,
+                  "prev": rows[-1]["mac"], "mac": "f" * 64}
         with open(self.ledger.LEDGER, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(forged) + "\n")
         verdict = self.ledger.verify(cfg=self.cfg)
         self.assertFalse(verdict["ok"], "伪造记录必须让整条链失效")
-        self.assertEqual(2, verdict["break_at"])
-        self.assertEqual("unchained-after-chain", verdict["break_kind"])
+        self.assertEqual(2, verdict["break_at"], "必须指出伪造的是第几条")
+        self.assertEqual("mac", verdict["break_kind"])
+        entries, _v = self.ledger.verified(cfg=self.cfg)
+        self.assertEqual([], entries)
+
+    def test_a_record_whose_signature_was_stripped_is_rejected(self):
+        """`record()` never writes an empty mac, so one means tampering."""
+        self.ledger.record("applied", cfg=self.cfg, path="/a")
+        rows = self._raw()
+        rows[-1]["mac"] = ""
+        self._write(*[json.dumps(r, ensure_ascii=False) for r in rows])
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual("stripped", verdict["break_kind"])
+        self.assertIn("抹掉", verdict["break_reason"])
 
     def test_deleting_a_middle_line_breaks_the_link(self):
         self.ledger.record("applied", cfg=self.cfg, path="/a")
@@ -9467,11 +9494,33 @@ class TestEvolveLedgerChain(unittest.TestCase):
         self.assertFalse(verdict["ok"])
 
     def test_legacy_lines_without_a_mac_are_not_a_break(self):
-        """History that predates the feature must not read as tampering."""
+        """History that predates the feature must not read as tampering.
+
+        Records written before the chain existed have no ``mac`` field at all.
+        They prove nothing -- and `attribute` never uses them to excuse a
+        change -- but reading them as forgery would fire on every upgrade,
+        because the daemon and the CLI write to this file concurrently and a
+        host has thousands of them.
+        """
         self._write(json.dumps({"ts": 1.0, "kind": "applied", "path": "/old"}))
         verdict = self.ledger.verify(cfg=self.cfg)
         self.assertTrue(verdict["ok"])
         self.assertEqual(1, verdict["legacy"])
+
+    def test_unchained_records_interleaved_with_chained_ones_do_not_break(self):
+        """The real shape on an upgraded host, not the tidy one."""
+        self.ledger.record("applied", cfg=self.cfg, path="/a")
+        lines = [ln for ln in
+                 self.ledger.LEDGER.read_text(encoding="utf-8").splitlines()
+                 if ln.strip()]
+        self._write(json.dumps({"ts": 0.5, "kind": "applied", "path": "/old"}),
+                    lines[0],
+                    json.dumps({"ts": 0.6, "kind": "applied", "path": "/old2"}))
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertTrue(verdict["ok"], verdict.get("break_reason"))
+        self.assertEqual(2, verdict["legacy"])
+        self.assertEqual(1, len([e for e in verdict["entries"]
+                                 if e.get("mac")]))
 
 
 class TestAttributionOfSelfModification(unittest.TestCase):
@@ -9795,6 +9844,28 @@ class TestGeneratedArtifactAutoRecovery(unittest.TestCase):
         self.assertIn("a", text)
 
 
+def _isolate_autoresponse_ledgers(case, root):
+    """Point every ledger `procresponse` writes to at *root*.
+
+    `procresponse.record()` writes its own append-only file **and** mirrors the
+    entry into `evolve.ledger`. Patching only the first one left the mirror
+    writing into the real state directory: a test run added over a thousand
+    `autoresponse-*` entries to the production ledger on the machine this was
+    written on. Both paths are redirected here, and both are restored by the
+    caller.
+    """
+    from vigil.evolve import ledger as evolve_ledger
+    from vigil.guards.checks import procresponse
+    saved = (procresponse.LEDGER, evolve_ledger.LEDGER)
+    procresponse.LEDGER = root / "autoresponse.jsonl"
+    evolve_ledger.LEDGER = root / "evolve-ledger.jsonl"
+
+    def restore():
+        procresponse.LEDGER, evolve_ledger.LEDGER = saved
+    case.addCleanup(restore)
+    return saved
+
+
 class TestSuspiciousProcessAutoResponse(unittest.TestCase):
     """The guards, not the feature, are what these tests are about.
 
@@ -9814,17 +9885,12 @@ class TestSuspiciousProcessAutoResponse(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.cfg = vconfig.Config(path=self.root / "c.json",
                                   secrets_path=self.root / "s.json")
-        self._saved_ledger = procresponse.LEDGER
-        procresponse.LEDGER = self.root / "autoresponse.jsonl"
-        self.addCleanup(self._restore)
+        self._saved_ledger = _isolate_autoresponse_ledgers(self, self.root)
         self.now = [1000.0]
         self.signals = []
         self.procs = {}
         self.conns = {}
         self.units = {}
-
-    def _restore(self):
-        self.pr.LEDGER = self._saved_ledger
 
     # -- the fictional host ------------------------------------------------
     def add(self, pid, exe="/tmp/payload", deleted=True, comm="payload",
@@ -10256,6 +10322,10 @@ class TestAutoresponseStateIsNotLost(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+        # `cmd_resume` writes through `procresponse.record`, which also mirrors
+        # into the evolve ledger. Both are redirected here so a CLI test
+        # cannot append to the real state directory.
+        self._saved = _isolate_autoresponse_ledgers(self, self.root)
 
     def test_settings_clamps_a_typo_in_the_action(self):
         from vigil.guards.checks import procresponse
@@ -10285,9 +10355,14 @@ class TestAutoresponseStateIsNotLost(unittest.TestCase):
             "exe": "/tmp/payload", "at": time.time()}}, "observing": {}}}
         real_read, real_write = cmd.read_json, cmd.write_json
         real_runtime = procresponse.Runtime
+        real_state_path = cmd._state_path
         store = dict(state)
         cmd.read_json = lambda *a, **k: store
         cmd.write_json = lambda *a, **k: True
+        # The state file the command persists to is the *check's* state, which
+        # lives in the real state directory. It is redirected here as well --
+        # `cmd_resume` must not rewrite the running daemon's health.json.
+        cmd._state_path = lambda: self.root / "health.json"
         procresponse.Runtime = lambda **k: type("R", (), {
             "proc_info": lambda self, pid: {},
             "signal": lambda self, pid, sig: (sent.append((pid, sig)),
@@ -10303,6 +10378,7 @@ class TestAutoresponseStateIsNotLost(unittest.TestCase):
         finally:
             cmd.read_json, cmd.write_json = real_read, real_write
             procresponse.Runtime = real_runtime
+            cmd._state_path = real_state_path
         self.assertEqual(0, rc)
         self.assertEqual([(4242, int(signal.SIGCONT))], sent)
         self.assertEqual({}, store[procresponse.STATE_KEY]["stopped"])
@@ -10328,14 +10404,9 @@ class TestAutomationVerdictsAreAutomaticAndRecorded(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.cfg = vconfig.Config(path=self.root / "c.json",
                                   secrets_path=self.root / "s.json")
-        self._saved = procresponse.LEDGER
-        procresponse.LEDGER = self.root / "autoresponse.jsonl"
-        self.addCleanup(self._restore)
+        self._saved = _isolate_autoresponse_ledgers(self, self.root)
         self.procs = {}
         self.conns = {}
-
-    def _restore(self):
-        self.pr.LEDGER = self._saved
 
     def _bundle(self, *parts):
         return os.path.join(tempfile.gettempdir(), "vigil-probe", *parts)

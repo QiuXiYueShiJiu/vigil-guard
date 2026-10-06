@@ -92,6 +92,21 @@ def _is_default(cfg, dotted: str, default) -> bool:
     return cur in (default, "", None, [], {})
 
 
+def _is_installed_tree(pkg) -> bool:
+    """Is *pkg* the tree this program actually runs from?
+
+    Compared against ``paths.LIB``, the configured install root -- not a
+    hardcoded path, so a relocated install still works. Anything else is a
+    copy: an operator staging a release, a packaging run, or a test that made
+    a temporary tree and called the installer.
+    """
+    try:
+        return os.path.abspath(str(pkg)).startswith(
+            os.path.abspath(str(paths.LIB)) + os.sep)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 class Installer:
     def __init__(self, cfg: Config = None, log=None, dry_run: bool = False):
         self.cfg = cfg or Config()
@@ -830,10 +845,18 @@ class Installer:
         # source of truth for `vigil rollback`.
         try:
             from ..evolve import ledger as _ledger
-            _ledger.record("deployed", cfg=self.cfg, file=str(pkg),
-                           version=rec["current"],
-                           previous=rec["previous"],
-                           rollback_available=rec["rollback_available"])
+            # Only a deploy of the *installed* tree is a deployment of this
+            # program. A tree somewhere else -- a staging copy, a packaging
+            # run, a test's temporary "installed" directory -- records into
+            # ``deploy.json`` (which is what `vigil rollback` reads) but must
+            # not append to the audit ledger: that ledger answers "did this
+            # program's own code change because it was upgraded", and a
+            # rehearsal is not an upgrade.
+            if _is_installed_tree(pkg):
+                _ledger.record("deployed", cfg=self.cfg, file=str(pkg),
+                               version=rec["current"],
+                               previous=rec["previous"],
+                               rollback_available=rec["rollback_available"])
         except Exception as exc:                            # noqa: BLE001
             # Reported, not swallowed: `self_integrity` reads this ledger to
             # tell an upgrade apart from an intrusion, so a silent failure
