@@ -6378,6 +6378,267 @@ class TestAcknowledgement(unittest.TestCase):
         self.assertIn(loud[0]["id"], acks)
 
 
+class TestAlertHysteresisAndRenotify(unittest.TestCase):
+    """抖动不该每次都发信；持续异常一次都不能漏。
+
+    真实日志里同一台机器反复出现「异常 → 已恢复 → 异常」，每次转换一封
+    邮件；另有一个持续一天多的误报每 30 分钟重复一封，共 50 多封。前者
+    要迟滞，后者要重复提醒间隔。两个都用假时钟把整套 :func:`run_once`
+    跑起来验证 —— 靠 sleep 十分钟来证明「它保持安静」的测试没人会跑。
+    """
+
+    def setUp(self):
+        from vigil.guards import health as health_mod
+        from vigil.guards.checks import base as cbase
+        self.h = health_mod
+        self.cbase = cbase
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=base / "config.json",
+                                  secrets_path=base / "secrets.json")
+        # 用 "all" 让告警策略只剩迟滞/重复提醒两件事，不受 attacks 过滤干扰。
+        self.cfg.set("alerts.mode", "all")
+        self.store = {"status": {}}
+        self.sent, self.recovered = [], []
+        self.holders = {}
+        self._checks = []
+        self._patched = []
+        self._patch(health_mod, "load_state", lambda: self.store)
+        self._patch(health_mod, "save_state",
+                    lambda s: self.store.update(s) or True)
+        self._patch(health_mod, "_env_cached", lambda *a, **k: {})
+        self._patch(health_mod, "write_json", lambda *a, **k: True)
+        self._patch(health_mod, "_notify_problems",
+                    lambda cfg, result, log, items=None:
+                    self.sent.append(sorted(p["id"] for p in (items or []))))
+        self._patch(health_mod, "_notify_recoveries",
+                    lambda cfg, result, log, items=None:
+                    self.recovered.append(sorted(r["id"] for r in
+                                                 (items or []))))
+        self._patch(cbase, "all_checks", lambda: list(self._checks))
+        self.add_probe("probe")
+
+    def tearDown(self):
+        for obj, name, old in reversed(self._patched):
+            setattr(obj, name, old)
+        self.tmp.cleanup()
+
+    def _patch(self, obj, name, value):
+        self._patched.append((obj, name, getattr(obj, name)))
+        setattr(obj, name, value)
+
+    def add_probe(self, check_id):
+        """Register a fake check driven by ``self.holders[check_id]``."""
+        from vigil.guards.checks import base as cbase
+        holder = {"status": "OK", "detail": ""}
+        self.holders[check_id] = holder
+
+        class _Fake(cbase.Check):
+            id = check_id
+            label = check_id
+            label_en = check_id
+            group = cbase.G_SECURITY
+            enabled_by_default = True
+
+            def run(self, ctx):
+                return cbase.CheckResult(holder["status"], holder["detail"])
+        self._checks.append(_Fake)
+        return holder
+
+    def _run(self, now):
+        return self.h.run_once(self.cfg, _QuietLog(), notify=True, now=now)
+
+    # -- 迟滞 -------------------------------------------------------------
+
+    def test_a_flap_alerts_once_and_a_persistent_problem_still_alerts(self):
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        first = self._run(1000)
+        self.assertEqual([["probe"]], self.sent)
+        self.assertTrue(first["problems"][0]["notify"])
+        # 恢复：不发「已恢复」，因为状态可能还在抖。
+        probe["status"] = "OK"
+        self._run(1100)
+        self.assertEqual([], self.recovered)
+        # 抖动回来：不重复告警，但异常仍然在案，`vigil health` 看得到。
+        probe["status"] = "CRIT"
+        flap = self._run(1200)
+        self.assertEqual([["probe"]], self.sent, "刚恢复又坏不该重复告警")
+        self.assertEqual(1, len(flap["problems"]),
+                         "抖动期的异常必须仍然被记录，不能从结果里消失")
+        self.assertFalse(flap["problems"][0]["notify"])
+        # 静默期内每轮都不发，也仍然在案。
+        mid = self._run(1500)
+        self.assertEqual([["probe"]], self.sent)
+        self.assertEqual(1, len(mid["problems"]))
+        self.assertEqual([], self.recovered)
+        # 静默期结束、异常还在 —— 必须照常告警。
+        self._run(1800)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "静默期结束后仍然存在的异常必须照常告警")
+
+    def test_recovery_notice_waits_until_the_state_is_stable(self):
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        self._run(60000)
+        self.assertEqual([["probe"]], self.sent)
+        probe["status"] = "OK"
+        self._run(60100)
+        self._run(60500)
+        self.assertEqual([], self.recovered, "恢复通知要等状态稳定")
+        self._run(60800)
+        self.assertEqual([["probe"]], self.recovered,
+                         "稳定 600 秒后应当发一次恢复通知")
+
+    def test_a_flapping_check_reports_no_recovery_for_a_flap_it_never_alerted(self):
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        self._run(70000)
+        for i, status in enumerate(["OK", "CRIT", "OK", "CRIT", "OK"]):
+            probe["status"] = status
+            self._run(70100 + i * 100)
+        self.assertEqual([["probe"]], self.sent, "抖动只该发第一封")
+        self.assertEqual([], self.recovered,
+                         "从没为这次抖动发过告警，就不该补一封「已恢复」")
+        # 真正稳定下来之后，恢复通知才发。
+        probe["status"] = "OK"
+        self._run(71200)
+        self.assertEqual([["probe"]], self.recovered)
+
+    def test_hysteresis_can_be_switched_off(self):
+        self.cfg.set("alerts.recovery_quiet_seconds", 0)
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        self._run(80000)
+        probe["status"] = "OK"
+        self._run(80100)
+        self.assertEqual([["probe"]], self.recovered, "关闭迟滞后恢复立即发")
+        probe["status"] = "CRIT"
+        self._run(80200)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "关闭迟滞后再坏立即发")
+
+    # -- 重复提醒间隔 -----------------------------------------------------
+
+    def test_an_unchanged_problem_does_not_repeat_before_the_interval(self):
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        self._run(100000)
+        self.assertEqual([["probe"]], self.sent)
+        for i in range(1, 20):
+            self._run(100000 + i * 300)
+        self.assertEqual([["probe"]], self.sent,
+                         "未变化的持续异常不该在间隔内反复发")
+        self._run(100000 + self.h.DEFAULT_RENOTIFY + 1)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "间隔到了应当再提醒一次")
+
+    def test_detail_churn_alone_does_not_re_alert(self):
+        """CPU 百分比、PID 这类明细每轮都在变，不能拿它当「变化」。"""
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        probe["detail"] = "cpu 91%"
+        self._run(120000)
+        for i, detail in enumerate(["cpu 3%", "cpu 47%", "cpu 88%"], start=1):
+            probe["detail"] = detail
+            self._run(120000 + i * 300)
+        self.assertEqual([["probe"]], self.sent)
+
+    def test_a_new_item_inside_a_finding_alerts_immediately(self):
+        """同严重度下多了一个被动过的文件，仍然是「变了」。"""
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        probe["detail"] = "被删除: /srv/a.conf"
+        self._run(130000)
+        self.assertEqual([["probe"]], self.sent)
+        probe["detail"] = "被删除: /srv/a.conf、/srv/b.conf"
+        self._run(130300)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "异常内容变化（多了一个文件）必须立即提醒")
+
+    def test_the_fingerprint_folds_digits_but_keeps_structure(self):
+        h = self.h
+        self.assertEqual(h._detail_fp("chrome(pid 123, CPU 91%)"),
+                         h._detail_fp("chrome(pid 999, CPU 3%)"))
+        self.assertNotEqual(h._detail_fp("被删除: /srv/a.conf"),
+                            h._detail_fp("被删除: /srv/a.conf、/srv/b.conf"))
+        self.assertEqual("", h._detail_fp(None))
+
+    def test_a_new_problem_in_the_same_round_alerts_immediately(self):
+        other = self.add_probe("other")
+        self.holders["probe"]["status"] = "CRIT"
+        self._run(140000)
+        self.assertEqual([["probe"]], self.sent)
+        other["status"] = "WARN"
+        self._run(140300)
+        self.assertEqual([["probe"], ["other", "probe"]], self.sent,
+                         "新增一项异常必须立即提醒，不等间隔")
+
+    def test_a_severity_increase_alerts_immediately(self):
+        probe = self.holders["probe"]
+        probe["status"] = "WARN"
+        self._run(150000)
+        self.assertEqual([["probe"]], self.sent)
+        probe["status"] = "CRIT"
+        self._run(150300)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "严重度上升必须立即提醒，不等间隔")
+
+    def test_a_recorded_alert_is_forgotten_once_everything_recovers(self):
+        probe = self.holders["probe"]
+        probe["status"] = "CRIT"
+        self._run(160000)
+        probe["status"] = "OK"
+        self._run(160100)          # 挂起恢复
+        self._run(160800)          # 稳定，恢复通知发出并清掉指纹
+        probe["status"] = "CRIT"
+        self._run(161000)
+        self.assertEqual([["probe"], ["probe"]], self.sent,
+                         "确认恢复后再犯是一次新事件，必须立即告警")
+
+    # -- 纯函数 -----------------------------------------------------------
+
+    def test_renotify_due_says_why(self):
+        h = self.h
+        state = {}
+        due, why = h.renotify_due(state, [{"id": "x", "status": "CRIT"}],
+                                  100, 21600)
+        self.assertTrue(due)
+        self.assertEqual("首次告警", why)
+        h.remember_alert(state, [{"id": "x", "status": "CRIT"}], 100)
+        due, why = h.renotify_due(state, [{"id": "x", "status": "CRIT"}],
+                                  200, 21600)
+        self.assertFalse(due, why)
+        due, why = h.renotify_due(
+            state, [{"id": "x", "status": "CRIT"}, {"id": "y", "status": "WARN"}],
+            200, 21600)
+        self.assertTrue(due)
+        self.assertIn("新增", why)
+        due, why = h.renotify_due(state, [{"id": "x", "status": "CRIT"}],
+                                  100 + 21600, 21600)
+        self.assertTrue(due)
+        self.assertEqual("重复提醒间隔已到", why)
+        h.forget_alert(state)
+        self.assertNotIn("alert_notify", state)
+
+    def test_the_windows_are_configurable_and_default_to_the_documented_values(self):
+        h = self.h
+        self.assertEqual(600, h.DEFAULT_RECOVERY_QUIET)
+        self.assertEqual(6 * 3600, h.DEFAULT_RENOTIFY)
+        self.assertEqual(600, h.recovery_quiet_seconds(self.cfg))
+        self.assertEqual(21600, h.renotify_seconds(self.cfg))
+        self.cfg.set("alerts.recovery_quiet_seconds", 0)
+        self.assertEqual(0, h.recovery_quiet_seconds(self.cfg))
+        self.cfg.set("alerts.renotify_seconds", 7200)
+        self.assertEqual(7200, h.renotify_seconds(self.cfg))
+        # 坏值退回默认，不能让一条写错的配置把告警循环炸掉。
+        self.cfg.set("alerts.recovery_quiet_seconds", "abc")
+        self.assertEqual(600, h.recovery_quiet_seconds(self.cfg))
+        self.cfg.set("alerts.renotify_seconds", -5)
+        self.assertEqual(0, h.renotify_seconds(self.cfg))
+
+
 class TestAttackDrill(unittest.TestCase):
     """The drill's own logic, and the rails that keep it pointed inward.
 

@@ -50,6 +50,11 @@ def cmd_run(args) -> int:
                 ui.hint("可能后果: %s" % p["consequence"])
             if p.get("action"):
                 ui.hint("建议处置: %s" % p["action"])
+            if p.get("notify") is False:
+                # 迟滞静默的异常仍然显示，只是这一轮没发信 —— 不能让
+                # 「没收到邮件」和「没检出异常」看起来一样。
+                ui.note("本轮未发信：刚恢复后的抖动（%.0f 秒前恢复）"
+                        % float(p.get("quiet_for", 0) or 0))
     if recoveries:
         ui.section("已恢复")
         for r in recoveries:
