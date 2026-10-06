@@ -26,6 +26,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -6116,13 +6117,21 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
                                (9, "node", "node /srv/app/run.js"))
         self.assertTrue(got)
 
-    def test_a_bundle_started_by_a_shell_is_not_exempt(self):
-        """A shell launching a browser out of /tmp is exactly the bad shape."""
+    def test_a_bundle_started_by_a_shell_is_still_classified(self):
+        """The verdict is structural; the driver is only *named* when known.
+
+        A shell in the chain used to cancel the exemption. It no longer does,
+        because requiring a driver produced false reports on every automation
+        run (see the docstring of `util.browser_automation`). The shell is
+        still visible in the explanation, which is what the operator needs.
+        """
         exe = self._bundle("browsers", "chromium-1234",
                            "chrome-linux64", "chrome")
         got = self._with_chain(exe, (10, "chrome", exe),
                                (9, "bash", "bash -c " + exe))
-        self.assertEqual("", got)
+        self.assertTrue(got)
+        self.assertIn("浏览器发行包布局", got)
+        self.assertIn("找不到驱动它的运行时", got)
 
     def test_a_random_binary_in_a_temp_dir_is_still_suspicious(self):
         exe = self._bundle("payload")
@@ -6136,12 +6145,14 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
                                (9, "node", "node /srv/app/test.js"))
         self.assertEqual("", got, "光有文件名、没有发行布局，不算豁免")
 
-    def test_a_bundle_with_no_automation_ancestor_is_still_suspicious(self):
+    def test_a_bundle_with_no_automation_ancestor_is_still_classified(self):
+        """A reparented browser/helper is the normal case, not a red flag."""
         exe = self._bundle("browsers", "chromium-1234",
                            "chrome-linux64", "chrome")
         got = self._with_chain(exe, (10, "chrome", exe),
                                (9, "systemd", "/sbin/init"))
-        self.assertEqual("", got)
+        self.assertTrue(got)
+        self.assertIn("浏览器发行包布局", got)
 
     # -- the ancestor-chain judgement -------------------------------------
     #
@@ -6162,10 +6173,13 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
         self.assertIn("node", got, "报文要点明是哪一层运行时")
 
     def test_a_wrapper_shell_does_not_itself_become_a_runtime(self):
-        """`chrome <- bash` with no runtime above it is the shape that warns.
+        """`chrome <- bash <- sh` names no driver, and that is reported.
 
-        The point of walking the chain is to keep looking, not to trust the
-        shell: `bash -c <payload>` is how a lot of malicious bundles start.
+        A shell is deliberately not in the trusted runtime set: `bash -c
+        <payload>` is how a lot of malicious bundles start. With the verdict
+        now structural the shell no longer *cancels* the classification, but
+        it must not be mistaken for a driver either -- the explanation says
+        the runtime could not be found rather than naming `bash`.
         """
         exe = self._bundle("browsers", "chromium-1234",
                            "chrome-linux64", "chrome")
@@ -6173,15 +6187,32 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
                                (10, "chrome", exe),
                                (9, "bash", "bash -c " + exe),
                                (8, "sh", "sh -c " + exe))
-        self.assertEqual("", got, "shell 本身不得被当作受信运行时")
+        self.assertIn("找不到驱动它的运行时", got)
+        self.assertNotIn("由 bash", got)
+        self.assertNotIn("由 sh", got)
 
-    def test_a_deleted_binary_is_never_exempt_through_the_chain(self):
-        """The chain rule must not resurrect the deleted-binary exemption.
+    def test_a_deleted_binary_in_a_release_layout_is_not_reported(self):
+        """A *deleted* browser binary inside a release layout is a leftover.
 
-        `suspect_procs_detail` only asks about automation on the temp-dir
-        branch; this pins the same invariant from the other side -- a deleted
-        binary is reported as `deleted` and never carries an automation tag,
-        even when the chain looks like a bundle.
+        This reverses an earlier rule, and the reversal is deliberate. The old
+        rule said "a deleted executable is never probably fine, so the
+        automation exemption must not apply to it". On a real host that
+        produced a false alarm every time a browser release was upgraded while
+        one was running: the running process's image is unlinked by the
+        upgrade, and the check printed its single most alarming line about it
+        -- "可执行文件已被删除且磁盘上不存在".
+
+        What decides it is the structural pair -- release layout **plus** a
+        browser/helper basename -- and deliberately *not* the ancestor chain,
+        which for a leftover browser is arbitrary (crashpad helpers are
+        reparented to init by design). A memory-resident implant that deletes
+        itself does not leave its file inside
+        ``<...>/browsers/chromium-<version>/chrome-linux64/``.
+
+        Note this stays a *reporting* judgement: no signal is ever sent on the
+        strength of it. `procresponse` requires a deleted binary to be
+        accompanied by an independent live outbound connection *and* two
+        independent evidence classes before it will act.
         """
         exe = self._bundle("browsers", "chromium-1234",
                            "chrome-linux64", "chrome")
@@ -6195,16 +6226,34 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
                 cfg=None, state={}, env={}, log=_QuietLog(), now=time.time()))
         finally:
             self.util.suspect_procs_detail = real
+        self.assertEqual("OK", res.status)
+        self.assertIn("已被删除", res.detail, "降级也必须说清楚看到了什么")
+        self.assertIn("浏览器发行包布局", res.detail)
+
+    def test_a_deleted_payload_outside_a_release_layout_still_warns(self):
+        """The reversal above must not become a general self-delete amnesty."""
+        hits = [{"pid": 10, "comm": "payload",
+                 "exe": self._bundle("payload"), "kind": "deleted",
+                 "automation": ""}]
+        real = self.util.suspect_procs_detail
+        self.util.suspect_procs_detail = lambda *a, **k: hits
+        try:
+            from vigil.guards.checks import base, security
+            res = security.SuspiciousProcesses().safe_run(base.CheckContext(
+                cfg=None, state={}, env={}, log=_QuietLog(), now=time.time()))
+        finally:
+            self.util.suspect_procs_detail = real
         self.assertEqual("WARN", res.status)
         self.assertIn("已被删除", res.detail)
 
-    def test_the_runtime_must_be_within_the_depth_limit(self):
+    def test_the_driver_walk_is_bounded_but_the_verdict_is_not(self):
         """Depth is 6 frames: the process plus up to five ancestors.
 
-        Deeper than that is not walked -- deliberately. The chains automation
-        produces are two or three layers; an unbounded walk would turn a busy
-        host's /proc into a cost, and every extra layer is one more process an
-        attacker could arrange to sit above a payload it launches.
+        The walk stays bounded so a busy host's /proc cannot turn this into a
+        cost, and so an attacker cannot buy anonymity by stacking wrappers.
+        Exceeding the bound only stops the walk from *naming* the driver; the
+        structural verdict is unchanged, which is the whole point of making
+        the verdict structural.
         """
         exe = self._bundle("browsers", "chromium-1234",
                            "chrome-linux64", "chrome")
@@ -6213,16 +6262,18 @@ class TestBrowserAutomationIsNotSuspicious(unittest.TestCase):
         for i in range(4):
             at_limit.append((9 - i, "bash", "bash -c wrapper%d" % i))
         at_limit.append((5, "node", "node /srv/app/run.js"))
-        self.assertTrue(self._with_chain(exe, *at_limit),
-                        "上限之内的运行时必须能被找到")
+        got = self._with_chain(exe, *at_limit)
+        self.assertTrue(got)
+        self.assertIn("node", got, "上限之内的驱动进程必须被指名")
 
         # One layer deeper: node is now the sixth ancestor and is not seen.
         beyond = [(10, "chrome", exe)]
         for i in range(5):
             beyond.append((9 - i, "bash", "bash -c wrapper%d" % i))
         beyond.append((4, "node", "node /srv/app/run.js"))
-        self.assertEqual("", self._with_chain(exe, *beyond),
-                         "超过深度上限就不再向上找")
+        got = self._with_chain(exe, *beyond)
+        self.assertTrue(got, "结构判据不因链太深而改变")
+        self.assertIn("找不到驱动它的运行时", got, "超过深度上限就不再向上找")
 
     def _run_check(self, hits):
         from vigil.guards.checks import base, security
@@ -9191,6 +9242,1315 @@ class TestPackaging(unittest.TestCase):
         self.assertRegex(version.__version__, r"^\d+\.\d+\.\d+$")
         self.assertIn(version.__version__,
                       (ROOT / "pyproject.toml").read_text())
+
+
+class TestConfigSchemaConsistency(unittest.TestCase):
+    """Every key `vigil config` shows must be the key the code reads.
+
+    Two real defects motivated this, and they are the same defect seen from
+    two sides:
+
+    * ``threat.digest_min_items`` / ``threat.digest_max_wait`` sat in
+      ``DEFAULTS`` under ``threat`` while the daemon read
+      ``mail.digest_min_items`` and ``mail.digest_max_wait``. So the setting
+      that *worked* was invisible in `vigil config`, and the one on display
+      was read by nobody. A key that looks configurable and is not is worse
+      than a missing key, because the operator believes they changed
+      something;
+    * ``threat.bouncer.*`` and ``threat.evolve.*`` were declared under
+      ``threat`` while every reader used the top-level ``bouncer.*`` and
+      ``evolve.*``.
+
+    The first test is the general form of the invariant; the rest pin the
+    specific keys so a regression names itself.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                                  secrets_path=Path(self.tmp.name) / "s.json")
+
+    def test_schema_says_what_the_reader_says(self):
+        """`in_schema` must match what is actually in DEFAULTS, both ways."""
+        from vigil.guards import threat as threat_mod
+        daemon = threat_mod.ThreatDaemon(self.cfg, log=_QuietLog(),
+                                         dry_run=True, echo=False)
+        wrong, claimed = [], []
+        for item in daemon.settings.keys_read:
+            key = item["key"]
+            if " | " in key:
+                # `_rf` tries several spellings; each one is checked only
+                # when it is the key that actually supplied the value.
+                if item["source"] != "merged-config":
+                    continue
+            if key.startswith("detect."):
+                continue
+            present = _dotted_present(vconfig.DEFAULTS, key)
+            if not item["in_schema"] and present:
+                wrong.append(key)
+            if item["in_schema"] and not present:
+                claimed.append(key)
+        self.assertEqual([], wrong,
+                         "这些键在 DEFAULTS 里，却被标记为「不在 schema」—— "
+                         "`vigil-threatd --print-config` 会把它们列成扩展键：%s"
+                         % wrong)
+        self.assertEqual([], claimed,
+                         "这些键被标记为「在 schema」，但 DEFAULTS 里没有 —— "
+                         "`vigil config` 展示不出来，操作者改不了：%s" % claimed)
+
+    def test_digest_thresholds_live_in_mail(self):
+        self.assertIn("digest_min_items", vconfig.DEFAULTS["mail"])
+        self.assertIn("digest_max_wait", vconfig.DEFAULTS["mail"])
+        self.assertNotIn("digest_min_items", vconfig.DEFAULTS["threat"])
+        self.assertNotIn("digest_max_wait", vconfig.DEFAULTS["threat"])
+        # And the path the reader uses is the path that resolves.
+        self.assertEqual(5, self.cfg.get("mail.digest_min_items"))
+        self.assertEqual(1800, self.cfg.get("mail.digest_max_wait"))
+
+    def test_threat_daemon_reads_the_displayed_path(self):
+        from vigil.guards import threat as threat_mod
+        cfg = vconfig.Config(path=Path(self.tmp.name) / "c2.json",
+                             secrets_path=Path(self.tmp.name) / "s2.json")
+        cfg.set("mail.digest_min_items", 9)
+        cfg.set("mail.digest_max_wait", 42)
+        daemon = threat_mod.ThreatDaemon(cfg, log=_QuietLog(), dry_run=True,
+                                         echo=False)
+        self.assertEqual(9, daemon.settings.digest_min_items,
+                         "设 mail.digest_min_items 必须真的生效")
+        self.assertEqual(42, daemon.settings.digest_max_wait)
+
+    def test_bouncer_and_evolve_are_top_level_sections(self):
+        for section in ("bouncer", "evolve"):
+            self.assertIn(section, vconfig.DEFAULTS,
+                          "%s 段必须在顶层：读取路径是 %s.*" % (section, section))
+            self.assertNotIn(section, vconfig.DEFAULTS["threat"],
+                             "threat.%s 是展示得出来却没人读的段" % section)
+        self.assertEqual(60, self.cfg.get("bouncer.sync_seconds"))
+        self.assertEqual(8, self.cfg.get("evolve.min_hits"))
+        self.assertIs(False, self.cfg.get("bouncer.enabled"))
+        self.assertIs(False, self.cfg.get("evolve.enabled"))
+
+    def test_every_displayed_key_has_a_reader_or_is_data(self):
+        """Broad-but-bounded sweep: a DEFAULTS key nothing in src mentions.
+
+        This is the weaker half of the invariant (it matches on the last path
+        segment, so it cannot prove the *path* is right -- the test above does
+        that against the daemon's own read log). It is still worth having,
+        because "declared and never mentioned anywhere" is the shape a
+        copy-paste mistake takes.
+        """
+        def leaves(node, prefix=""):
+            out = []
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    out += leaves(value, (prefix + "." + key) if prefix else key)
+            else:
+                out.append(prefix)
+            return out
+
+        blob = "\n".join(
+            p.read_text(encoding="utf-8", errors="replace")
+            for p in (ROOT / "src").rglob("*.py") if "__pycache__" not in p.parts)
+        orphans = []
+        for path in leaves(vconfig.DEFAULTS):
+            segment = path.rsplit(".", 1)[-1]
+            if path in blob or ('"%s"' % segment) in blob or \
+                    ("'%s'" % segment) in blob:
+                continue
+            orphans.append(path)
+        self.assertEqual([], orphans,
+                         "DEFAULTS 里这些键在整个 src 里都没被提到过：%s" % orphans)
+
+
+def _dotted_present(tree, dotted) -> bool:
+    cur = tree
+    for part in str(dotted).split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return False
+        cur = cur[part]
+    return True
+
+
+class TestEvolveLedgerChain(unittest.TestCase):
+    """The ledger must be unforgeable, or it launders malicious edits.
+
+    ``self_integrity`` now trusts this ledger to excuse a change to the
+    program's own source. A plain appendable JSONL file would then be the
+    perfect cover: append one line claiming "I changed this file, here is its
+    new hash", and the attacker's edit is reported as sanctioned
+    self-modification. The chain (and the HMAC under a key kept outside the
+    repository) is what makes that line impossible to produce.
+    """
+
+    def setUp(self):
+        from vigil.evolve import ledger
+        self.ledger = ledger
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self._saved = (ledger.LEDGER, ledger.BACKUP_DIR)
+        ledger.LEDGER = self.root / "ledger.jsonl"
+        ledger.BACKUP_DIR = self.root / "backup"
+        self.addCleanup(self._restore)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def _restore(self):
+        self.ledger.LEDGER, self.ledger.BACKUP_DIR = self._saved
+
+    def _write(self, *lines):
+        self.ledger.LEDGER.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _raw(self):
+        return [json.loads(x) for x in
+                self.ledger.LEDGER.read_text(encoding="utf-8").splitlines()
+                if x.strip()]
+
+    def test_a_record_carries_a_mac_and_links_to_the_previous_one(self):
+        first = self.ledger.record("applied", cfg=self.cfg, path="/a", tier=1)
+        second = self.ledger.record("rolled-back", cfg=self.cfg, path="/a")
+        self.assertTrue(first.get("mac"), "记录必须带 MAC")
+        self.assertEqual(first["mac"], second["prev"],
+                         "第二条必须链到第一条的 MAC")
+        self.assertEqual(first["mac"], self._raw()[1]["prev"])
+
+    def test_a_clean_chain_verifies(self):
+        for i in range(3):
+            self.ledger.record("applied", cfg=self.cfg, path="/f%d" % i)
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertTrue(verdict["ok"], verdict.get("break_reason"))
+        self.assertEqual(3, verdict["checked"])
+
+    def test_a_tampered_line_breaks_the_chain_at_that_line(self):
+        self.ledger.record("applied", cfg=self.cfg, path="/a", after="x")
+        self.ledger.record("applied", cfg=self.cfg, path="/b")
+        rows = self._raw()
+        rows[0]["after"] = "forged"          # rewrite history, keep the MAC
+        self._write(*[json.dumps(r, ensure_ascii=False) for r in rows])
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(1, verdict["break_at"], "必须指出断在哪一条")
+        self.assertIn("改写过", verdict["break_reason"])
+
+    def test_a_forged_line_appended_by_an_attacker_is_rejected(self):
+        """The attack this exists for: append "I changed it" and walk away."""
+        self.ledger.record("applied", cfg=self.cfg, path="/a")
+        forged = {"ts": time.time(), "kind": "code-edited",
+                  "file": "src/vigil/guards/decoy.py",
+                  "after": "0" * 64, "prev": "", "mac": ""}
+        with open(self.ledger.LEDGER, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(forged) + "\n")
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertFalse(verdict["ok"], "伪造记录必须让整条链失效")
+        self.assertEqual(2, verdict["break_at"])
+        self.assertEqual("unchained-after-chain", verdict["break_kind"])
+
+    def test_deleting_a_middle_line_breaks_the_link(self):
+        self.ledger.record("applied", cfg=self.cfg, path="/a")
+        self.ledger.record("applied", cfg=self.cfg, path="/b")
+        self.ledger.record("applied", cfg=self.cfg, path="/c")
+        rows = self._raw()
+        self._write(*[json.dumps(r, ensure_ascii=False)
+                      for r in (rows[0], rows[2])])
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertFalse(verdict["ok"])
+        self.assertIn("删除、插入或重排", verdict["break_reason"])
+
+    def test_verified_drops_everything_when_the_chain_is_broken(self):
+        self.ledger.record("applied", cfg=self.cfg, path="/a")
+        rows = self._raw()
+        rows[0]["kind"] = "tampered"
+        self._write(*[json.dumps(r, ensure_ascii=False) for r in rows])
+        entries, verdict = self.ledger.verified(cfg=self.cfg)
+        self.assertEqual([], entries, "链不成立时不能返回任何可用记录")
+        self.assertFalse(verdict["ok"])
+
+    def test_legacy_lines_without_a_mac_are_not_a_break(self):
+        """History that predates the feature must not read as tampering."""
+        self._write(json.dumps({"ts": 1.0, "kind": "applied", "path": "/old"}))
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertTrue(verdict["ok"])
+        self.assertEqual(1, verdict["legacy"])
+
+
+class TestAttributionOfSelfModification(unittest.TestCase):
+    """Hash matching is the only trustworthy judge, so it gets the tests.
+
+    ``evolve`` may edit one source file on purpose. Before this, every such
+    edit made ``self_integrity`` report CRIT, which buried the finding that
+    matters. The fix is attribution by *hash* -- and the failure mode of a
+    bad fix is worse than the original bug, because accepting any change
+    because "something legitimate happened recently" hands an attacker a
+    perfect cover. Hence the case below that must stay CRIT.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import selfcheck
+        from vigil.evolve import ledger
+        self.sc = selfcheck
+        self.ledger = ledger
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self._saved = ledger.LEDGER
+        ledger.LEDGER = self.root / "ledger.jsonl"
+        self.addCleanup(self._restore)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self.tree = self.root / "pkg"
+        self.tree.mkdir()
+        self.target = self.tree / "decoy.py"
+
+    def _restore(self):
+        self.ledger.LEDGER = self._saved
+
+    def _edit_and_record(self, text="DECOYS = ()\n"):
+        self.target.write_text(text, encoding="utf-8")
+        digest = self.sc.digest_file(str(self.target))
+        self.ledger.record("code-edited", cfg=self.cfg,
+                           file=str(self.target), after=digest)
+        return digest
+
+    def test_a_recorded_self_edit_is_not_malicious(self):
+        self.target.write_text("old\n", encoding="utf-8")
+        digest = self._edit_and_record("DECOYS = (1,)\n")
+        result = self.sc.attribute([str(self.target)], {str(self.target): digest},
+                                   str(self.tree), self.cfg)
+        self.assertEqual([], result["unattributed"])
+        self.assertEqual([str(self.target)],
+                         [e["path"] for e in result["self"]])
+
+    def test_a_record_for_the_file_with_a_different_hash_is_crit(self):
+        """The test the whole feature exists for.
+
+        The ledger *does* have a record for this file; the file is simply not
+        the file that was recorded. A path-only or "recent activity" judge
+        would call this self-modification. It is not.
+        """
+        self._edit_and_record("DECOYS = (1,)\n")
+        self.target.write_text("DECOYS = (1,)\nimport os; os.system('id')\n",
+                               encoding="utf-8")
+        current = self.sc.digest_file(str(self.target))
+        result = self.sc.attribute([str(self.target)],
+                                   {str(self.target): current},
+                                   str(self.tree), self.cfg)
+        self.assertEqual([], result["self"], "哈希不匹配绝不能算自修正")
+        self.assertEqual(1, len(result["mismatch"]))
+        entry = result["mismatch"][0]
+        self.assertNotEqual(entry["expected"], entry["actual"])
+        self.assertIn("哈希不匹配", self.sc._attribution_report(result))
+
+    def test_an_old_record_cannot_excuse_todays_change(self):
+        """Attribution has a time window; three months is not "just now"."""
+        digest = self._edit_and_record("DECOYS = (1,)\n")
+        rows = self.ledger.read(limit=10)
+        rows[0]["ts"] = time.time() - 90 * 86400
+        self.ledger.LEDGER.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8")
+        result = self.sc.attribute([str(self.target)],
+                                   {str(self.target): digest},
+                                   str(self.tree), self.cfg)
+        self.assertEqual([], result["self"])
+        self.assertEqual(1, len(result["unattributed"]),
+                         "超出归因窗口的台账记录不能为今天的改动背书")
+
+    def test_a_broken_ledger_attributes_nothing(self):
+        digest = self._edit_and_record("DECOYS = (1,)\n")
+        rows = self.ledger.read(limit=10)
+        rows[0]["after"] = "0" * 64        # rewrite, keep the MAC
+        self.ledger.LEDGER.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8")
+        result = self.sc.attribute([str(self.target)],
+                                   {str(self.target): digest},
+                                   str(self.tree), self.cfg)
+        self.assertFalse(result["ledger_ok"])
+        self.assertEqual([], result["self"])
+        self.assertEqual(1, len(result["unattributed"]))
+        self.assertIn("台账链校验", self.sc._attribution_report(result))
+
+    def test_an_unrecorded_change_is_critical(self):
+        self.target.write_text("x = 1\n", encoding="utf-8")
+        digest = self.sc.digest_file(str(self.target))
+        result = self.sc.attribute([str(self.target)],
+                                   {str(self.target): digest},
+                                   str(self.tree), self.cfg)
+        self.assertEqual(1, len(result["unattributed"]))
+        self.assertEqual([], result["self"])
+        why = result["unattributed"][0]["why"]
+        self.assertIn("台账", why, "报告必须说明查过台账、没有匹配记录")
+        self.assertIn("部署", why)
+
+    def test_the_check_reports_self_modification_as_ok_and_a_mismatch_as_crit(self):
+        chk = self.sc.SelfIntegrity()
+        real_root = self.sc._package_root
+        self.sc._package_root = lambda: str(self.tree)
+        self.target.write_text("a = 1\n", encoding="utf-8")
+        try:
+            state = {}
+            self.assertEqual("OK", chk.run(self._ctx(state)).status)
+            # A recorded self-edit: not an intrusion.
+            digest = self._edit_and_record("a = 2\n")
+            res = chk.run(self._ctx(state))
+            self.assertEqual("OK", res.status, res.detail)
+            self.assertIn("自修正（已记录）", res.detail)
+            # A record exists, but the file is not what was recorded.
+            self.target.write_text("a = 2\nbackdoor = 1\n", encoding="utf-8")
+            res = chk.run(self._ctx(state))
+            self.assertEqual("CRIT", res.status, res.detail)
+            self.assertIn("哈希不匹配", res.detail)
+        finally:
+            self.sc._package_root = real_root
+
+    def _ctx(self, state):
+        from vigil.guards.checks import base as cbase
+        return cbase.CheckContext(cfg=self.cfg, state=state, env={},
+                                  log=None, now=time.time())
+
+
+class TestGeneratedArtifactAutoRecovery(unittest.TestCase):
+    """Finding a deleted file is not a response; rebuilding it is.
+
+    The incident: a cleanup deleted ``vigil-shield.conf``, `self_integrity`
+    reported "文件被删除" 55 times, and the file stayed missing until a human
+    ran `vigil shield install`. These tests pin the response, its boundary
+    (never the source, never the operator's files), and the rate limiter that
+    stops "rebuild -> deleted again -> rebuild" from becoming a loop.
+    """
+
+    def setUp(self):
+        from vigil.guards import selfheal
+        self.sh = selfheal
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def _target(self, name="vigil-shield.conf"):
+        return str(self.root / name)
+
+    def test_only_generated_artifacts_have_a_regenerator(self):
+        self.assertEqual("shield", self.sh.action_for(self._target()) or
+                         self.sh.action_for("/etc/nginx/vigil-shield.conf"))
+        self.assertTrue(self.sh.supported("/etc/nginx/vigil-shield.conf"))
+        self.assertTrue(self.sh.supported("/x/vigil-gate-dsh_gate.conf"))
+        self.assertTrue(self.sh.supported("/x/dsh-gate/gate.lua"))
+        # The source, and the gate files that encode operator data, are not.
+        self.assertFalse(self.sh.supported("/usr/local/lib/vigil/vigil/cli.py"))
+        self.assertFalse(self.sh.supported("/x/dsh-gate/config.php"))
+        self.assertFalse(self.sh.supported("/x/dsh-gate/policy.conf"))
+
+    def test_a_deleted_artifact_is_rebuilt_and_reported(self):
+        path = self._target()
+        content = "deny 198.51.100.0/24;\nlimit_req zone=vigil burst=5;\n"
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        calls = []
+
+        def regen(p):
+            calls.append(p)
+            Path(p).write_text(content, encoding="utf-8")
+            return {"ok": True, "detail": "已重新生成"}
+
+        # `render` is the independent recheck. Stubbed so this test is about
+        # the heal/recheck decision rather than about rendering a shield on a
+        # machine that has no nginx.
+        real_render = self.sh.render
+        self.sh.render = lambda p, cache=None: (content, "")
+        self.addCleanup(setattr, self.sh, "render", real_render)
+        result = self.sh.heal(self.cfg, removed=[path],
+                              baseline={path: digest},
+                              healstate={},
+                              regenerators={"shield": regen})
+        self.assertEqual([path], calls, "必须调用对应模块的重建器")
+        self.assertEqual(1, len(result["healed"]))
+        self.assertEqual([path], list(result["changed_baseline"]))
+        text = self.sh.describe(result)
+        self.assertIn(path, text)
+        self.assertIn("被删除", text)
+        self.assertIn("复检", text)
+
+    def test_a_file_that_cannot_be_read_back_is_not_called_recovered(self):
+        path = self._target()
+
+        def regen(_p):
+            return {"ok": True, "detail": "写了"}
+
+        result = self.sh.heal(self.cfg, removed=[path], baseline={},
+                              healstate={}, regenerators={"shield": regen})
+        self.assertEqual([], result["healed"])
+        self.assertEqual(1, len(result["unhealed"]))
+        self.assertIn("复检仍读不到", result["unhealed"][0]["detail"])
+
+    def test_a_rebuild_that_does_not_match_the_baseline_is_not_a_recovery(self):
+        path = self._target()
+        good = "deny all;\n"
+        good_digest = hashlib.sha256(good.encode()).hexdigest()
+
+        def regen(p):
+            Path(p).write_text("allow all;\n", encoding="utf-8")
+            return {"ok": True, "detail": "写了"}
+
+        result = self.sh.heal(self.cfg, removed=[path],
+                              baseline={path: good_digest}, healstate={},
+                              regenerators={"shield": regen})
+        self.assertEqual([], result["healed"], "内容不一致不能算恢复")
+        self.assertEqual(1, len(result["unhealed"]))
+        self.assertIn("与基线不一致", result["unhealed"][0]["detail"])
+
+    def test_the_source_and_operator_files_are_never_touched(self):
+        source = "/usr/local/lib/vigil/vigil/guards/threat.py"
+        config = "/x/dsh-gate/config.php"
+        called = []
+
+        def regen(p):
+            called.append(p)
+            return {"ok": True, "detail": "写了"}
+
+        result = self.sh.heal(self.cfg, removed=[source],
+                              changed=[config], baseline={}, healstate={},
+                              regenerators={"shield": regen})
+        self.assertEqual([], called, "源码与操作者的文件绝不能被重建")
+        self.assertEqual(2, len(result["unsupported"]))
+        text = self.sh.describe(result)
+        self.assertIn("不在自动重建范围", text)
+        self.assertIn("人工处理", text)
+
+    def test_the_rate_limit_stops_the_rebuild_loop(self):
+        path = self._target()
+        content = "deny all;\n"
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        attempts = []
+
+        def regen(p):
+            attempts.append(p)
+            Path(p).write_text(content, encoding="utf-8")
+            return {"ok": True, "detail": "写了"}
+
+        healstate = {}
+        now = 1000.0
+        for _ in range(5):
+            self.sh.heal(self.cfg, removed=[path], baseline={path: digest},
+                         healstate=healstate, now=now,
+                         regenerators={"shield": regen})
+        self.assertEqual(3, len(attempts),
+                         "默认上限是每 30 分钟 3 次，超过后只报警")
+        result = self.sh.heal(self.cfg, removed=[path],
+                              baseline={path: digest}, healstate=healstate,
+                              now=now + 1, regenerators={"shield": regen})
+        self.assertEqual(1, len(result["limited"]))
+        self.assertEqual(0, result["attempted"])
+        self.assertIn("循环", result["limited"][0]["reason"])
+        self.assertIn("反复", self.sh.describe(result))
+        # A later window gets a fresh allowance: the cap is a sliding window,
+        # not a permanent give-up.
+        later = self.sh.heal(self.cfg, removed=[path], baseline={path: digest},
+                             healstate=healstate, now=now + 4000,
+                             regenerators={"shield": regen})
+        self.assertEqual(1, later["attempted"])
+
+    def test_auto_recovery_can_be_switched_off(self):
+        path = self._target()
+        self.cfg.set("checks.self_integrity.auto_recover", False)
+        called = []
+        result = self.sh.heal(self.cfg, removed=[path], baseline={},
+                              healstate={},
+                              regenerators={"shield": lambda p: called.append(p)})
+        self.assertFalse(result["enabled"])
+        self.assertEqual([], called)
+        self.assertEqual("", self.sh.describe(result))
+
+    def test_the_diff_summary_names_the_rules_that_were_weakened(self):
+        """The intent is in the difference, so it has to be reported."""
+        expected = ("deny 198.51.100.0/24;\nlimit_req zone=vigil burst=5;\n"
+                    "access_by_lua_file /x/gate.lua;\n")
+        tampered = ("limit_req zone=vigil burst=5;\n"
+                    "access_by_lua_file /x/gate.lua;\n")
+        summary = self.sh._weakened(tampered, expected)
+        self.assertIn("被削弱的规则", summary)
+        self.assertIn("deny", summary)
+        self.assertIn("198.51.100.0/24", summary,
+                      "被删掉的那条规则就是意图的证据，必须出现在摘要里")
+        # A deleted file has no previous content, so there is no diff to give.
+        self.assertEqual("", self.sh._weakened(None, expected))
+
+    def test_the_zone_key_guard_is_checked_before_any_write(self):
+        """Repairing a snippet must not reintroduce the reload-never-works bug.
+
+        A changed ``limit_req_zone`` key is accepted by `nginx -t` and refused
+        by every reload, so a "repair" that redefines a live zone would take
+        the protection down while looking successful.
+        """
+        from vigil.gates import shield
+        changes = shield.zone_key_changes(
+            "limit_req_zone $binary_remote_addr zone=a:10m rate=12r/m;\n",
+            {"a": "$request_uri"})
+        self.assertTrue(changes, "同名换 key 必须被 zone_key_changes 识别出来")
+        self.assertEqual(("a", "$request_uri", "$binary_remote_addr"),
+                         tuple(changes[0][:1]) + tuple(changes[0][1:]))
+        text = shield.describe_zone_conflicts(changes)
+        self.assertIn("拒绝写入", text)
+        self.assertIn("a", text)
+
+
+class TestSuspiciousProcessAutoResponse(unittest.TestCase):
+    """The guards, not the feature, are what these tests are about.
+
+    Automatic process intervention is the one thing in this program that can
+    take a server down by itself, so the tests are weighted towards the cases
+    where it must **not** act: exemptions, a single signal, a changed
+    identity, a different PID namespace, the hourly cap. Every test uses a
+    fictional process table and a Runtime whose `signal` only records -- no
+    real process is ever touched, and no real signal is ever sent.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import procresponse
+        self.pr = procresponse
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self._saved_ledger = procresponse.LEDGER
+        procresponse.LEDGER = self.root / "autoresponse.jsonl"
+        self.addCleanup(self._restore)
+        self.now = [1000.0]
+        self.signals = []
+        self.procs = {}
+        self.conns = {}
+        self.units = {}
+
+    def _restore(self):
+        self.pr.LEDGER = self._saved_ledger
+
+    # -- the fictional host ------------------------------------------------
+    def add(self, pid, exe="/tmp/payload", deleted=True, comm="payload",
+            cmdline="", start=100.0, unit="", automation="", conns=None,
+            ns="/proc/1/ns/pid", ino=555, dev=8, ppid=1):
+        self.procs[pid] = {"pid": pid, "comm": comm, "cmdline": cmdline or exe,
+                           "exe": exe, "exe_deleted": deleted,
+                           "start_time": start, "unit": unit, "ppid": ppid,
+                           "exe_ino": ino, "exe_dev": dev, "ns": ns,
+                           "automation": automation}
+        self.conns[pid] = list(conns or [])
+
+    def runtime(self, allowlist=None, own_ns="/proc/1/ns/pid"):
+        def info(pid):
+            row = self.procs.get(int(pid))
+            return dict(row) if row else {}
+
+        def conns(pid):
+            return list(self.conns.get(int(pid)) or [])
+
+        def unit(pid):
+            row = self.procs.get(int(pid)) or {}
+            return row.get("unit", "")
+
+        def start(pid):
+            row = self.procs.get(int(pid)) or {}
+            return float(row.get("start_time") or 0.0)
+
+        def automation(pid, exe):
+            row = self.procs.get(int(pid)) or {}
+            return row.get("automation", "")
+
+        def ns(pid):
+            if int(pid) == os.getpid():
+                return own_ns
+            row = self.procs.get(int(pid)) or {}
+            return row.get("ns", own_ns)
+
+        return self.pr.Runtime(
+            cfg=self.cfg, log=_QuietLog(), proc_info=info, connections=conns,
+            cgroup_unit=unit, start_time=start, is_automation=automation,
+            signal_fn=lambda pid, sig: (self.signals.append((int(pid), int(sig))),
+                                        (True, ""))[1],
+            now=lambda: self.now[0], pid_namespace=ns,
+            list_pids=lambda: sorted(self.procs))
+
+    def enable(self, **overrides):
+        self.cfg.set("threat.autoresponse.enabled", True)
+        self.cfg.set("threat.autoresponse.evidence_dir",
+                     str(self.root / "evidence"))
+        for key, value in overrides.items():
+            self.cfg.set("threat.autoresponse.%s" % key, value)
+
+    def hits(self, *pids):
+        return [{"pid": p, "comm": self.procs[p]["comm"],
+                 "exe": self.procs[p]["exe"], "kind": "deleted",
+                 "automation": ""} for p in pids]
+
+    # -- off by default ----------------------------------------------------
+    def test_nothing_happens_until_it_is_switched_on(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        state = {}
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertFalse(result["enabled"])
+        self.assertEqual([], self.signals, "默认关闭时绝不可以发信号")
+
+    # -- two independent signals ------------------------------------------
+    def test_one_signal_alone_is_never_enough(self):
+        self.add(4242, conns=[])         # deleted binary, no connection
+        self.enable()
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
+                                runtime=self.runtime())
+        self.assertEqual([], result["responded"])
+        self.assertEqual([], self.signals)
+        self.assertEqual("medium", result["reported"][0]["level"])
+        self.assertIn("缺少独立佐证", result["reported"][0]["reason"])
+
+    def test_a_temp_dir_path_alone_is_not_a_high_confidence_signal(self):
+        self.add(4242, exe="/tmp/build/payload", deleted=False,
+                 conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable()
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
+                                runtime=self.runtime())
+        self.assertEqual([], result["responded"])
+        self.assertEqual("medium", result["reported"][0]["level"],
+                         "只有「路径在临时目录」这一类，不能算高置信")
+
+    def test_a_loopback_connection_does_not_count_as_outbound(self):
+        self.add(4242, conns=[("ESTAB", "127.0.0.1:41000", "127.0.0.1:3306")])
+        self.enable()
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
+                                runtime=self.runtime())
+        self.assertEqual([], result["responded"])
+        self.assertFalse(result["reported"][0]["signals"]["external_conn"])
+
+    # -- the observation window -------------------------------------------
+    def test_a_snapshot_is_not_enough_but_persistence_is(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=120)
+        state = {}
+        first = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                               runtime=self.runtime())
+        self.assertEqual([], self.signals, "第一轮只开始观察，不动手")
+        self.assertEqual(1, len(first["observed"]))
+        # Still there, evidence unchanged, window elapsed.
+        self.now[0] += 121
+        second = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertEqual(1, len(second["responded"]))
+        self.assertEqual([(4242, int(signal.SIGSTOP))], self.signals)
+
+    def test_a_candidate_that_disappears_inside_the_window_is_dropped(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=120)
+        state = {}
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                       runtime=self.runtime())
+        self.now[0] += 30
+        del self.procs[4242]
+        result = self.pr.handle([], cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertEqual([], self.signals)
+        self.assertEqual({}, state[self.pr.STATE_KEY]["observing"])
+
+    def test_a_signal_that_changes_restarts_the_observation(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=120)
+        state = {}
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                       runtime=self.runtime())
+        self.now[0] += 121
+        self.conns[4242] = [("ESTAB", "10.0.0.5:41000", "203.0.113.200:8443")]
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertEqual([], self.signals, "信号组合变了就要重新观察")
+        self.assertEqual(1, len(result["abandoned"]))
+
+    # -- the never-touch list ---------------------------------------------
+    def test_every_exemption_is_a_hard_stop(self):
+        cases = [
+            ("pid 1", dict(pid=1)),
+            ("systemd", dict(pid=77, unit="nginx.service")),
+            ("automation", dict(pid=78, automation="疑似自动化工具链：node")),
+            ("kernel", dict(pid=79, comm="kworker/0:1", exe="")),
+            ("allowlist", dict(pid=80)),
+            ("namespace", dict(pid=81, ns="/proc/999/ns/pid")),
+            ("own", dict(pid=82, exe="/usr/local/lib/vigil/vigil/cli.py")),
+        ]
+        for label, spec in cases:
+            with self.subTest(label):
+                pid = spec.get("pid", 1)
+                self.procs.clear()
+                self.conns.clear()
+                self.signals[:] = []
+                self.add(conns=[("ESTAB", "10.0.0.5:41000",
+                                 "203.0.113.9:443")], **spec)
+                self.enable(observe_seconds=0,
+                            allowlist=["payload"] if label == "allowlist" else [])
+                state = {}
+                self.pr.handle(self.hits(pid), cfg=self.cfg, state=state,
+                               runtime=self.runtime())
+                self.pr.handle(self.hits(pid), cfg=self.cfg, state=state,
+                               runtime=self.runtime())
+                self.assertEqual([], self.signals, "%s 必须永不处置" % label)
+
+    def test_the_operator_allowlist_is_respected(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0, allowlist=["/tmp/payload"])
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
+                                runtime=self.runtime())
+        self.assertIn("允许清单", result["reported"][0]["exempt"])
+        self.assertEqual([], self.signals)
+
+    # -- identity, right before the action --------------------------------
+    def test_a_reused_pid_abandons_the_action(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                       runtime=self.runtime())
+        # The pid is now a different process: new start time, new inode.
+        self.add(4242, exe="/usr/sbin/nginx", deleted=False, comm="nginx",
+                 start=999.0, ino=777,
+                 conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertEqual([], self.signals, "pid 复用后绝不能动手")
+        self.assertTrue(any("身份" in e["why"] for e in result["abandoned"]))
+
+    def test_an_execve_between_deciding_and_acting_abandons_the_action(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                       runtime=self.runtime())
+        # Same pid, same start time, but the image was swapped underneath.
+        self.procs[4242]["exe_ino"] = 999
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=self.runtime())
+        self.assertEqual([], self.signals)
+        self.assertTrue(result["abandoned"])
+
+    def test_the_namespace_check_refuses_containers(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")],
+                 ns="/proc/4242/ns/pid")
+        self.enable(observe_seconds=0)
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state={},
+                                runtime=self.runtime(own_ns="/proc/1/ns/pid"))
+        self.assertIn("PID 命名空间", result["reported"][0]["exempt"])
+        self.assertEqual([], self.signals)
+
+    # -- evidence ----------------------------------------------------------
+    def test_evidence_lands_on_disk_before_the_signal(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        seen = {}
+
+        def signal_fn(pid, sig):
+            seen["files"] = list((self.root / "evidence").glob("*.json"))
+            self.signals.append((int(pid), int(sig)))
+            return True, ""
+
+        state = {}
+        rt = self.runtime()
+        rt._signal_fn = signal_fn
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual([], self.signals, "第一轮只观察")
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual([(4242, int(signal.SIGSTOP))], self.signals)
+        self.assertTrue(seen.get("files"), "证据必须先落盘再动手")
+        bundle = json.loads(Path(seen["files"][0]).read_text(encoding="utf-8"))
+        self.assertEqual(4242, bundle["pid"])
+        self.assertIn("verdict", bundle)
+        self.assertTrue(bundle["connections"])
+
+    def test_no_evidence_means_no_action(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        # An evidence directory that cannot be created (a file in the way).
+        blocked = self.root / "blocked"
+        blocked.write_text("not a directory", encoding="utf-8")
+        self.cfg.set("threat.autoresponse.evidence_dir", str(blocked / "sub"))
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=rt)
+        self.assertEqual([], self.signals, "证据落不了盘就不许动手")
+        self.assertEqual(1, len(result["refused"]))
+
+    # -- the reversible action, and undoing it ----------------------------
+    def test_the_default_action_is_reversible_stop_not_kill(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual([int(signal.SIGSTOP)], [s for _p, s in self.signals])
+        self.assertIn("4242", state[self.pr.STATE_KEY]["stopped"])
+        self.assertNotIn(int(signal.SIGKILL), [s for _p, s in self.signals])
+
+    def test_a_stopped_process_is_released_when_it_joins_a_unit(self):
+        """Reversibility is only real if something actually reverses it."""
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual(1, len(state[self.pr.STATE_KEY]["stopped"]))
+        # A systemd unit claims it (a `.service` cgroup appeared).
+        self.procs[4242]["unit"] = "php-fpm.service"
+        result = self.pr.handle([], cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual([(4242, int(signal.SIGCONT))], self.signals[1:])
+        self.assertEqual(1, len(result["resumed"]))
+        self.assertIn("已撤销处置", self.pr.describe(result))
+        self.assertEqual({}, state[self.pr.STATE_KEY]["stopped"])
+        kinds = [e["kind"] for e in self.pr.recent(20)]
+        self.assertIn("action-resumed", kinds, "撤销必须进台账")
+
+    def test_a_stopped_process_is_released_when_put_on_the_allowlist(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.cfg.set("threat.autoresponse.allowlist", ["/tmp/payload"])
+        result = self.pr.handle([], cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual(1, len(result["resumed"]))
+        self.assertEqual((4242, int(signal.SIGCONT)), self.signals[-1])
+
+    def test_held_stop_is_reported_rather_than_silently_kept(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0, resume_window_seconds=60,
+                    after_observe="hold")
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 61
+        result = self.pr.handle([], cfg=self.cfg, state=state, runtime=rt)
+        self.assertEqual([int(signal.SIGSTOP)], [s for _p, s in self.signals],
+                         "hold 不升级为任何终止信号")
+        self.assertEqual(1, len(result["escalated"]))
+        self.assertIn("保持暂停", self.pr.describe(result))
+
+    def test_terminate_is_only_reachable_by_explicit_configuration(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0, resume_window_seconds=0,
+                    after_observe="terminate", terminate_signal="SIGTERM")
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle([], cfg=self.cfg, state=state, runtime=rt)
+        self.assertIn((4242, int(signal.SIGTERM)), self.signals)
+
+    # -- rate limiting -----------------------------------------------------
+    def test_the_hourly_cap_turns_into_report_only(self):
+        self.enable(observe_seconds=0, max_per_hour=1)
+        state = {}
+        rt = self.runtime()
+        for pid in (4242, 4243):
+            self.add(pid, conns=[("ESTAB", "10.0.0.5:41000",
+                                  "203.0.113.9:443")])
+            self.pr.handle(self.hits(pid), cfg=self.cfg, state=state, runtime=rt)
+            self.now[0] += 1
+            self.pr.handle(self.hits(pid), cfg=self.cfg, state=state, runtime=rt)
+            self.now[0] += 1
+        self.assertEqual([4242], [p for p, _s in self.signals])
+        self.assertTrue(state[self.pr.STATE_KEY]["action_stamps"])
+        result = self.pr.handle(self.hits(4243), cfg=self.cfg, state=state,
+                                runtime=rt)
+        self.assertEqual(1, len(result["limited"]))
+        self.assertIn("上限", result["limited"][0]["why"])
+        self.assertIn("未处置（限频）", self.pr.describe(result))
+
+    def test_the_cap_has_a_hard_ceiling(self):
+        self.enable(max_per_hour=99999)
+        self.assertEqual(self.pr.MAX_PER_HOUR_CEILING,
+                         self.pr.settings(self.cfg)["max_per_hour"])
+
+    def test_hours_later_the_allowance_returns(self):
+        self.enable(observe_seconds=0, max_per_hour=1)
+        state = {}
+        rt = self.runtime()
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        state[self.pr.STATE_KEY]["action_stamps"] = [self.now[0] - 7200]
+        self.add(4243, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.pr.handle(self.hits(4243), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4243), cfg=self.cfg, state=state, runtime=rt)
+        self.assertIn(4243, [p for p, _s in self.signals])
+
+    # -- the loop that must not happen ------------------------------------
+    def test_an_already_handled_process_is_not_re_decided(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        before = len(self.signals)
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=rt)
+        self.assertEqual(4242, result["handled_pids"][0])
+        self.assertEqual(before, len(self.signals),
+                         "已暂停的进程不该被反复重新判定")
+
+    # -- the report --------------------------------------------------------
+    def test_the_report_carries_the_tradeoff_and_the_undo(self):
+        self.add(4242, conns=[("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")])
+        self.enable(observe_seconds=0)
+        state = {}
+        rt = self.runtime()
+        self.pr.handle(self.hits(4242), cfg=self.cfg, state=state, runtime=rt)
+        self.now[0] += 1
+        result = self.pr.handle(self.hits(4242), cfg=self.cfg, state=state,
+                                runtime=rt)
+        text = self.pr.describe(result)
+        self.assertIn("SIGSTOP", text)
+        self.assertIn("宁可漏处置，也绝不误杀", text)
+        self.assertIn("kill -CONT", text)
+        self.assertIn("独立信号", text)
+
+    def test_signals_of_keeps_the_evidence_classes_apart(self):
+        info = {"exe": "/tmp/build/payload", "exe_deleted": False}
+        sig = self.pr.signals_of(info, [("LISTEN", "0.0.0.0:8080", "")])
+        self.assertTrue(sig["temp_exe"])
+        self.assertFalse(sig["deleted_exe"])
+        self.assertFalse(sig["external_conn"])
+        self.assertTrue(sig["has_conns"])
+
+    def test_classify_never_responds_to_a_single_class(self):
+        info = {"pid": 4242, "exe": "/tmp/x", "exe_deleted": True, "ns": ""}
+        rt = self.runtime()
+        verdict = self.pr.classify(info, [], rt, [])
+        self.assertEqual(self.pr.DECISION_REPORT, verdict["decision"])
+        info["exe_deleted"] = True
+        verdict = self.pr.classify(
+            info, [("ESTAB", "10.0.0.5:1", "203.0.113.9:443")], rt, [])
+        self.assertEqual(self.pr.DECISION_RESPOND, verdict["decision"])
+
+
+class TestAutoresponseStateIsNotLost(unittest.TestCase):
+    """A stopped process nobody knows about is the worst possible outcome.
+
+    The record of what was stopped lives in the check's persisted state, so
+    it survives a daemon restart, and the CLI can list and release it without
+    the feature even being enabled.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_settings_clamps_a_typo_in_the_action(self):
+        from vigil.guards.checks import procresponse
+        cfg = vconfig.Config(path=self.root / "c.json",
+                             secrets_path=self.root / "s.json")
+        cfg.set("threat.autoresponse.enabled", True)
+        cfg.set("threat.autoresponse.action", "SIGKILL-EVERYTHING")
+        st = procresponse.settings(cfg)
+        self.assertEqual("stop", st["action"],
+                         "无法识别的动作必须退回可逆的那个，而不是照做")
+
+    def test_resume_works_with_the_feature_disabled(self):
+        """Turning the feature off must not leave processes frozen."""
+        from vigil.commands import autoresponse as cmd
+        from vigil.guards.checks import procresponse
+        cfg = vconfig.Config(path=self.root / "c.json",
+                             secrets_path=self.root / "s.json")
+        cfg.set("threat.autoresponse.enabled", False)
+        sent = []
+
+        class _Args:
+            all = True
+            pid = []
+            config = None
+
+        state = {procresponse.STATE_KEY: {"stopped": {"4242": {
+            "exe": "/tmp/payload", "at": time.time()}}, "observing": {}}}
+        real_read, real_write = cmd.read_json, cmd.write_json
+        real_runtime = procresponse.Runtime
+        store = dict(state)
+        cmd.read_json = lambda *a, **k: store
+        cmd.write_json = lambda *a, **k: True
+        procresponse.Runtime = lambda **k: type("R", (), {
+            "proc_info": lambda self, pid: {},
+            "signal": lambda self, pid, sig: (sent.append((pid, sig)),
+                                              (True, ""))[1],
+            "now": lambda self: time.time(),
+            "pid_namespace": lambda self, pid: "/proc/1/ns/pid",
+            "cgroup_unit": lambda self, pid: "",
+            "own_namespace": lambda self: "/proc/1/ns/pid",
+            "start_time": lambda self, pid: 0.0,
+        })()
+        try:
+            rc = cmd.cmd_resume(_Args())
+        finally:
+            cmd.read_json, cmd.write_json = real_read, real_write
+            procresponse.Runtime = real_runtime
+        self.assertEqual(0, rc)
+        self.assertEqual([(4242, int(signal.SIGCONT))], sent)
+        self.assertEqual({}, store[procresponse.STATE_KEY]["stopped"])
+
+
+
+
+class TestAutomationVerdictsAreAutomaticAndRecorded(unittest.TestCase):
+    """The false report this answers, and the loop it must not create.
+
+    A real host reported two ``chrome_crashpad_handler`` processes as
+    suspicious on every automation run, and a deleted Playwright browser as
+    "executable deleted" -- the most alarming line this check can print. Both
+    are now classified automatically, with a one-line conclusion and a ledger
+    entry, and neither can reach the intervention path.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import procresponse
+        self.pr = procresponse
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+        self._saved = procresponse.LEDGER
+        procresponse.LEDGER = self.root / "autoresponse.jsonl"
+        self.addCleanup(self._restore)
+        self.procs = {}
+        self.conns = {}
+
+    def _restore(self):
+        self.pr.LEDGER = self._saved
+
+    def _bundle(self, *parts):
+        return os.path.join(tempfile.gettempdir(), "vigil-probe", *parts)
+
+    def add(self, pid, exe, deleted=False, comm="chrome", unit="",
+            cmdline="", automation=""):
+        self.procs[pid] = {"pid": pid, "comm": comm, "cmdline": cmdline or exe,
+                           "exe": exe, "exe_deleted": deleted,
+                           "start_time": 10.0, "unit": unit, "ppid": 1,
+                           "exe_dev": 8, "exe_ino": 1,
+                           "ns": "/proc/1/ns/pid", "automation": automation}
+        self.conns[pid] = []
+
+    def runtime(self):
+        return self.pr.Runtime(
+            cfg=self.cfg,
+            proc_info=lambda pid: dict(self.procs.get(int(pid)) or {}),
+            connections=lambda pid: list(self.conns.get(int(pid)) or []),
+            cgroup_unit=lambda pid: (self.procs.get(int(pid)) or {}).get("unit", ""),
+            start_time=lambda pid: 10.0,
+            is_automation=lambda pid, exe: (self.procs.get(int(pid)) or {}).get("automation", ""),
+            signal_fn=lambda pid, sig: (True, ""),
+            now=lambda: 1000.0,
+            pid_namespace=lambda pid: "/proc/1/ns/pid")
+
+    def test_a_crashpad_helper_is_classified_without_an_ancestor(self):
+        """It is reparented to init by design; that must not be evidence."""
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "chrome_crashpad_handler")
+        self.add(646871, exe, comm="chrome_crashpad",
+                 automation=self.pr.util.browser_automation(646871, exe))
+        result = self.pr.automation_verdicts(
+            [{"pid": 646871, "comm": "chrome_crashpad", "exe": exe,
+              "kind": "temp", "automation": ""}],
+            cfg=self.cfg, state={}, runtime=self.runtime())
+        self.assertEqual([], result["suspicious"])
+        self.assertEqual(1, len(result["exempt"]))
+        self.assertEqual("automation", result["exempt"][0]["verdict"])
+        self.assertIn("helper", result["exempt"][0]["reason"])
+
+    def test_a_deleted_browser_in_a_release_layout_is_a_leftover(self):
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "chrome")
+        self.add(551002, exe, deleted=True)
+        result = self.pr.automation_verdicts(
+            [{"pid": 551002, "comm": "chrome", "exe": exe,
+              "kind": "deleted", "automation": ""}],
+            cfg=self.cfg, state={}, runtime=self.runtime())
+        self.assertEqual([], result["suspicious"])
+        self.assertIn("浏览器发行包布局", result["exempt"][0]["reason"])
+
+    def test_a_payload_beside_a_bundle_is_still_suspicious(self):
+        """The exemption is for a layout *and* a browser name, not a folder."""
+        self.add(4243, self._bundle("payload"), comm="payload")
+        result = self.pr.automation_verdicts(
+            [{"pid": 4243, "comm": "payload", "exe": self._bundle("payload"),
+              "kind": "temp", "automation": ""}],
+            cfg=self.cfg, state={}, runtime=self.runtime())
+        self.assertEqual(1, len(result["suspicious"]))
+        self.assertEqual([], result["exempt"])
+
+    def test_a_payload_inside_a_browsers_directory_is_still_suspicious(self):
+        """Layout alone must never be enough -- the basename must qualify."""
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "notabrowser")
+        self.add(4244, exe, comm="notabrowser")
+        result = self.pr.automation_verdicts(
+            [{"pid": 4244, "comm": "notabrowser", "exe": exe,
+              "kind": "temp", "automation": ""}],
+            cfg=self.cfg, state={}, runtime=self.runtime())
+        self.assertEqual(1, len(result["suspicious"]),
+                         "「在 browsers 目录里」本身不构成豁免")
+
+    def test_the_verdict_keeps_the_raw_observation(self):
+        """A verdict that overwrites its own evidence cannot be audited."""
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "chrome")
+        self.add(4245, exe)
+        result = self.pr.automation_verdicts(
+            [{"pid": 4245, "comm": "chrome", "exe": exe, "kind": "temp",
+              "automation": ""}],
+            cfg=self.cfg, state={}, runtime=self.runtime())
+        item = result["exempt"][0]
+        self.assertEqual(exe, item["exe"])
+        self.assertEqual(4245, item["pid"])
+        self.assertTrue(item["conclusion"])
+        self.assertIn("浏览器", item["conclusion"])
+
+    def test_an_exempt_process_never_reaches_the_intervention_path(self):
+        """The loop this must not create: classify, then act on the same pid.
+
+        `automation_verdicts` returns only the hits that were *not* exempted,
+        and the check hands exactly those to `handle`. This asserts the
+        property directly, with the intervention path's signal recorder
+        watching.
+        """
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "chrome")
+        # A deleted browser binary that is *also* holding an outbound
+        # connection: without the automation verdict this is exactly the
+        # high-confidence shape that may be stopped.
+        self.add(551002, exe, deleted=True, comm="chrome")
+        self.conns[551002] = [("ESTAB", "10.0.0.5:41000", "203.0.113.9:443")]
+        self.cfg.set("threat.autoresponse.enabled", True)
+        self.cfg.set("threat.autoresponse.observe_seconds", 0)
+        self.cfg.set("threat.autoresponse.evidence_dir",
+                     str(self.root / "evidence"))
+        hits = [{"pid": 551002, "comm": "chrome", "exe": exe,
+                 "kind": "deleted", "automation": ""}]
+        classified = self.pr.automation_verdicts(
+            hits, cfg=self.cfg, state={}, runtime=self.runtime())
+        sent = []
+
+        def signal_fn(pid, sig):
+            sent.append((int(pid), int(sig)))
+            return True, ""
+
+        rt = self.runtime()
+        rt._signal_fn = signal_fn
+        state = {}
+        for _ in range(3):
+            self.pr.handle(classified["suspicious"], cfg=self.cfg,
+                           state=state, runtime=rt)
+        self.assertEqual([], sent,
+                         "已被自动豁免的进程绝不能进入自动处置流程")
+        self.assertEqual([], self.pr.handle(
+            classified["suspicious"], cfg=self.cfg, state=state,
+            runtime=rt)["observed"])
+
+    def test_every_pass_leaves_a_ledger_line_with_an_outcome(self):
+        self.cfg.set("threat.autoresponse.enabled", True)
+        exe = self._bundle("browsers", "chromium-1243", "chrome-linux64",
+                           "chrome")
+        self.add(551002, exe, deleted=True)
+        self.pr.handle([{"pid": 551002, "comm": "chrome", "exe": exe,
+                         "kind": "deleted", "automation": "疑似自动化工具链"}],
+                       cfg=self.cfg, state={}, runtime=self.runtime())
+        kinds = [e.get("kind") for e in self.pr.recent(20)]
+        self.assertIn("pass", kinds, "每一轮判定都要在台账里留下结论")
+
+
+class TestTrustedRuntimeDowngrade(unittest.TestCase):
+    """A build at 102% CPU is not a process anomaly.
+
+    Three structural signals, any one enough -- deliberately weaker than the
+    intervention path's two, because a wrong downgrade costs one unreported
+    hot process, not a stopped server.
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import procresponse
+        self.pr = procresponse
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def _runtime(self, unit="", exe="/usr/bin/node", start=1.0, ns=True):
+        return self.pr.Runtime(
+            cfg=self.cfg,
+            proc_info=lambda pid: {"pid": int(pid), "exe": exe,
+                                   "exe_deleted": False, "cmdline": exe,
+                                   "comm": "node", "start_time": start,
+                                   "unit": unit, "ppid": 1, "exe_dev": 1,
+                                   "exe_ino": 1, "ns": "/proc/1/ns/pid"},
+            connections=lambda pid: [],
+            cgroup_unit=lambda pid: unit,
+            start_time=lambda pid: start,
+            is_automation=lambda pid, e: "",
+            signal_fn=lambda pid, sig: (True, ""),
+            now=lambda: 1.0,
+            pid_namespace=lambda pid: "/proc/1/ns/pid")
+
+    def test_a_unit_managed_process_is_downgraded(self):
+        why = self.pr.runtime_downgrade(1234, "node", "node /srv/app/server.js",
+                                        self._runtime(unit="app.service"),
+                                        self.cfg)
+        self.assertIn("systemd 单元", why)
+
+    def test_a_site_build_directory_is_downgraded(self):
+        self.cfg.set("gate.dsh_gate.webroot", "/srv/site/public")
+        rt = self._runtime(exe="/usr/bin/node")
+        # `package_owner` cannot resolve a path that does not exist on this
+        # host, so the site-root signal is what is being exercised here.
+        why = self.pr.runtime_downgrade(
+            1234, "node", "node /srv/site/public/node_modules/.bin/vue-tsc",
+            rt, self.cfg)
+        self.assertIn("站点目录", why)
+
+    def test_a_runtime_name_alone_is_not_enough(self):
+        """`node -e <payload>` is a common implant shape; it must keep warning."""
+        rt = self._runtime(exe="/usr/bin/node")
+        why = self.pr.runtime_downgrade(
+            1234, "node", "node -e c29tZXBheWxvYWQ=", rt, self.cfg)
+        self.assertEqual("", why, "光凭进程叫 node 不能降级")
+
+    def test_a_python_one_liner_is_not_downgraded(self):
+        rt = self._runtime(exe="/usr/bin/python3")
+        why = self.pr.runtime_downgrade(1234, "python3", "python3 -c import os",
+                                        rt, self.cfg)
+        self.assertEqual("", why)
+
+    def test_the_downgrade_never_signals_anything(self):
+        """It is a reporting decision, and the code must prove it.
+
+        The strong form of this is a test that watches the signal recorder;
+        this is the static one, so that a later edit cannot quietly reach for
+        `os.kill` inside the reporting path.
+        """
+        body = inspect_module_src(self.pr.runtime_downgrade)
+        self.assertNotIn("os.kill", body)
+        self.assertNotIn("signal.SIG", body)
+        self.assertNotIn("apply_action", body)
+        self.assertNotIn("_send_alert", body)
 
 
 if __name__ == "__main__":

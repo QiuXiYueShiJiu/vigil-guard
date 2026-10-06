@@ -246,6 +246,12 @@ class ProcessAnomaly(Check):
         patterns, custom = process_whitelist(ctx)
         hot = []
         exempt = []
+        downgraded = []
+        # Imported inside the method on purpose: `procresponse` imports this
+        # module for its whitelist, and a module-level import here would close
+        # the cycle while the package is still initialising.
+        from . import procresponse
+        runtime = procresponse.Runtime(cfg=ctx.cfg, log=ctx.log)
         ok, out, _err = shell.run(
             ["ps", "-eo", "pcpu=,pmem=,pid=,user=,comm=", "--sort=-pcpu"],
             timeout=10)
@@ -265,6 +271,18 @@ class ProcessAnomaly(Check):
                 identity = _proc_identity(pid)
                 if any(_matches(identity, pat) for pat in patterns):
                     exempt.append("%s(pid %s，CPU %.0f%%)" % (comm, pid, pcpu))
+                    continue
+                # A build (vue-tsc, esbuild, webpack) or a service pinned at
+                # 100% is not an anomaly. Downgraded only on *structural*
+                # evidence -- a systemd unit, a package-managed binary, or a
+                # command line pointing at a site this host already serves --
+                # never on the process merely being called `node`, because
+                # `node -e <payload>` is a common way to run an implant.
+                why = procresponse.runtime_downgrade(
+                    pid, comm, identity.get("cmdline", ""), runtime, ctx.cfg)
+                if why:
+                    downgraded.append("%s(pid %s，CPU %.0f%%，%s)"
+                                      % (comm, pid, pcpu, why))
                     continue
                 # Detail is only gathered for processes that will actually be
                 # reported: reading /proc and hashing a binary for every busy
@@ -289,16 +307,29 @@ class ProcessAnomaly(Check):
             # unnoticed.
             problems.append("已按白名单跳过 %d 个高占用进程：%s"
                             % (len(exempt), "、".join(exempt[:6])))
+        if downgraded:
+            # Reported too, and with the reason: an automatic downgrade the
+            # operator cannot audit is indistinguishable from a check that
+            # stopped working.
+            problems.append("已自动降级 %d 个高占用进程（结构性判据，非异常）：%s"
+                            % (len(downgraded), "、".join(downgraded[:6])))
         if total >= count_warn:
             problems.append("进程总数异常偏高：%d 个（阈值 %d）—— 可能是 fork 炸弹、"
                             "服务重启风暴，或恶意程序大量派生子进程"
                             % (total, count_warn))
         if hot:
-            extra = ("\n     " + problems[1]) if len(problems) > 1 else ""
+            extra = ("\n     " + "\n     ".join(problems[1:])
+                     if len(problems) > 1 else "")
             return CheckResult(WARN, problems[0] + extra)
-        if exempt:
-            return CheckResult(OK, "进程 %d 个；%d 个高占用进程命中白名单（%s）"
-                               % (total, len(exempt), "、".join(exempt[:4])))
+        if exempt or downgraded:
+            bits = []
+            if exempt:
+                bits.append("%d 个高占用进程命中白名单（%s）"
+                            % (len(exempt), "、".join(exempt[:4])))
+            if downgraded:
+                bits.append("已自动降级 %d 个（%s）"
+                            % (len(downgraded), "、".join(downgraded[:4])))
+            return CheckResult(OK, "进程 %d 个；%s" % (total, "；".join(bits)))
         return CheckResult(OK, "进程 %d 个，无 CPU 占用超过 %.0f%% 的进程"
                            % (total, cpu_warn))
 

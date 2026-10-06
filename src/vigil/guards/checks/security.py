@@ -312,6 +312,29 @@ class PanelAuth(Check):
         return (out or "").strip() if ok else ""
 
 
+def _conclusion(exempt: list) -> dict:
+    """One sentence for the "nothing needed doing" case.
+
+    The operator asked for a *result*, not a list: "已自动判定为浏览器自动化
+    工具链（结构性判据），已忽略，无需处理". This is that sentence, and it
+    names the structural fact the judgement rests on, so it can be disagreed
+    with.
+    """
+    labels = []
+    for item in exempt or ():
+        label = item.get("verdict_label") or item.get("label") or ""
+        if label and label not in labels:
+            labels.append(label)
+    text = "、".join(labels) or "已知安全形态"
+    return {
+        "verdict": "exempt",
+        "labels": labels,
+        "conclusion": ("已自动判定为%s（结构性判据：可执行文件位于浏览器发行包"
+                       "布局内且文件名属浏览器或其 helper），已忽略，无需处理"
+                       % text),
+    }
+
+
 @register
 class SuspiciousProcesses(Check):
     id = "suspicious_procs"
@@ -325,28 +348,102 @@ class SuspiciousProcesses(Check):
             hits = util.suspect_procs_detail()
         except OSError as exc:
             return CheckResult(OK, "无法枚举进程：%s" % exc)
+
+        # -- the response, before the report -------------------------------
+        # This check is where the operator's "自我检测，然后自我处置" belongs,
+        # because this is where the candidates already are. It runs
+        # unconditionally but does nothing at all unless
+        # `threat.autoresponse.enabled` is true; see
+        # `checks/procresponse.py` for the guards, which are the point of the
+        # feature rather than an afterthought.
+        response = {}
+        try:
+            from . import procresponse
+            response = procresponse.handle(
+                hits, cfg=ctx.cfg,
+                state=ctx.state.setdefault(procresponse.STATE_KEY, {}),
+                log=ctx.log)
+        except Exception as exc:                            # noqa: BLE001
+            # A broken auto-response must be *visible*, not silent: if it
+            # cannot be trusted to run, the operator needs to know that the
+            # thing they enabled is not doing anything.
+            response = {"enabled": False, "error": "%s: %s"
+                        % (type(exc).__name__, exc)}
+            try:
+                from . import procresponse as _pr
+                _pr.record("handle-error", err=response["error"])
+            except Exception as log_exc:                    # noqa: BLE001
+                _pr.note("自动响应失败，且台账写入也失败：%s" % log_exc)
+
+        # A process this module has already stopped must not be re-reported as
+        # a fresh finding: it would be re-decided on every round and, without
+        # this, re-signalled forever. It is still named, because a stopped
+        # process is something the operator has to know about.
+        handled = set()
+        try:
+            handled = {int(p) for p in (response.get("handled_pids") or [])}
+            # Released this round: its exemption was proven, so it must not be
+            # re-decided from the same evidence in the same run.
+            handled |= {int((r or {}).get("pid"))
+                        for r in (response.get("resumed") or [])
+                        if (r or {}).get("pid") is not None}
+        except (TypeError, ValueError):
+            handled = set()
+
         if not hits:
             return CheckResult(OK, "无可疑进程")
 
+        # -- automatic classification of what needs no intervention --------
         # A browser automation tool unpacks a browser release into a temp
         # directory and runs it from there -- structurally the same as "a
-        # binary running out of /tmp". `browser_automation` has already
-        # required a release layout *and* a trusted driving process; only
-        # those are set aside, and they are still named here so the operator
-        # can see what was skipped.
-        suspicious = [h for h in hits if not h.get("automation")]
-        automation = [h for h in hits if h.get("automation")]
+        # binary running out of /tmp" -- and its crashpad helper outlives the
+        # browser, so its ancestor chain is legitimately broken. Both are
+        # judged *structurally* (release layout + browser/helper basename) and
+        # the verdict is recorded with its reason, so "nothing was done"
+        # never reads the same as "nothing needed doing".
+        #
+        # This runs whether or not `threat.autoresponse` is enabled: it can
+        # only ever *remove* a process from consideration, and a process that
+        # never reaches the response path cannot be responded to.
+        try:
+            from . import procresponse
+            rt = procresponse.Runtime(cfg=ctx.cfg, log=ctx.log)
+            classified = procresponse.automation_verdicts(
+                hits, cfg=ctx.cfg, state=ctx.state, runtime=rt, log=ctx.log)
+        except Exception as exc:                            # noqa: BLE001
+            classified = {"exempt": [], "suspicious": list(hits),
+                          "error": "%s: %s" % (type(exc).__name__, exc)}
+        automation = classified.get("exempt") or []
+        suspicious = [h for h in (classified.get("suspicious") or [])
+                      if not h.get("automation")]
+
+        report = ""
+        try:
+            from . import procresponse as _pr
+            report = _pr.describe(response)
+        except Exception:                                   # noqa: BLE001
+            report = ""
+        if response.get("error"):
+            report = ("自动响应执行失败：%s" % response["error"]) + (
+                "\n       " + report if report else "")
 
         if not suspicious:
             lines = [util.suspect_line(h) for h in automation[:_DETAIL_CAP]]
-            return CheckResult(
-                OK,
-                "发现 %d 个从临时目录运行的浏览器进程，全部识别为自动化工具链"
-                "（浏览器发行包布局 + 受信驱动进程），不计为可疑：\n       %s"
-                % (len(automation), "\n       ".join(lines)))
+            verdict = _conclusion(automation)
+            detail = ("发现 %d 个浏览器/自动化工具链进程（含 helper 与已删除的"
+                      "发行包残留），已**自动判定**并忽略，不计为可疑：\n"
+                      "       结论：%s\n       %s"
+                      % (len(automation), verdict["conclusion"],
+                         "\n       ".join(lines)))
+            return CheckResult(OK, detail + (("\n       " + report) if report
+                                             else ""))
 
         lines = []
         for h in suspicious[:_DETAIL_CAP]:
+            if h.get("pid") in handled:
+                lines.append("%s　→ 已由自动响应处置（见下），本轮不重复判定"
+                             % util.suspect_line(h))
+                continue
             lines.append(util.suspect_line(h))
             try:
                 chain = util.process_chain(h.get("pid"), 3)
@@ -360,10 +457,14 @@ class SuspiciousProcesses(Check):
             lines.append("…… 等 %d 项未展开" % (len(suspicious) - _DETAIL_CAP))
         note = ""
         if automation:
-            note = ("\n       （另有 %d 个从临时目录运行的浏览器进程识别为自动化"
-                    "工具链，未计为异常）" % len(automation))
+            verdict = _conclusion(automation)
+            note = ("\n       另有 %d 个浏览器/自动化工具链进程被**自动判定**并忽略："
+                    "%s" % (len(automation), verdict["conclusion"]))
+        tail = ("\n       请保留 /proc/<pid>/ 现场后终止进程，并对全盘做一次扫描。"
+                if not handled else
+                "\n       其中 %d 个已由自动响应处置，撤销方式见下。" % len(handled))
         return CheckResult(WARN,
                            "发现可疑进程 %d 个（可执行文件已删除或从临时目录运行，"
-                           "是恶意程序/内存马的典型特征）：\n       %s%s\n"
-                           "       请保留 /proc/<pid>/ 现场后终止进程，并对全盘做一次扫描。"
-                           % (len(suspicious), "\n       ".join(lines), note))
+                           "是恶意程序/内存马的典型特征）：\n       %s%s\n%s"
+                           % (len(suspicious), "\n       ".join(lines), note,
+                              report + tail if report else tail.lstrip("\n")))

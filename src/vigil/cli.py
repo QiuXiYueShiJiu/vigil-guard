@@ -51,6 +51,7 @@ COMMAND_GROUPS = [
         ("audit-source", "发布前自检：随包文件里是否混入本机信息"),
         ("decoy", "诱饵端点：让扫描器自投罗网"),
         ("bouncer", "Web 层封禁：第二个执行点"),
+        ("autoresponse", "可疑进程自动处置：看它暂停了谁、一键撤销"),
         ("learn", "自学习：从观测中挖掘新特征（带误报门控）"),
         ("hygiene", "请求卫生：限制请求行与 Host 头的大小"),
         ("drill", "攻击演练：多来源多层次，仅对本机"),
@@ -101,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
                            exposure as cmd_exposure,
                            audit_source as cmd_audit_source,
                            backup as cmd_backup, bouncer as cmd_bouncer,
+                           autoresponse as cmd_autoresponse,
                            decoy as cmd_decoy, learn as cmd_learn,
                            hygiene as cmd_hygiene,
                            drill as cmd_drill,
@@ -131,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     cmd_decoy.register(sub)
     cmd_learn.register(sub)
     cmd_bouncer.register(sub)
+    cmd_autoresponse.register(sub)
     cmd_hygiene.register(sub)
     cmd_drill.register(sub)
     cmd_lure.register(sub)

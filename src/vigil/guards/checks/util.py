@@ -338,12 +338,24 @@ def audit_attribution(cfg, basenames, since_ts=None) -> dict:
 # --------------------------------------------------------------------------
 
 
-#: Executable basenames that are browsers or their headless builds.
+#: Executable basenames that are browsers or their headless builds, plus the
+#: **helper** binaries that ship inside the same release. The helpers matter
+#: on their own: a ``chrome_crashpad_handler`` outlives the browser that
+#: spawned it and gets reparented to init, so requiring a trusted ancestor for
+#: it means flagging it on every automation run -- which is exactly the false
+#: report this exemption exists to remove.
 _BROWSER_BINARIES = frozenset({
     "chrome", "chromium", "chromium-browser", "headless_shell",
     "chrome-headless-shell", "chrome_crashpad_handler", "firefox",
     "firefox-bin", "msedge", "msedgewebview2", "opera", "brave",
 })
+
+#: Helpers named after the project rather than the browser: ``crashpad_handler``
+#: on bare Chromium builds, ``chrome_crashpad_handler`` on branded ones. They
+#: are the binaries whose *ancestor chain is expected to be broken*, so they
+#: are identified by name and exempted on the structural pair alone.
+_BROWSER_HELPER_RX = re.compile(
+    r"^(?:[\w-]*crashpad[\w-]*|[\w-]*_handler|crashreporter)$", re.I)
 
 #: A path component naming a browser *distribution layout*, as opposed to a
 #: random directory. Playwright/Puppeteer/Selenium unpack a versioned release
@@ -404,50 +416,98 @@ def automation_driver(pid, depth: int = 6) -> dict:
     return {}
 
 
+def browser_layout(exe: str) -> str:
+    """The browser-layout directory component of *exe*, or ``""``.
+
+    Structural, never path-specific: any component named ``browsers``,
+    ``ms-playwright``, ``chromium-<version>``, ``chrome-linux64`` and so on
+    counts, on any host. Returns the component so the report can name what it
+    matched instead of asserting an exemption from nowhere.
+    """
+    parts = [p for p in str(exe or "").split("/") if p]
+    for part in parts[:-1]:
+        if _BROWSER_LAYOUT_RX.match(part):
+            return part
+    return ""
+
+
+def is_browser_helper(name: str) -> bool:
+    return bool(_BROWSER_HELPER_RX.match(str(name or "").strip()))
+
+
 def browser_automation(pid, exe: str, depth: int = 6) -> str:
     """Describe *exe* as a browser-automation bundle, or ``""`` if it is not.
 
-    A browser automation tool downloads a browser *release* into a temp
-    directory and runs it from there. By path alone that is the same shape as
-    "a binary executing out of /tmp", which is a real malware signature -- so
-    every automation run tripped the check.
+    The judgement is **structural**, and it is exactly two facts:
 
-    The exemption is structural, never path-specific. All three must hold:
+      * some parent directory of the executable names a browser distribution
+        layout (``chromium-<version>``, ``chrome-linux64``, ``browsers``,
+        ``ms-playwright``, ...), **and**
+      * the executable's basename is a known browser binary or a browser
+        **helper** (``chrome_crashpad_handler``, ``crashpad_handler``).
 
-      * the executable's basename is a known browser binary, **and**
-      * some parent directory of it names a browser distribution layout
-        (``chromium-<version>``, ``chrome-linux64``, ``browsers``, ...),
-        **and**
-      * a trusted automation runtime is anywhere in the ancestor chain up to
-        ``depth`` -- not only the direct parent, because automation normally
-        launches through a wrapper (see :func:`automation_driver`).
+    Nothing else is required, and the reason is empirical rather than
+    theoretical. An earlier version also demanded a trusted automation runtime
+    somewhere in the ancestor chain, and on a real host that produced two
+    false reports on every single automation run:
 
-    All three, not any one: an arbitrary ELF dropped in ``/tmp`` still warns,
-    a browser binary outside a release layout still warns, and a real browser
-    bundle launched by a shell with no runtime above it still warns. Only the
-    shape that automation actually produces is downgraded.
+      * a crashpad helper is **designed** to outlive the browser that spawned
+        it and is reparented to init, so its ancestor chain is expected to be
+        broken -- demanding one flagged two processes per run;
+      * upgrading the browser release *while a browser is running* unlinks the
+        running process's image, so a legitimate automation browser appeared
+        as "可执行文件已被删除", the single most alarming line this check can
+        print.
+
+    What is still not exempted, and must not become so: an arbitrary ELF in a
+    temp directory (no release layout), a browser binary outside a release
+    layout, and any other filename -- a payload dropped next to a browser
+    release is still reported. The residual risk is that malware *could* name
+    itself `chrome` and live in a directory called `browsers`; it is accepted
+    because this classification only ever removes a process from a *report*
+    and from a downstream action that requires its own two independent
+    signals (see `procresponse`), and because the alternative was a false
+    alarm on every automation run.
+
+    When a driver *is* found, the explanation names it. That is for the
+    operator's benefit -- "who started this" is the next question they will
+    ask -- and never a condition of the verdict.
     """
-    name = os.path.basename(str(exe).rstrip("/"))
-    if name.lower() not in _BROWSER_BINARIES:
+    name = os.path.basename(str(exe or "").rstrip("/"))
+    layout = browser_layout(exe)
+    if not name or not layout:
         return ""
-    parts = [p for p in str(exe).split("/") if p]
-    if not any(_BROWSER_LAYOUT_RX.match(p) for p in parts[:-1]):
+    helper = is_browser_helper(name)
+    if name.lower() not in _BROWSER_BINARIES and not helper:
         return ""
     driver = automation_driver(pid, depth)
-    if driver:
-        return ("疑似自动化工具链：%s 浏览器发行包，由 %s(pid %s) 驱动"
-                % (name, driver.get("comm") or "?", driver.get("pid")))
-    return ""
+    lineage = ("，由 %s(pid %s) 驱动" % (driver.get("comm") or "?",
+                                        driver.get("pid")) if driver else
+              "，进程链上已找不到驱动它的运行时（helper 被重新挂载、"
+              "或发行包升级后原进程已退出，都属正常）")
+    kind = "helper " if helper else ""
+    return ("疑似自动化工具链%s：%s 位于浏览器发行包布局（%s）内%s"
+            % ("残留" if helper else "", name, layout, lineage))
 
 
 def suspect_procs_detail(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
     """Suspicious processes as dicts.
 
-    Each hit is ``{pid, comm, exe, kind, automation}``. ``kind`` is
+    Each hit is ``{pid, comm, exe, kind, automation, reason}``. ``kind`` is
     ``"deleted"`` (the binary is gone from disk) or ``"temp"`` (running out of
-    a temp dir); ``automation`` is a non-empty description when the temp-dir
-    hit matches a browser-automation bundle. Only the temp-dir branch can be
-    downgraded -- a genuinely deleted binary is never "probably fine".
+    a temp dir); ``automation`` is a non-empty structural explanation when the
+    hit is a browser-automation bundle or its leftover helper, and is empty
+    otherwise.
+
+    Both branches consult :func:`browser_automation`, including the deleted
+    one. That is deliberate and it fixed a real false report: Playwright keeps
+    a versioned browser release under a temp directory, and when that release
+    is upgraded while a browser is running, the running process's executable
+    is unlinked -- so a legitimate automation browser showed up as "可执行
+    file已被删除", the single most alarming line this check can print. The
+    structural test (release layout + browser/helper basename) is what tells
+    the two apart; a memory-resident payload does not live inside
+    ``<...>/browsers/chromium-<version>/chrome-linux64/``.
     """
     hits = []
     for pid in os.listdir("/proc"):
@@ -464,7 +524,8 @@ def suspect_procs_detail(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
             # it when the path is genuinely gone.
             if not os.path.exists(real):
                 hits.append({"pid": int(pid), "comm": comm, "exe": real,
-                             "kind": "deleted", "automation": ""})
+                             "kind": "deleted",
+                             "automation": browser_automation(pid, real)})
         elif any(exe.startswith(d.rstrip("/") + "/") for d in tmp_dirs):
             hits.append({"pid": int(pid), "comm": comm, "exe": exe,
                          "kind": "temp",
@@ -473,12 +534,21 @@ def suspect_procs_detail(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
 
 
 def suspect_line(hit: dict) -> str:
-    """One human-readable line for a :func:`suspect_procs_detail` hit."""
-    if hit.get("kind") == "deleted":
-        return ("%s(pid %s) 可执行文件已被删除且磁盘上不存在: %s"
-                % (hit.get("comm") or "?", hit.get("pid"), hit.get("exe")))
-    return ("%s(pid %s) 从临时目录运行: %s"
+    """One human-readable line for a :func:`suspect_procs_detail` hit.
+
+    When the hit has been classified as automation the line says so, in the
+    same sentence as the raw fact. Two reasons: the operator sees *what was
+    matched* rather than a bare dismissal, and the check's "already exempt"
+    list is auditable instead of being a number.
+    """
+    what = ("%s(pid %s) 可执行文件已被删除且磁盘上不存在: %s"
+            % (hit.get("comm") or "?", hit.get("pid"), hit.get("exe"))
+            if hit.get("kind") == "deleted" else
+            "%s(pid %s) 从临时目录运行: %s"
             % (hit.get("comm") or "?", hit.get("pid"), hit.get("exe")))
+    if hit.get("automation"):
+        what += "　→ 已自动判定为%s，不计为可疑" % hit["automation"]
+    return what
 
 
 def suspect_procs(tmp_dirs=("/tmp", "/var/tmp", "/dev/shm")) -> list:
