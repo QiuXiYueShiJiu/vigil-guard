@@ -584,8 +584,28 @@ class Installer:
             "-f 1",
             "",
             "# Privileged command execution by unprivileged callers.",
-            "-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 -k vigil_exec",
-            "-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 -k vigil_exec",
+            # `-F auid>=1000` on its own is NOT the filter it looks like. The
+            # kernel reports an *unset* loginuid as 4294967295 (the unsigned
+            # form of -1), and that value satisfies `>= 1000`. So the rule
+            # matched every root execve on the machine -- including those made
+            # by systemd services, which have no login session at all.
+            #
+            # Measured on a live host (2026-10-17): 25137 of 25314 records
+            # (99.3%) were unset-auid noise, from commands as mundane as
+            # date/cut/tr/grep. Each execve produces ~9 audit records, and each
+            # record is written twice -- once by auditd and once by
+            # systemd-journald. That was ~875 KB/s of journal writes at idle,
+            # 99.4% of them audit, which saturated the (slow) disk's ext4
+            # journal and parked auditd, journald, jbd2 and everything behind
+            # them in uninterruptible I/O wait. The symptom the operator saw
+            # was "running dsh sessions in parallel freezes the box".
+            #
+            # The exclusion restores the stated intent: an unprivileged caller
+            # escalating to root, not a daemon starting up.
+            "-a always,exit -F arch=b64 -S execve -F euid=0 -F auid>=1000 "
+            "-F auid!=4294967295 -k vigil_exec",
+            "-a always,exit -F arch=b32 -S execve -F euid=0 -F auid>=1000 "
+            "-F auid!=4294967295 -k vigil_exec",
             "",
             "# File watches. Existence is verified because a missing target",
             "# aborts the remainder of the file.",

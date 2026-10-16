@@ -456,6 +456,137 @@ class ZombieProcesses(Check):
         return CheckResult(OK, "僵尸进程 %d 个（低于告警阈值 %d）" % (len(zombies), warn))
 
 
+# --------------------------------------------------------------------------
+# site_availability: turning configured site name(s) into probe targets
+# --------------------------------------------------------------------------
+
+#: Severity order, so several sites can be judged together.
+_STATUS_RANK = {OK: 0, WARN: 1, CRIT: 2}
+
+
+def _worse(candidate: str, current: str) -> bool:
+    """Is *candidate* more severe than *current*?"""
+    return _STATUS_RANK.get(candidate, 1) > _STATUS_RANK.get(current, 0)
+
+
+def _idna(name: str) -> str:
+    """Punycode-encode an internationalised name, label by label.
+
+    ``str.encode("idna")`` on the whole string is stricter than it needs to
+    be -- it rejects a trailing dot and some separators -- and one awkward
+    label should not cost us the rest of the name. ASCII labels pass through
+    untouched, which leaves an already-punycode name exactly as it was.
+    """
+    out = []
+    for label in name.split("."):
+        if not label:
+            raise ValueError("域名里有空的标签")
+        try:
+            label.encode("ascii")
+            out.append(label)
+        except UnicodeEncodeError:
+            out.append(label.encode("idna").decode("ascii"))
+    return ".".join(out)
+
+
+def normalize_probe_domain(value):
+    """``(host, port_or_None, error)`` for one configured site name.
+
+    Accepts what an operator actually types -- a bare name, a URL, a name with
+    a port, a trailing root dot, an internationalised name -- and returns the
+    host in punycode.
+
+    Punycode is not cosmetic. nginx stores ``server_name`` in its IDNA form, so
+    a probe carrying the raw UTF-8 name does not match the vhost at all: the
+    request lands on the default server instead, and the check then reports a
+    perfectly healthy site as down. curl is worse -- it will not resolve a
+    non-ASCII ``--resolve`` target and returns 000, which the check turned
+    into a CRIT "站点无响应".
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "", None, "空的域名"
+    scheme = re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*://", text)
+    if scheme:
+        text = text[scheme.end():]
+    text = re.split(r"[/?#]", text, 1)[0]              # drop path/query/fragment
+    if "@" in text:                                     # drop user:pass@
+        text = text.rsplit("@", 1)[1]
+    port = None
+    if text.startswith("["):                            # [::1]:443
+        host, _, rest = text[1:].partition("]")
+        text = host
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+    else:
+        head, sep, tail = text.rpartition(":")
+        if sep and tail.isdigit() and head:
+            text, port = head, int(tail)
+    text = text.strip().rstrip(".")
+    if not text:
+        return "", None, "空的域名"
+    if any(c.isspace() for c in text):
+        return "", None, "域名里含空白字符"
+    try:
+        text.encode("ascii")
+        host = text
+    except UnicodeEncodeError:
+        try:
+            host = _idna(text)
+        except Exception as e:                          # noqa: BLE001
+            return "", None, ("不是有效的国际化域名（%s）；"
+                              "请改用 punycode 形式，例如 xn--…" % e)
+    if not host:
+        return "", None, "空的域名"
+    return host, port, ""
+
+
+def site_targets(value):
+    """``(targets, problems)`` from ``checks.site_availability.domain``.
+
+    ``targets`` is ``[(host, port_or_None), ...]`` with hosts in punycode.
+
+    This key used to be a single string and the code assumed one: passing a
+    list raised ``AttributeError: 'list' object has no attribute 'strip'``,
+    which the runner turned into a bare "检查执行异常" naming neither the key
+    nor the reason. An operator with several sites has to be able to name them
+    all, so a list is accepted now -- and a wrong type is reported as a
+    configuration mistake rather than an execution failure.
+    """
+    if value is None:
+        return [], []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return [], [
+            "checks.site_availability.domain 只能是字符串或字符串列表，"
+            "当前是 %s：%s —— 请改成例如 www.example.com，"
+            "或 [\"www.example.com\", \"shop.example.com\"]"
+            % (type(value).__name__, repr(value))]
+
+    targets, problems, seen = [], [], set()
+    for item in items:
+        if not isinstance(item, str):
+            problems.append("%s 不是字符串（%s），已跳过"
+                            % (repr(item), type(item).__name__))
+            continue
+        if not item.strip():
+            # 空串是「没配」，不是「配错了」：这个键的默认值就是 ""，
+            # 而推断闸门失败时也返回 ""。把它报成错误只会制造噪声。
+            continue
+        host, port, err = normalize_probe_domain(item)
+        if err:
+            problems.append("%s 无法使用：%s" % (repr(item), err))
+            continue
+        if host in seen:
+            continue
+        seen.add(host)
+        targets.append((host, port))
+    return targets, problems
+
+
 @register
 class SiteAvailability(Check):
     id = "site_availability"
@@ -469,83 +600,52 @@ class SiteAvailability(Check):
         crit_pct = float(ctx.copt("site_availability", "crit_5xx_pct", 20))
         log_lines = int(ctx.copt("site_availability", "log_lines", 200) or 200)
 
-        domain = (ctx.copt("site_availability", "domain", "") or "").strip()
-        if not domain:
+        targets, problems = site_targets(
+            ctx.copt("site_availability", "domain", ""))
+        if not targets and not problems:
             # 未显式配置时，从已安装的闸门推断 —— 否则这个检查默认什么都不监控，
             # 而它存在的意义正是「站点挂了要能发现」。
-            domain = infer_site_domain(ctx.cfg)
-        if not domain:
+            targets, problems = site_targets(infer_site_domain(ctx.cfg))
+        if not targets:
+            if problems:
+                return CheckResult(WARN, "站点可用性检查无法执行：\n       %s"
+                                   % "\n       ".join(problems))
             return CheckResult(WARN, "未配置站点域名（checks.site_availability.domain），"
                                      "且没有已启用的登录闸门可供推断 —— "
                                      "网站可用性检查当前不会监控任何站点")
-        gate = gate_for_site(ctx.cfg, domain)
-
-        problems = []
-        status = OK
-        # Set inside the status branch below when the site is gated and the
-        # challenge is the designed answer. Initialised here so the success
-        # paths can mention it without a `locals()` lookup.
-        gate_note = ""
-        code = ""
 
         if not shell.have("curl"):
-            problems.append("未安装 curl，无法探测站点 HTTP 状态")
-            status = WARN
-        else:
-            try:
-                port = int(ctx.copt("site_availability", "port", 443) or 443)
-            except (TypeError, ValueError):
-                port = 443
-            scheme = "https" if port in (443, 8443) else "http"
-            ok, out, _err = shell.run(
-                ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
-                 "--max-time", "8",
-                 "--resolve", "%s:%d:127.0.0.1" % (domain, port),
-                 "-H", "Host: %s" % domain,
-                 "%s://%s/" % (scheme, domain)], timeout=12)
-            code = (out or "").strip() if ok else ""
-            if not code or code == "000":
-                # A gate does not change this: if nothing answers, the site is
-                # down, whatever is supposed to be in front of it.
-                status = CRIT
-                problems.append("站点首页无响应（%s://%s/ 返回 %s）—— 站点可能已宕机，"
-                                "请检查 nginx 与 PHP-FPM/数据库"
-                                % (scheme, domain, code or "无响应"))
-            elif code in _FAILURE_CODES or code.startswith("5"):
-                # Also unchanged by a gate, and this is the distinction that
-                # keeps the exemption honest: a gate that cannot serve its own
-                # challenge is a broken gate, which is *more* alarming than a
-                # broken site -- the protected thing is exposed while looking
-                # protected. So a 5xx from a gated site is still CRIT.
-                status = CRIT
-                problems.append(
-                    "站点首页返回 **HTTP %s**%s，后端服务可能已崩溃"
-                    % (code, "（该站点有登录闸门，但连验证页都打不开）"
-                       if gate else ""))
-            elif gate and code in _GATE_CODES:
-                # The designed answer from a gated path.
-                gate_note = "站点有登录闸门（%s），401/403 是设计行为" % (
-                    gate.get("matched") or gate.get("section"))
-            elif gate and code in _HEALTHY_CODES and code.startswith("3"):
-                gate_note = ("站点有登录闸门（%s），跳转到验证页是设计行为"
-                             % (gate.get("matched") or gate.get("section")))
-            elif code not in _HEALTHY_CODES:
-                if status == OK:
-                    status = WARN
-                problems.append("站点首页返回异常 HTTP %s（期望 200/3xx%s）"
-                                % (code, "，或闸门的 401/403" if gate else ""))
+            return CheckResult(WARN, "未安装 curl，无法探测站点 HTTP 状态")
+
+        try:
+            default_port = int(ctx.copt("site_availability", "port", 443) or 443)
+        except (TypeError, ValueError):
+            default_port = 443
+
+        # One line per site: with several configured, a bare "网站正常" would
+        # hide which one is unwell -- and naming several is only useful if each
+        # is reported on its own.
+        status = OK
+        healthy = []
+        for host, port in targets:
+            site_status, text = self._probe(ctx, host, port or default_port)
+            if site_status == OK:
+                healthy.append(text)
+            else:
+                problems.append(text)
+                if _worse(site_status, status):
+                    status = site_status
 
         # 5xx ratio from the tail of the first nginx access log we know about.
+        # Deliberately global: it is a property of the server's traffic rather
+        # than of any single vhost.
         logs = list((ctx.env.get("log_sources") or {}).get("nginx_access") or [])
-        ratio_note = ""
         if logs:
             log = logs[0]
             codes = self._tail_codes(log, log_lines)
             if codes:
                 bad = sum(1 for c in codes if c.startswith("5"))
                 pct = bad * 100.0 / len(codes)
-                ratio_note = "最近 %d 条请求中 5xx 占 %.1f%%（%d 条），日志 %s" % (
-                    len(codes), pct, bad, log)
                 if pct >= crit_pct:
                     status = CRIT
                     problems.append("网站 5xx 错误率过高：**%.1f%%**（%d/%d）"
@@ -555,15 +655,61 @@ class SiteAvailability(Check):
                         status = WARN
                     problems.append("网站 5xx 错误率偏高：%.1f%%（%d/%d）"
                                     % (pct, bad, len(codes)))
+                else:
+                    healthy.append("最近 %d 条请求中 5xx 占 %.1f%%（%d 条），日志 %s"
+                                   % (len(codes), pct, bad, log))
 
         if problems:
-            return CheckResult(status, "\n     ".join(problems))
-        suffix = ("；%s" % gate_note) if gate_note else ""
-        if ratio_note:
-            return CheckResult(OK, "网站正常（HTTP %s）%s；%s"
-                               % (code, suffix, ratio_note))
-        return CheckResult(OK, "网站正常（HTTP %s%s，未找到可统计的访问日志）"
-                           % (code, "，" + gate_note if gate_note else ""))
+            detail = "\n     ".join(problems)
+            if healthy and len(targets) > 1:
+                # 多站点时要说清哪些是好的：只有故障行的报告读不出
+                # 「问题只在这一站」还是「全站都挂了」。
+                detail += "\n     其余站点正常：%s" % "；".join(healthy)
+            return CheckResult(status, detail)
+        if healthy:
+            return CheckResult(OK, "；".join(healthy))
+        return CheckResult(OK, "网站正常（未找到可统计的访问日志）")
+
+    def _probe(self, ctx: CheckContext, domain: str, port: int):
+        """Probe one site over loopback. Returns ``(status, text)``."""
+        scheme = "https" if port in (443, 8443) else "http"
+        gate = gate_for_site(ctx.cfg, domain)
+        target = "%s://%s/" % (scheme, domain)
+        ok, out, _err = shell.run(
+            ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}",
+             "--max-time", "8",
+             "--resolve", "%s:%d:127.0.0.1" % (domain, port),
+             "-H", "Host: %s" % domain,
+             target], timeout=12)
+        code = (out or "").strip() if ok else ""
+        if not code or code == "000":
+            # A gate does not change this: if nothing answers, the site is
+            # down, whatever is supposed to be in front of it.
+            return CRIT, ("%s：站点首页无响应（%s 返回 %s）—— 站点可能已宕机，"
+                          "请检查 nginx 与 PHP-FPM/数据库"
+                          % (domain, target, code or "无响应"))
+        if code in _FAILURE_CODES or code.startswith("5"):
+            # Also unchanged by a gate, and this is the distinction that keeps
+            # the exemption honest: a gate that cannot serve its own challenge
+            # is a broken gate, which is *more* alarming than a broken site --
+            # the protected thing is exposed while looking protected. So a 5xx
+            # from a gated site is still CRIT.
+            return CRIT, ("%s：站点首页返回 **HTTP %s**%s，后端服务可能已崩溃"
+                          % (domain, code,
+                             "（该站点有登录闸门，但连验证页都打不开）"
+                             if gate else ""))
+        if gate and code in _GATE_CODES:
+            # The designed answer from a gated path.
+            return OK, ("%s：站点有登录闸门（%s），401/403 是设计行为"
+                        % (domain, gate.get("matched") or gate.get("section")))
+        if gate and code in _HEALTHY_CODES and code.startswith("3"):
+            return OK, ("%s：站点有登录闸门（%s），跳转到验证页是设计行为"
+                        % (domain, gate.get("matched") or gate.get("section")))
+        if code not in _HEALTHY_CODES:
+            return WARN, ("%s：站点首页返回异常 HTTP %s（期望 200/3xx%s）"
+                          % (domain, code,
+                             "，或闸门的 401/403" if gate else ""))
+        return OK, "%s：网站正常（HTTP %s）" % (domain, code)
 
     @staticmethod
     def _tail_codes(path, want: int) -> list:

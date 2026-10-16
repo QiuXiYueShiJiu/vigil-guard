@@ -292,6 +292,62 @@ sudo vigil config set checks.site_availability.domain status.example.com
 sudo vigil config set checks.site_availability.port 443
 ```
 
+有多个站点时把域名写成列表，每一项都会被单独探测、单独汇报；
+条目里可以带 `:端口` 覆盖全局端口：
+
+```sh
+sudo vigil config set checks.site_availability.domain \
+  '["status.example.com", "shop.example.com:8443"]'
+```
+
+两点值得知道：
+
+- **国际化域名会自动转成 punycode。** nginx 的 `server_name` 存的就是 punycode，
+  拿原始 UTF-8 名去探测根本匹配不到那个 vhost，请求会落到默认 server 上，
+  于是一个好端端的站点被报成「无响应」。你不用自己转，也不该自己转。
+- **类型写错会明确告诉你。** 这个键只接受字符串或字符串列表；写成数字之类
+  会得到一条指名该键的 WARN，而不是一句语焉不详的「检查执行异常」。
+
+### 本地服务未授权
+
+只监听回环的服务，不等于安全：外网够不着，但本机任何进程、以及 Web 应用的
+SSRF 都够得着。这个检查实测「不带任何凭据能不能拿到回答」，而不是去读配置文件
+怎么写的：
+
+```sh
+sudo vigil config set checks.local_service_auth.redis_eol '["5.0", "6.0"]'
+```
+
+`checks.local_service_auth.redis_eol` 是**已经停止安全支持的 Redis 版本线**。
+它放在配置里而不是写死在代码里，因为这张表会过时——把你确认过的版本线写进来，
+或者留空 `[]` 直接关掉这一项。端口可用
+`checks.local_service_auth.redis_port` 调整。
+
+### PHP 的这几点默认不吵
+
+`php_config` 除危险函数、`open_basedir`、远程文件包含之外，还会报
+`display_errors = On`（把路径、调用栈、SQL 片段回显给访客）和
+`session.cookie_httponly` 未开启（一处 XSS 就能盗走登录态）。
+
+`allow_url_fopen` **默认不报**：绝大多数发行版默认就是 `On`，而不少应用真的
+依赖它；默认告警会让这个检查在几乎每台机器上长鸣，把真问题淹掉。确实想管它时：
+
+```sh
+sudo vigil config set checks.php_config.flag_allow_url_fopen true
+```
+
+### 自我封禁防护与 SSH 加固
+
+这两项没有配置键，它们只报告、不修改任何东西：
+
+- `self_protection` 实测「本机地址是不是真的封不掉」。vigil 的 DROP 规则排在
+  iptables INPUT 第一条、在 ufw 之前，所以这条护栏失效的代价是 SSH 与全部管理页
+  同时失联。它会揪出两种静默失效：枚举本机地址的命令不可用（自动豁免会悄悄退化成
+  「只剩回环」），以及 `threat.auto_whitelist_local` 被关掉后没人补白名单。
+- `ssh_hardening` 报告 `PermitRootLogin yes`、以及「开着口令登录却一个
+  authorized_keys 都没有」。它**故意不改 sshd_config**：在没握有一把验证过能用的
+  密钥之前就关掉口令登录，是把自己锁在门外的标准做法，这个决定必须由人来下。
+
 ## 配置校验
 
 `vigil config validate` 会指出真正会让告警发不出去的问题：没有渠道、没有收件人、

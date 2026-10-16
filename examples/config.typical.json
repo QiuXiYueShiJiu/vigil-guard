@@ -46,6 +46,7 @@
       "::1",
       "203.0.113.10/32"
     ],
+    "auto_whitelist_local": true,
     "notify_bans": true,
     "notify_ssh_success": true,
     "ssh": {
@@ -160,6 +161,14 @@
       "warn_5xx_pct": 5,
       "crit_5xx_pct": 20,
       "log_lines": 200
+    },
+    "php_config": {
+      "ini_paths": [],
+      "flag_allow_url_fopen": false
+    },
+    "local_service_auth": {
+      "redis_port": 6379,
+      "redis_eol": ["5.0", "6.0"]
     },
     "self_integrity": {
       "paths": [],

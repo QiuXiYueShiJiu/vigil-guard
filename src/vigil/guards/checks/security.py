@@ -209,6 +209,29 @@ class PhpConfig(Check):
             m = re.search(r"^\s*open_basedir\s*=\s*(.*)$", text, re.M)
             if m and not m.group(1).strip():
                 hits.append("%s 未设置 open_basedir（WebShell 可读取任意目录）" % ini)
+            # 下面三项来自一台在线生产机的实测：都是「应用能跑，但把内部
+            # 信息或会话交给了访客」的配置，靠崩溃是发现不了的。
+            #
+            # 只对 Web 侧的 ini 生效。命令行下 display_errors=On 是正确的
+            # （你就想看见错误），cookie_httponly 在 CLI 里没有意义，
+            # 把它们一起算进来只会制造假警报，把真问题淹掉。
+            web_facing = "php-cli" not in os.path.basename(ini)
+            if web_facing and re.search(r"^\s*display_errors\s*=\s*On",
+                                        text, re.M | re.I):
+                hits.append("%s 开启了 display_errors（生产环境会把文件路径、"
+                            "调用栈、SQL 片段回显给访客，等于免费给攻击者指路）" % ini)
+            if web_facing and re.search(
+                    r"^\s*session\.cookie_httponly\s*=\s*(off|0)?\s*$",
+                    text, re.M | re.I):
+                hits.append("%s 未开启 session.cookie_httponly（会话 Cookie 可被 "
+                            "JavaScript 读取，一处 XSS 就能直接盗走登录态）" % ini)
+            # allow_url_fopen 默认就是 On，且不少应用真的依赖它。把它做成
+            # 选择项而不是默认告警，否则这项检查会在几乎每台机器上长鸣。
+            if web_facing and \
+                    bool(ctx.copt("php_config", "flag_allow_url_fopen", False)) and \
+                    re.search(r"^\s*allow_url_fopen\s*=\s*On", text, re.M | re.I):
+                hits.append("%s 开启了 allow_url_fopen（配合 SSRF 可让 PHP "
+                            "主动去取攻击者指定的远端内容）" % ini)
         if hits:
             return CheckResult(WARN, "PHP 安全配置存在风险：\n       %s\n"
                                      "       这会拆掉 WebShell 面前的最后一道防线，"
@@ -468,3 +491,264 @@ class SuspiciousProcesses(Check):
                            "是恶意程序/内存马的典型特征）：\n       %s%s\n%s"
                            % (len(suspicious), "\n       ".join(lines), note,
                               report + tail if report else tail.lstrip("\n")))
+
+
+# --------------------------------------------------------------------------
+# v3.3.2 新增：三项来自一台在线生产机的实测发现
+# --------------------------------------------------------------------------
+
+
+@register
+class SelfProtection(Check):
+    id = "self_protection"
+    label = "自我封禁防护"
+    label_en = "Self-ban protection"
+    group = G_SECURITY
+    description = "实测本机地址是否真的封不掉（自动豁免这条护栏是否真的在生效）"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        """Verify the "never ban myself" rail, instead of assuming it.
+
+        ``Whitelist`` already exempts every address found on a local interface,
+        and ``netblock_blockers`` refuses a range that contains one -- so this
+        check deliberately does **not** re-implement either. What it verifies is
+        that the rail is actually load-bearing on *this* host, because it can
+        fail silently in two ways:
+
+        * ``local_addresses()`` reads ``ip -o addr show``. If that command is
+          missing or fails, it quietly returns loopback only, and the
+          self-exemption degrades to "loopback cannot be banned" -- which is
+          not the rail anyone is relying on.
+        * ``threat.auto_whitelist_local`` can be switched off, after which an
+          address is protected only if it is written into ``threat.whitelist``
+          by hand.
+
+        Both matter more than they look: vigil's DROP rule sits at INPUT
+        position 1, ahead of ufw, so a mistaken ban on this host's own address
+        takes out SSH and every admin page at once -- that is the shape of the
+        worst outage in this project's history.
+
+        Known limit: on a host behind NAT the public address is not on any
+        interface, so nothing here can recognise it. Say so rather than pretend
+        otherwise.
+        """
+        from .. import threat
+
+        entries = list(ctx.cfg.get("threat.whitelist", []) or [])
+        auto = bool(ctx.cfg.get("threat.auto_whitelist_local", True))
+
+        try:
+            local = sorted(threat.local_addresses())
+        except Exception as e:                          # noqa: BLE001
+            return CheckResult(
+                WARN, "无法枚举本机地址（%s: %s）—— 无法确认「本机封不掉」"
+                      "这条护栏是否生效" % (type(e).__name__, e))
+
+        non_loopback = [a for a in local if a not in ("127.0.0.1", "::1")]
+
+        wl = threat.Whitelist(entries, auto)
+        exposed = [a for a in local if not wl.allowed(a)]
+        if exposed:
+            return CheckResult(
+                CRIT,
+                "本机地址不在封禁豁免内：%s\n"
+                "       vigil 的 DROP 规则排在 iptables INPUT 第 1 条、在 ufw 之前，"
+                "这些地址一旦被自动封禁，SSH 与全部管理页会同时失联。\n"
+                "       请打开 threat.auto_whitelist_local，"
+                "或把上述地址显式加入 threat.whitelist。"
+                % "、".join(exposed))
+
+        if not non_loopback:
+            why = ("`ip` 命令不可用" if not shell.have("ip")
+                   else "`ip addr show` 没有返回任何地址")
+            return CheckResult(
+                WARN,
+                "只枚举到回环地址，没有找到任何本机对外地址（%s）—— "
+                "「自动豁免本机地址」这条护栏实际上只剩回环在生效。\n"
+                "       在修好之前，请把本机的对外地址显式写进 threat.whitelist，"
+                "否则一旦误判，服务器会把自己封在门外。" % why)
+
+        note = ""
+        if not auto:
+            note = ("（threat.auto_whitelist_local 已关闭，当前只靠显式白名单条目"
+                    "豁免本机地址）")
+        return CheckResult(OK, "本机 %d 个地址均已豁免封禁：%s%s"
+                           % (len(local), "、".join(local), note))
+
+
+@register
+class LocalServiceAuth(Check):
+    id = "local_service_auth"
+    label = "本地服务未授权"
+    label_en = "Unauthenticated local services"
+    group = G_SECURITY
+    description = "探测仅监听回环的服务是否允许无认证访问（Redis 等）"
+
+    #: Redis lines that no longer receive security fixes. The values live in
+    #: ``checks.local_service_auth.redis_eol`` (config defaults) rather than
+    #: here, so an operator can correct the table without a code change --
+    #: this class attribute is only the fallback for a config that predates it.
+    _REDIS_EOL = ("5.0", "6.0")
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        """A service bound to loopback is not "safe" if it needs no password.
+
+        Binding to 127.0.0.1 only removes the internet as an attacker; every
+        process on the box can still reach it, and a web app's SSRF is the
+        classic way in. Redis without a password is a well-worn path to writing
+        files and, from there, to running as the web user.
+
+        The probe is behavioural rather than config-reading: what matters is
+        whether an unauthenticated client gets an answer, not what the config
+        file intended.
+        """
+        problems, verified = [], []
+        self._check_redis(ctx, problems, verified)
+        if problems:
+            return CheckResult(
+                WARN, "本地服务允许未授权访问：\n       %s\n"
+                      "       仅监听回环只是挡住了外网；本机任何进程，"
+                      "以及 Web 应用的 SSRF，都仍然够得着。"
+                      % "\n       ".join(problems))
+        if verified:
+            return CheckResult(OK, "本地服务均要求认证（已核实：%s）"
+                               % "、".join(verified))
+        return CheckResult(OK, "未检测到需要检查的本地服务")
+
+    def _check_redis(self, ctx: CheckContext, problems: list,
+                     verified: list) -> None:
+        if not shell.have("redis-cli"):
+            return
+        port = int(ctx.copt("local_service_auth", "redis_port", 6379) or 6379)
+        ok, out, err = shell.run(
+            ["redis-cli", "-h", "127.0.0.1", "-p", str(port), "PING"],
+            timeout=6)
+        text = "%s %s" % (out or "", err or "")
+        if "PONG" in text:
+            detail = "Redis（127.0.0.1:%d）**未设密码** —— PING 直接返回 PONG" % port
+            version = self._redis_version()
+            if version:
+                detail += "；版本 %s" % version
+                if self._redis_eol(ctx, version):
+                    detail += "（该版本已停止安全支持）"
+            problems.append(detail)
+        elif any(s in text for s in ("NOAUTH", "WRONGPASS",
+                                     "Authentication required")):
+            verified.append("Redis 已设密码")
+        # "Could not connect" simply means it is not running: not a finding.
+
+    @staticmethod
+    def _redis_version() -> str:
+        ok, out, _err = shell.run(["redis-server", "-v"], timeout=5)
+        if not ok:
+            return ""
+        m = re.search(r"v=([0-9][0-9.]*)", out or "")
+        return m.group(1).rstrip(".") if m else ""
+
+    def _redis_eol(self, ctx: CheckContext, version: str) -> bool:
+        lines = ctx.copt("local_service_auth", "redis_eol", None)
+        if lines is None:
+            lines = list(self._REDIS_EOL)
+        line = ".".join(str(version).split(".")[:2])
+        return line in {str(x) for x in lines or []}
+
+
+@register
+class SshHardening(Check):
+    id = "ssh_hardening"
+    label = "SSH 加固"
+    label_en = "SSH hardening"
+    group = G_SECURITY
+    description = "检查 sshd 是否允许 root 直接登录、是否用口令登录且没配密钥"
+
+    #: Where the fallback parse reads from when `sshd -T` is unavailable.
+    #: A class attribute so a test can point it at a fixture instead of the
+    #: host's real file.
+    CONFIG_PATH = "/etc/ssh/sshd_config"
+
+    def run(self, ctx: CheckContext) -> CheckResult:
+        """Report the two settings that decide how guessable SSH is.
+
+        This check only ever *reports*: it never edits sshd_config. Turning off
+        password authentication from a program that is not holding a verified
+        working key is how an operator locks themselves out of their own
+        machine -- the change has to be made by a human who has just confirmed
+        the key works.
+        """
+        effective = self._effective()
+        if effective is None:
+            return CheckResult(OK, "无法读取 sshd 生效配置（可能未安装 SSH），跳过检查")
+
+        problems = []
+        root_login = (effective.get("permitrootlogin") or "").strip().lower()
+        password = (effective.get("passwordauthentication") or "").strip().lower()
+
+        if root_login == "yes":
+            problems.append("`PermitRootLogin yes` —— 允许以 root 身份直接登录，"
+                            "攻击者不需要先猜到一个普通用户名")
+
+        keys = self._authorized_key_files()
+        if password == "yes" and not keys:
+            problems.append("`PasswordAuthentication yes` 且整机没有任何 "
+                            "authorized_keys —— 登录唯一的防线就是口令强度，"
+                            "没有密钥这一层")
+        elif password == "yes":
+            problems.append("`PasswordAuthentication yes`（已配置 %d 个 "
+                            "authorized_keys，建议在确认密钥可用后关闭口令登录）"
+                            % len(keys))
+
+        if not problems:
+            return CheckResult(OK, "SSH 关键项正常（未允许 root 直接登录，"
+                                   "且未开启口令登录）")
+        return CheckResult(WARN, "SSH 配置偏松：\n       %s\n"
+                                 "       本项只报告、不修改：关掉口令登录前，"
+                                 "必须先确认密钥真的能登上，否则会把自己锁在门外。"
+                           % "\n       ".join(problems))
+
+    @staticmethod
+    def _effective() -> dict:
+        """``sshd -T`` if we can get it, else a flat read of sshd_config.
+
+        ``sshd -T`` is worth preferring because it is what sshd itself will
+        use -- it resolves Include files and fills in compiled-in defaults,
+        neither of which a grep over the config file does.
+        """
+        if shell.have("sshd"):
+            ok, out, _err = shell.run(["sshd", "-T"], timeout=10)
+            if ok and out:
+                result = {}
+                for line in out.splitlines():
+                    parts = line.split(None, 1)
+                    if len(parts) == 2:
+                        result[parts[0].strip().lower()] = parts[1].strip()
+                if result:
+                    return result
+        try:
+            with open(SshHardening.CONFIG_PATH, "r",
+                      encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            return None
+        result = {}
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                result[parts[0].strip().lower()] = parts[1].strip()
+        return result or None
+
+    @staticmethod
+    def _authorized_key_files() -> list:
+        found = []
+        for home in ("/root",) + tuple(
+                p.pw_dir for p in pwd.getpwall()
+                if p.pw_dir.startswith("/home/")):
+            path = os.path.join(home, ".ssh", "authorized_keys")
+            try:
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    found.append(path)
+            except OSError:
+                continue
+        return found

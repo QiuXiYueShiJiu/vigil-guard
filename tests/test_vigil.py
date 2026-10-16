@@ -12425,6 +12425,135 @@ class TestSiteAvailabilityInfersTheDomain(unittest.TestCase):
         self.assertIn("probe.example.com", " ".join(self.curl["argv"]))
         self.assertNotIn("other.example.com", " ".join(self.curl["argv"]))
 
+
+class TestSiteAvailabilityAcceptsWhatOperatorsType(unittest.TestCase):
+    """domain 的三个可用性缺陷：列表、中文域名、多个站点。
+
+    三条都是「配置写下去以后，检查给出的结论是错的」——不是崩溃，而是
+    报一个看似合理的错结论：
+
+    * 传列表抛 AttributeError，被 safe_run 包成一句"检查执行异常"，
+      既没点出是哪个键、也没说该怎么办；
+    * 中文域名报 CRIT「站点无响应」，而站点其实是好的；
+    * 该键只能配一个域名，多站点的人无处可写。
+
+    第三条尤其值得记住：这不是"curl 的怪癖"。nginx 的 server_name 存的是
+    punycode，用原始 UTF-8 名去探测根本匹配不到那个 vhost，请求会落到默认
+    server —— 所以「自动转 punycode」是唯一正确的修法，而不是让使用者手改。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+        self.curl = []
+
+    def _run(self, value, code="200"):
+        from vigil.guards.checks import base, process
+        self.cfg.set("checks.site_availability.domain", value)
+        self.curl = []
+        real_have, real_run = process.shell.have, process.shell.run
+        process.shell.have = lambda name: True
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "curl":
+                self.curl.append(list(argv))
+                return True, code, ""
+            return True, "", ""
+
+        process.shell.run = fake_run
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return process.SiteAvailability().safe_run(ctx)
+        finally:
+            process.shell.have, process.shell.run = real_have, real_run
+
+    def _probed(self):
+        return [argv[argv.index("--resolve") + 1].split(":")[0]
+                for argv in self.curl]
+
+    def test_a_list_of_domains_is_probed_instead_of_raising(self):
+        from vigil.guards.checks.process import site_targets
+        res = self._run(["a.example.com", "b.example.com"])
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertEqual(["a.example.com", "b.example.com"], self._probed())
+        self.assertIn("a.example.com", res.detail)
+        self.assertIn("b.example.com", res.detail)
+        self.assertEqual([("a.example.com", None), ("b.example.com", None)],
+                         site_targets(["a.example.com", "b.example.com"])[0])
+
+    def test_a_list_never_surfaces_as_an_attribute_error(self):
+        res = self._run(["a.example.com"])
+        self.assertNotIn("AttributeError", res.detail)
+        self.assertNotIn("检查执行异常", res.detail)
+
+    def test_an_internationalised_domain_is_converted_to_punycode(self):
+        res = self._run("中文域名.中国")
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertEqual(["xn--fiq06l2rdsvs.xn--fiqs8s"], self._probed())
+
+    def test_an_internationalised_domain_is_not_reported_as_down(self):
+        res = self._run("中文域名.中国")
+        self.assertNotEqual(
+            "CRIT", res.status,
+            "用原始 UTF-8 名探测会匹配不到 vhost（nginx 存的是 punycode）、"
+            "并落到默认 server，报出假的「站点无响应」")
+        self.assertNotIn("无响应", res.detail)
+
+    def test_a_wrong_type_names_the_key_instead_of_crashing(self):
+        res = self._run(443)
+        self.assertEqual("WARN", res.status)
+        self.assertIn("checks.site_availability.domain", res.detail)
+        self.assertIn("int", res.detail)
+
+    def test_one_broken_entry_does_not_hide_the_others(self):
+        res = self._run(["good.example.com", 5])
+        self.assertIn("good.example.com", self._probed())
+        self.assertIn("不是字符串", res.detail)
+
+    def test_a_url_and_a_trailing_dot_are_normalised(self):
+        res = self._run(["https://www.example.com/", "shop.example.com."])
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertEqual(["www.example.com", "shop.example.com"], self._probed())
+
+    def test_a_per_entry_port_overrides_the_global_one(self):
+        self._run("www.example.com:8443")
+        self.assertIn("www.example.com:8443:127.0.0.1", self.curl[0])
+        self.assertIn("https://www.example.com/", self.curl[0])
+
+    def test_one_down_site_makes_the_whole_check_critical(self):
+        from vigil.guards.checks import base, process
+        self.cfg.set("checks.site_availability.domain",
+                     ["up.example.com", "down.example.com"])
+        real_have, real_run = process.shell.have, process.shell.run
+        process.shell.have = lambda name: True
+
+        def fake_run(argv, **kw):
+            host = argv[argv.index("--resolve") + 1].split(":")[0]
+            return True, ("200" if host == "up.example.com" else "000"), ""
+
+        process.shell.run = fake_run
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            res = process.SiteAvailability().safe_run(ctx)
+        finally:
+            process.shell.have, process.shell.run = real_have, real_run
+        self.assertEqual("CRIT", res.status, res.detail)
+        self.assertIn("down.example.com", res.detail)
+        self.assertIn("无响应", res.detail)
+        self.assertIn("up.example.com", res.detail,
+                      "多站点报告要说清哪些是好的，否则读不出故障范围")
+
+    def test_an_empty_value_means_unconfigured_not_invalid(self):
+        from vigil.guards.checks.process import site_targets
+        self.assertEqual(([], []), site_targets(""))
+        self.assertEqual(([], []), site_targets([]))
+
+
 class TestDoctorShowsTheRescuePath(unittest.TestCase):
     """M14: the warning has to reach `vigil doctor`, not only the logs."""
 
@@ -12475,6 +12604,351 @@ class TestDoctorShowsTheRescuePath(unittest.TestCase):
     def test_a_usable_whitelist_entry_keeps_the_section_quiet(self):
         text = self._doctor(["127.0.0.1/8", "::1", "203.0.113.7"])
         self.assertNotIn("救援路径检查", text)
+
+
+class TestAuditExecRuleExcludesUnsetLoginuid(unittest.TestCase):
+    """回归：execve 规则不得匹配「无登录会话」的进程。
+
+    内核用 4294967295 表示 auid 未设置（-1 的无符号形式），而 `-F auid>=1000`
+    对它**恒为真**。于是这条本意是「捕获普通用户提权执行 root 命令」的规则，
+    实际上把机器上每一次 root 执行都记了下来——包括根本没有登录会话的
+    systemd 服务。
+
+    本机实测（2026-10-17）：25314 条记录里 25137 条（99.3%）是这类噪声，
+    来源是 date/cut/tr/grep 这种日常小命令；每次 execve 产生约 9 条审计记录，
+    而每一份都被写两次（auditd 一次、systemd-journald 一次）。空载时就有
+    约 875 KB/s 的 journal 写入、其中 99.4% 是 audit，把慢盘的 ext4 日志打满，
+    auditd / journald / jbd2 连同后面所有进程一起卡在不可中断 I/O 上——
+    使用者看到的现象就是「并行开 dsh 会话会把机器卡死」。
+
+    所以这里锁两层：规则必须排除 unset，且不能因此漏掉 b32/b64 任一架构。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+
+    def _lines(self):
+        from vigil.core import installer as inst
+        return inst.Installer().render_audit_rules(self.cfg).splitlines()
+
+    def _effective(self):
+        return [l.strip() for l in self._lines()
+                if l.strip() and not l.strip().startswith("#")]
+
+    def test_every_execve_rule_excludes_the_unset_loginuid(self):
+        rules = [l for l in self._effective() if "-S execve" in l]
+        self.assertEqual(2, len(rules),
+                         "应有 b64/b32 两条 execve 规则：%r" % rules)
+        for line in rules:
+            self.assertIn(
+                "auid!=4294967295", line,
+                "缺了 auid!=4294967295，该规则会匹配所有无登录会话的 root "
+                "执行，等于记录机器上的每一次命令：%s" % line)
+            self.assertIn("auid>=1000", line)
+            self.assertIn("euid=0", line)
+            self.assertIn("arch=b", line)
+
+    def test_both_architectures_are_covered(self):
+        rules = "\n".join(self._effective())
+        self.assertIn("arch=b64", rules)
+        self.assertIn("arch=b32", rules)
+
+    def test_immutability_stays_last(self):
+        lines = self._effective()
+        if "-e 2" in lines:
+            self.assertEqual(
+                "-e 2", lines[-1],
+                "-e 2 必须是最后一条：它之后的规则永远不会被加载，"
+                "而且一旦设置，运行期再也改不了（只能重启）")
+
+
+class TestSelfProtectionVerifiesTheRail(unittest.TestCase):
+    """「本机封不掉」这条护栏必须是**被验证过**的，而不是被假设的。
+
+    vigil 的 DROP 规则排在 iptables INPUT 第 1 条、在 ufw 之前，所以这条护栏
+    失效的代价是 SSH 与全部管理页同时失联 —— 那正是本项目历史上最严重一次
+    事故的形状。它有两种静默失效，都要能被看见：
+
+    * 枚举本机地址靠 `ip -o addr show`；命令不可用时它安静地只返回回环，
+      自动豁免就退化成「回环封不掉」；
+    * `threat.auto_whitelist_local` 可以关掉，之后本机地址只靠手工白名单条目保护。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+
+    def _run(self, local, entries=(), auto=True, have_ip=True):
+        from vigil.guards import threat as threat_mod
+        from vigil.guards.checks import base, security
+        self.cfg.set("threat.whitelist", list(entries))
+        self.cfg.set("threat.auto_whitelist_local", auto)
+        real_local, real_have = threat_mod.local_addresses, security.shell.have
+        threat_mod.local_addresses = lambda: set(local)
+        security.shell.have = lambda name: have_ip if name == "ip" else True
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return security.SelfProtection().safe_run(ctx)
+        finally:
+            threat_mod.local_addresses = real_local
+            security.shell.have = real_have
+
+    def test_a_fully_exempted_host_is_reported_ok(self):
+        res = self._run(["127.0.0.1", "::1", "203.0.113.7"])
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("203.0.113.7", res.detail)
+
+    def test_an_unexempted_own_address_is_critical(self):
+        res = self._run(["127.0.0.1", "::1", "203.0.113.7"],
+                        entries=[], auto=False)
+        self.assertEqual("CRIT", res.status, res.detail)
+        self.assertIn("203.0.113.7", res.detail)
+        self.assertIn("失联", res.detail)
+
+    def test_loopback_only_enumeration_is_reported_as_a_degraded_rail(self):
+        res = self._run(["127.0.0.1", "::1"])
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("只剩回环", res.detail)
+
+    def test_the_degraded_rail_says_which_command_failed(self):
+        res = self._run(["127.0.0.1", "::1"], have_ip=False)
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("ip", res.detail)
+
+    def test_turning_off_auto_exemption_is_still_noted_when_explicit_entries_cover_it(self):
+        res = self._run(["127.0.0.1", "::1", "203.0.113.7"],
+                        entries=["203.0.113.7", "127.0.0.1", "::1"],
+                        auto=False)
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("auto_whitelist_local", res.detail)
+
+
+class TestLocalServiceAuth(unittest.TestCase):
+    """回环只挡住外网：没有密码的服务，本机任何进程和 SSRF 都够得着。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+
+    def _run(self, ping_out, ping_ok=True, version="", redis_cli=True,
+             server=True):
+        from vigil.guards.checks import base, security
+        real_have, real_run = security.shell.have, security.shell.run
+
+        def fake_have(name):
+            if name == "redis-cli":
+                return redis_cli
+            return True
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "redis-cli":
+                return ping_ok, ping_out, ""
+            if argv and argv[0] == "redis-server":
+                return server, version, ""
+            return True, "", ""
+
+        security.shell.have = fake_have
+        security.shell.run = fake_run
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return security.LocalServiceAuth().safe_run(ctx)
+        finally:
+            security.shell.have, security.shell.run = real_have, real_run
+
+    def test_a_passwordless_redis_is_reported(self):
+        res = self._run("PONG")
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("未设密码", res.detail)
+        self.assertIn("6379", res.detail)
+
+    def test_an_eol_redis_says_so(self):
+        res = self._run("PONG", version="Redis server v=6.0.16 sha=00000000:0")
+        self.assertIn("6.0.16", res.detail)
+        self.assertIn("停止安全支持", res.detail)
+
+    def test_a_current_redis_is_not_labelled_eol(self):
+        res = self._run("PONG", version="Redis server v=7.4.1 sha=00000000:0")
+        self.assertIn("7.4.1", res.detail)
+        self.assertNotIn("停止安全支持", res.detail)
+
+    def test_a_redis_that_requires_auth_is_fine(self):
+        res = self._run("NOAUTH Authentication required.", ping_ok=False)
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_a_redis_that_is_not_running_is_not_a_finding(self):
+        res = self._run("Could not connect to Redis at 127.0.0.1:6379: "
+                        "Connection refused", ping_ok=False)
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_no_redis_cli_means_no_noise(self):
+        res = self._run("PONG", redis_cli=False)
+        self.assertEqual("OK", res.status, res.detail)
+
+
+class TestSshHardeningReportsWithoutChanging(unittest.TestCase):
+    """只报告，绝不改 sshd_config。
+
+    在没握有一把验证过能用的密钥之前就关掉口令登录，是把自己锁在门外的
+    标准做法 —— 这个决定必须由人来下，不能由一个巡检程序替他做。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+
+    def _run(self, root_login="no", password="no", keys=(), have_sshd=True):
+        from vigil.guards.checks import base, security
+        real_have, real_run = security.shell.have, security.shell.run
+        security.shell.have = lambda name: True
+        out = ("permitrootlogin %s\n"
+               "passwordauthentication %s\n"
+               "pubkeyauthentication yes\n" % (root_login, password))
+
+        def fake_run(argv, **kw):
+            if argv and argv[0] == "sshd":
+                return have_sshd, out, ""
+            return True, "", ""
+        security.shell.run = fake_run
+        real_keys = security.SshHardening._authorized_key_files
+        security.SshHardening._authorized_key_files = staticmethod(
+            lambda: list(keys))
+        try:
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            return security.SshHardening().safe_run(ctx)
+        finally:
+            security.shell.have, security.shell.run = real_have, real_run
+            security.SshHardening._authorized_key_files = real_keys
+
+    def test_root_login_by_password_without_keys_is_reported(self):
+        res = self._run(root_login="yes", password="yes")
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("PermitRootLogin", res.detail)
+        self.assertIn("authorized_keys", res.detail)
+
+    def test_a_hardened_sshd_is_ok(self):
+        res = self._run(root_login="prohibit-password", password="no",
+                        keys=["/root/.ssh/authorized_keys"])
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_prohibit_password_is_not_treated_as_root_login(self):
+        """`prohibit-password` 只允许密钥登录 root，是加固而不是风险。"""
+        res = self._run(root_login="prohibit-password", password="no")
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_password_auth_with_keys_is_still_worth_a_nudge(self):
+        res = self._run(root_login="no", password="yes",
+                        keys=["/root/.ssh/authorized_keys"])
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("建议", res.detail)
+
+    def test_a_missing_sshd_is_not_a_finding(self):
+        """读不到生效配置时明确跳过，而不是回退到宿主的真实文件去猜。"""
+        from vigil.guards.checks import base, security
+        with mock.patch.object(security.SshHardening, "_effective",
+                               staticmethod(lambda: None)):
+            ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                    log=_QuietLog(), now=time.time())
+            res = security.SshHardening().safe_run(ctx)
+        self.assertEqual("OK", res.status, res.detail)
+        self.assertIn("跳过", res.detail)
+
+    def test_the_config_file_is_read_when_sshd_T_is_unavailable(self):
+        """`sshd -T` 不可用时退回读 sshd_config。
+
+        回退会丢掉 Include 与编译期默认值，但总比什么都看不见强 ——
+        前提是它读的是**指定的**文件，而不是想当然的宿主路径。
+        """
+        from vigil.guards.checks import security
+        path = Path(self.tmp.name) / "sshd_config"
+        path.write_text("PermitRootLogin yes\nPasswordAuthentication no\n",
+                        encoding="utf-8")
+        real_have, real_run = security.shell.have, security.shell.run
+        real_path = security.SshHardening.CONFIG_PATH
+        security.shell.have = lambda name: False
+        security.shell.run = lambda argv, **kw: (False, "", "")
+        security.SshHardening.CONFIG_PATH = str(path)
+        try:
+            got = security.SshHardening._effective()
+        finally:
+            security.shell.have, security.shell.run = real_have, real_run
+            security.SshHardening.CONFIG_PATH = real_path
+        self.assertIsNotNone(got)
+        self.assertEqual("yes", got.get("permitrootlogin"))
+        self.assertEqual("no", got.get("passwordauthentication"))
+
+
+class TestPhpConfigLeaksAreWebFacingOnly(unittest.TestCase):
+    """display_errors / cookie_httponly 只对 Web 侧的 ini 有意义。
+
+    命令行下 display_errors=On 是正确的（你就想看见错误），
+    cookie_httponly 在 CLI 里没有意义。把它们算进来只会制造假警报。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=self.root / "c.json",
+                                  secrets_path=self.root / "s.json")
+
+    def _ini(self, name, body):
+        path = self.root / name
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+
+    def _run(self, paths, **opts):
+        from vigil.guards.checks import base, security
+        self.cfg.set("checks.php_config.ini_paths", list(paths))
+        for key, value in opts.items():
+            self.cfg.set("checks.php_config.%s" % key, value)
+        ctx = base.CheckContext(cfg=self.cfg, state={}, env={},
+                                log=_QuietLog(), now=time.time())
+        return security.PhpConfig().safe_run(ctx)
+
+    def test_display_errors_on_the_web_ini_is_reported(self):
+        ini = self._ini("php.ini", "display_errors = On\n")
+        res = self._run([ini])
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("display_errors", res.detail)
+
+    def test_display_errors_on_the_cli_ini_is_not_reported(self):
+        ini = self._ini("php-cli.ini", "display_errors = On\n")
+        res = self._run([ini])
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_a_missing_httponly_is_reported_for_the_web_ini(self):
+        ini = self._ini("php.ini", "session.cookie_httponly =\n")
+        res = self._run([ini])
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("cookie_httponly", res.detail)
+
+    def test_an_enabled_httponly_is_not_reported(self):
+        ini = self._ini("php.ini", "session.cookie_httponly = 1\n")
+        res = self._run([ini])
+        self.assertEqual("OK", res.status, res.detail)
+
+    def test_allow_url_fopen_is_quiet_unless_asked_for(self):
+        ini = self._ini("php.ini", "allow_url_fopen = On\n")
+        self.assertEqual("OK", self._run([ini]).status)
+        res = self._run([ini], flag_allow_url_fopen=True)
+        self.assertEqual("WARN", res.status, res.detail)
+        self.assertIn("allow_url_fopen", res.detail)
 
 
 if __name__ == "__main__":

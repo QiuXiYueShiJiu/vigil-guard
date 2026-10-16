@@ -464,7 +464,15 @@ DEFAULTS: dict = {
         "web_content": {"min_score": 4, "root_thresholds": {},
                         "max_file_bytes": 524288},
         "kernel_errors": {"max_lines": 10},
-        "php_config": {"ini_paths": []},
+        "php_config": {"ini_paths": [],
+                       # allow_url_fopen 默认就是 On，且不少应用真的依赖它。
+                       # 默认不告警，否则几乎每台机器都会长鸣，真问题被淹掉。
+                       "flag_allow_url_fopen": False},
+        "local_service_auth": {"redis_port": 6379,
+                               # 已停止安全支持的 Redis 版本线。写在这里而不是
+                               # 硬编码在检查里：这张表会过时，而「你已经 EOL」
+                               # 报错的代价比不报大。留空即关闭该项。
+                               "redis_eol": ["5.0", "6.0"]},
         "outbound_connections": {"safe_ports": [22, 25, 53, 80, 123, 443,
                                                 465, 587, 993, 995, 9418,
                                                 8080, 8443],
