@@ -32,7 +32,8 @@
     "reply_to": "",
     "language": "zh",
     "digest_min_items": 5,
-    "digest_max_wait": 1800
+    "digest_max_wait": 1800,
+    "digest_routine_wait": 21600
   },
   "alerts": {
     "mode": "attacks",

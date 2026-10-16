@@ -463,6 +463,13 @@ class Settings:
             self._r("mail.digest_min_items", 5), 5, minimum=1)
         self.digest_max_wait = _int(
             self._r("mail.digest_max_wait", 1800), 1800, minimum=0)
+        # 例行批次的等待上限，比普通摘要窗口长得多。
+        #
+        # `digest_max_wait` 在低事件率下会退化成「到点就发一封只含一条的邮件」：
+        # 实测 53 封「自动进入高压防护」就是这么来的。例行事件的价值只有在成批
+        # 看时才体现，所以让它们攒够 6 小时（可配，设 86400 就是日报）。
+        self.digest_routine_wait = _int(
+            self._r("mail.digest_routine_wait", 21600), 21600, minimum=0)
         self.event_queue_max = _int(
             self._r("threat.event_queue_max", 1000), 1000,
             minimum=10)
@@ -1995,7 +2002,18 @@ ROUTINE_STATUS = frozenset({401, 403, 405, 406, 407, 415, 416, 429})
 
 _CRIT_KINDS = frozenset({"BREACH", "DIST", "BAN_FAIL", "DETECT"})
 _KIND_ORDER = ("BREACH", "DETECT", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE",
-               "BAN", "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST", "INFO")
+               "BAN", "SSH", "OFFWHITELIST", "BREAKER", "WHITELIST",
+               "LOADSHED", "INFO")
+
+#: 「守护按设计正常工作」而不是新闻的类别。
+#
+# 只由这些类别组成的批次，等待 `mail.digest_routine_wait`（默认 6 小时）而不是
+# 通常的摘要窗口。理由是一台被持续扫描的机器上，「我们又封了一个」每小时会来
+# 很多次，而逐条发出去正是让人学会忽略告警的方式 —— 实测 594 封已送达邮件里
+# 75% 属于这一类（例行封禁 261、负载保护开关 130、姿态变化 53）。
+# 真正需要立刻知道的（BREACH / DIST / BAN_FAIL / DETECT 是 CRIT；NETBLOCK /
+# WHITELIST / BREAKER / OFFWHITELIST 带 immediate）都不在这里。
+_ROUTINE_KINDS = frozenset({"BAN", "POSTURE", "LOADSHED", "INFO"})
 
 
 def _ban_title(events) -> str:
@@ -2056,9 +2074,27 @@ class EventReporter:
             if self._stop.is_set():
                 break
             try:
+                self.ingest_routine()
                 self.flush()
             except Exception as exc:                   # noqa: BLE001
                 self.d.log.warn("事件发送线程异常：%s", exc)
+
+    def ingest_routine(self) -> int:
+        """把别的进程暂存的例行事件收进来，走同一条摘要路径。
+
+        loadshed 是独立进程，没法直接调用这里的 queue()。它原先的做法是
+        自己调 send_alert()，于是它的告警完全绕过了合并、去重和共享额度。
+        从暂存文件收进来之后，它和 BAN / POSTURE 一样受同一套规则约束。
+        """
+        try:
+            from . import routine
+            records = routine.drain()
+        except Exception:                              # noqa: BLE001
+            return 0
+        for record in records:
+            record.setdefault("kind", "LOADSHED")
+            self.queue(record)
+        return len(records)
 
     def pending(self) -> int:
         with self._lock:
@@ -2073,6 +2109,24 @@ class EventReporter:
         """Events lost to the queue bound since start-up."""
         with self._lock:
             return self._dropped_total
+
+    def _batch_wait(self, items) -> float:
+        """这批事件最多愿意等多久再发。
+
+        例行批次（成功的自动封禁、姿态变化、负载保护开关）等
+        ``mail.digest_routine_wait``（默认 6 小时）；其余等普通的
+        ``mail.digest_max_wait``（默认 30 分钟）。
+
+        分开的理由是普通窗口在低事件率下会退化：到点就发一封只含一条的邮件，
+        而那和逐条发没有区别 —— 实测 53 封「自动进入高压防护」正是这样来的。
+        例行事件只有成批看才有价值；真正紧急的（CRIT 或带 immediate）在
+        :meth:`flush` 里更早就被放行了，不会走到这里。
+        """
+        if not items:
+            return float(self.d.settings.digest_max_wait)
+        if all(e.get("kind") in _ROUTINE_KINDS for e in items):
+            return float(self.d.settings.digest_routine_wait)
+        return float(self.d.settings.digest_max_wait)
 
     def flush(self, force: bool = False) -> bool:
         with self._lock:
@@ -2096,9 +2150,13 @@ class EventReporter:
             # 处理」这类告警不会被这里延迟。被压住的只有普通事件 —— 实测一天
             # 190 封邮件里，绝大部分是逐条发出的封禁/登录/异常恢复，而它们的
             # 价值在**成批看**时才体现，逐条发只会让人把告警当噪声。
+            #
+            # 全由例行类别组成的批次等得更久：普通窗口在低事件率下会退化成
+            # 「每 30 分钟一封、每封一条」，那和逐条发没有区别。
+            wait = self._batch_wait(items)
             oldest = min(float(e.get("ts") or now) for e in items)
             if len(items) < self.d.settings.digest_min_items and \
-                    now - oldest < self.d.settings.digest_max_wait:
+                    now - oldest < wait:
                 with self._lock:
                     self._q.extendleft(reversed(items))
                 return False
@@ -2160,6 +2218,8 @@ class EventReporter:
             "WHITELIST": "白名单 IP 命中了封禁规则（已放行，请核实）",
             "POSTURE": "自动进入高压防护",
             "NETBLOCK": "自动升级为网段封禁",
+            "LOADSHED": "负载保护状态变化 %d 次"
+                        % len(groups.get("LOADSHED", [])),
             "DETECT": "检测器连续失败（该日志源可能已停止检测）",
             "INFO": "自动化处置事件 %d 条" % len(items),
         }
@@ -2197,6 +2257,26 @@ class EventReporter:
                 section.add("  排查：`vigil threat test` 用样例日志验证规则，"
                             "并检查该日志的格式是否变了。")
                 section.add("")
+        if groups.get("LOADSHED"):
+            section = alert.add_section("负载保护状态变化")
+            shown = groups["LOADSHED"][:8]
+            for event in shown:
+                section.add("● %s　%s"
+                            % (event.get("at") or "",
+                               "已启用" if event.get("state") == "on" else "已解除"))
+                section.add("    触发指标：1 分钟负载 %.2f、80/443 连接 %d"
+                            % (float(event.get("load1") or 0.0),
+                               int(event.get("conns") or 0)))
+                section.add("    阈值：进入 %.1f/%d，解除 %.1f/%d"
+                            % (float(event.get("protect_load") or 0.0),
+                               int(event.get("protect_conn") or 0),
+                               float(event.get("release_load") or 0.0),
+                               int(event.get("release_conn") or 0)))
+            if len(groups["LOADSHED"]) > len(shown):
+                section.add("…… 另有 %d 次未展开"
+                            % (len(groups["LOADSHED"]) - len(shown)))
+            section.add("这些是守护自动限流以保住可用性，属例行处置；"
+                        "它们不再逐条发信，只在这里汇总。")
         if groups.get("BREACH"):
             section = alert.add_section("安全警告：疑似爆破成功")
             for event in groups["BREACH"]:
@@ -2306,6 +2386,10 @@ class EventReporter:
         if kind == "POSTURE":
             return ("攻击信号达到阈值，本机已自动收紧封禁阈值；"
                     "平静一段时间后会自动恢复。")
+        if kind == "LOADSHED":
+            return ("负载保护在阈值附近开关，属例行处置（守护自动限流以保住"
+                    "可用性）。开关频繁说明负载在阈值附近震荡 —— 可拉开进入与"
+                    "解除阈值之间的距离来增加滞后。")
         if kind == "DETECT":
             return ("某个日志源的检测器连续处理失败，该来源的检测很可能已经"
                     "整体失效 —— 守护进程仍在运行、状态页仍显示「正在监控」，"
@@ -2649,7 +2733,14 @@ class ThreatDaemon:
         if self.settings.notify_bans:
             event = {
                 "kind": "BAN" if ok else "BAN_FAIL",
-                "immediate": severity >= 2 or not ok,
+                # 只有**没封成功**才需要人立刻介入。
+                #
+                # 这里原本是 `severity >= 2 or not ok`，用意是「高置信度命中要
+                # 马上告诉人」。但高置信度封禁恰恰是最常见的例行情况：一台天天
+                # 被扫的机器上，实测 261 封封禁告警里有 247 封每封只含 1 个攻击源
+                # ——它们全部绕过了摘要合并，逐条进了收件箱。守护按设计正常工作
+                # 不该打断人；人需要被打断的是「本该封住却没封住」。
+                "immediate": not ok,
                 "ip": ip, "reason": reason, "seconds": seconds,
                 "offense": offense, "detector": detector, "severity": severity,
                 "enforced": ok, "err": err,

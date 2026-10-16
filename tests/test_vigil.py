@@ -6559,10 +6559,23 @@ class TestMailIsBatchedNotStreamed(unittest.TestCase):
         self.assertTrue(self.d.reporter.flush())
         self.assertEqual(1, len(self.sent))
 
-    def test_a_held_event_is_eventually_sent(self):
-        """Nothing may sit in the queue forever."""
-        wait = self.d.settings.digest_max_wait
+    def test_a_held_routine_event_is_eventually_sent(self):
+        """压着的事件最终必须发出去 —— 例行批次也一样。
+
+        例行批次等的是 `digest_routine_wait`（默认 6 小时）而不是
+        `digest_max_wait`（30 分钟），但保证不变：**队列里的东西不会永远
+        压着**。这条不变式比具体等待时长重要，所以要按各自的上限验证。
+        """
+        wait = self.d.settings.digest_routine_wait
         self._routine(1, age=wait + 60)
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent))
+
+    def test_a_held_non_routine_event_goes_out_after_the_short_window(self):
+        """非例行事件仍按 30 分钟窗口发出，不被例行的长等待拖累。"""
+        wait = self.d.settings.digest_max_wait
+        self.d.reporter.queue({"kind": "SSH", "ip": "203.0.113.9",
+                               "ts": time.time() - wait - 60})
         self.assertTrue(self.d.reporter.flush())
         self.assertEqual(1, len(self.sent))
 
@@ -12949,6 +12962,140 @@ class TestPhpConfigLeaksAreWebFacingOnly(unittest.TestCase):
         res = self._run([ini], flag_allow_url_fopen=True)
         self.assertEqual("WARN", res.status, res.detail)
         self.assertIn("allow_url_fopen", res.detail)
+
+
+class _StubSettings:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+class _StubStop:
+    def is_set(self):
+        return False
+
+
+class TestRoutineEventsReachTheDigest(unittest.TestCase):
+    """例行事件必须走同一条摘要路径，而不是逐条占用收件箱。
+
+    实测（一台在线生产机，594 封已送达邮件）：
+
+    * **例行封禁 261 封，其中 247 封每封只含 1 个攻击源** ——
+      `immediate = severity >= 2 or not ok` 让每一次例行高置信封禁都绕过了
+      合并；
+    * **负载保护开/关 130 封** —— loadshed 是独立进程，直接调 `send_alert()`，
+      完全绕过 reporter 的合并、去重窗口与共享额度；
+    * **姿态变化 53 封** —— 普通摘要窗口在低事件率下到点就发，一封只含一条。
+
+    这三类合计 75%，是收件箱被淹的直接原因，也让真正要立刻知道的事
+    （封禁失败、熔断、白名单命中）混在噪声里看不见。
+    """
+
+    def setUp(self):
+        from vigil.guards import routine
+        self.routine = routine
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.spool = Path(self.tmp.name) / "routine-events.jsonl"
+        self._real_path = routine.path
+        routine.path = lambda: self.spool
+        self.addCleanup(lambda: setattr(routine, "path", self._real_path))
+
+    def _reporter(self, **over):
+        from vigil.guards import threat
+        settings = _StubSettings(
+            event_queue_max=1000, event_flush_interval=60, min_flush_interval=30,
+            digest_min_items=5, digest_max_wait=1800, digest_routine_wait=21600)
+        for key, value in over.items():
+            setattr(settings, key, value)
+        daemon = _StubSettings(settings=settings, stop=_StubStop())
+        return threat.EventReporter(daemon)
+
+    # -- the spool itself --------------------------------------------------
+    def test_spool_and_drain_round_trip(self):
+        self.assertTrue(self.routine.spool({"kind": "LOADSHED", "state": "on"}))
+        self.assertEqual([{"kind": "LOADSHED", "state": "on"}],
+                         self.routine.drain())
+        self.assertEqual([], self.routine.drain(), "drain 必须是读后即清")
+
+    def test_the_spool_is_bounded_and_keeps_the_newest(self):
+        for i in range(self.routine.MAX_LINES + 25):
+            self.routine.spool({"kind": "LOADSHED", "n": i})
+        got = self.routine.drain()
+        self.assertEqual(self.routine.MAX_LINES, len(got))
+        self.assertEqual(self.routine.MAX_LINES + 24, got[-1]["n"],
+                         "上界应保留最新的事件，丢掉最旧的")
+
+    def test_an_unwritable_spool_reports_false_instead_of_raising(self):
+        """写不进去不能让产出事件的守护进程跟着倒下。"""
+        self.routine.path = lambda: Path("/proc/self/definitely-not-writable")
+        self.assertFalse(self.routine.spool({"kind": "LOADSHED"}))
+
+    def test_an_unparseable_line_does_not_block_the_rest(self):
+        self.spool.write_text('{"kind": "LOADSHED"}\nnot json\n\n',
+                              encoding="utf-8")
+        self.assertEqual([{"kind": "LOADSHED"}], self.routine.drain())
+
+    # -- ingestion ---------------------------------------------------------
+    def test_ingest_folds_spooled_events_into_the_queue(self):
+        self.routine.spool({"kind": "LOADSHED", "state": "on"})
+        rep = self._reporter()
+        self.assertEqual(1, rep.ingest_routine())
+        self.assertEqual(1, rep.pending())
+        self.assertEqual(0, rep.ingest_routine(), "同一个事件不该被收两次")
+
+    def test_ingest_defaults_the_kind(self):
+        self.routine.spool({"state": "off"})
+        rep = self._reporter()
+        rep.ingest_routine()
+        self.assertEqual("LOADSHED", rep._q[0]["kind"])
+
+    # -- waiting policy ----------------------------------------------------
+    def test_routine_batches_wait_far_longer(self):
+        rep = self._reporter()
+        self.assertEqual(21600, rep._batch_wait([{"kind": "BAN"}]))
+        self.assertEqual(21600, rep._batch_wait(
+            [{"kind": "BAN"}, {"kind": "POSTURE"}, {"kind": "LOADSHED"}]))
+
+    def test_one_notable_kind_pulls_the_batch_back_to_the_short_window(self):
+        rep = self._reporter()
+        self.assertEqual(1800, rep._batch_wait(
+            [{"kind": "BAN"}, {"kind": "SSH"}]))
+        self.assertEqual(1800, rep._batch_wait([{"kind": "BAN_FAIL"}]))
+
+    def test_the_routine_wait_is_configurable_up_to_a_daily_digest(self):
+        rep = self._reporter(digest_routine_wait=86400)
+        self.assertEqual(86400, rep._batch_wait([{"kind": "BAN"}]))
+
+    # -- the ban event itself ----------------------------------------------
+    def test_a_successful_ban_is_queued_without_immediate(self):
+        """成功的封禁是「守护按设计工作」，不该打断人。
+
+        实测：261 封封禁告警里 247 封每封只含 1 个攻击源，全部因为
+        `severity >= 2` 被标记 immediate 而绕过合并。
+        """
+        from vigil.guards import threat as threat_mod
+        cfg = vconfig.Config(path=Path(self.tmp.name) / "c.json",
+                             secrets_path=Path(self.tmp.name) / "s.json")
+        cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+        daemon = threat_mod.ThreatDaemon(cfg, log=_QuietLog(), dry_run=True,
+                                         echo=False)
+        daemon.reporter._q.clear()
+        daemon.ban("203.0.113.44", "扫描", detector="exploit_high",
+                   severity=2)
+        queued = [e for e in daemon.reporter._q if e.get("kind") == "BAN"]
+        self.assertTrue(queued, "封禁应产生一条事件")
+        for event in queued:
+            self.assertFalse(
+                event.get("immediate"),
+                "成功的封禁不该是 immediate：那会让每一次例行封禁都单独发一封")
+
+    def test_a_failed_ban_is_still_immediate(self):
+        """「本该封住却没封住」才是需要人立刻读到的。"""
+        import inspect
+        from vigil.guards import threat as threat_mod
+        src = inspect.getsource(threat_mod.ThreatDaemon.ban)
+        self.assertIn('"immediate": not ok', src,
+                      "失败路径必须仍然是 immediate（交付失败要人介入）")
 
 
 if __name__ == "__main__":

@@ -48,13 +48,13 @@ import signal
 import sys
 import threading
 import time
+from datetime import datetime
 
 from ..core import paths, shell
 from ..core.config import load as load_config
 from ..core.logging import get as get_logger
 from ..core.state import write_text
 from ..i18n import language, set_language, t as i18n_t
-from ..mail.message import Alert, KIND_ALERT, SEV_INFO, SEV_WARN
 from .attacks import ConfigError, assert_config_parsable
 from .checks.util import oneline
 
@@ -641,59 +641,43 @@ class LoadShedder:
 
     # -- alerting ----------------------------------------------------------
     def notify_state(self, enabled: bool, load1: float, conns: int) -> None:
-        title = _t("protect_on") if enabled else _t("protect_off")
-        alert = Alert(
-            title=title,
-            severity=SEV_WARN if enabled else SEV_INFO,
-            kind=KIND_ALERT,
-            summary=("检测到负载异常，已自动启用单源限流以保护服务可用性。"
-                     if enabled else
-                     "负载已恢复正常，限流规则已全部撤销。"),
-            dedupe_key="loadshed|%s" % ("on" if enabled else "off"),
-        )
-        alert.add_section("触发指标", [
-            "1 分钟负载：%.2f（进入阈值 %.1f / 解除阈值 %.1f）"
-            % (load1, self.protect_load, self.release_load),
-            "80/443 已建立连接：%d（进入阈值 %d / 解除阈值 %d）"
-            % (conns, self.protect_conn, self.release_conn),
-            "CPU 核心数：%d" % (os.cpu_count() or 1),
-        ])
-        if enabled:
-            alert.add_section("已实施动作", [
-                "单源并发连接上限：%d" % self.connlimit,
-                "单源新建连接速率上限：%d/s（突发 %d）"
-                % (self.newconn_rate, self.newconn_burst),
-                "限流链：%s（IPv4 %s / IPv6 %s）" % (
-                    self.chain,
-                    "已安装" if self._iptables else "不可用",
-                    "已安装" if self._ip6tables else "不可用"),
-                "风控已进入严格模式：封禁阈值收紧，攻击源会被更快切断。",
-            ])
-            v4, v6 = self._whitelist_sources()
-            alert.add_section("白名单豁免（不受限流影响）", [
-                "IPv4：%s" % ("、".join(v4) if v4 else "无"),
-                "IPv6：%s" % ("、".join(v6) if v6 else "无"),
-            ])
-            alert.footer = ("负载回落到解除阈值以下并连续确认 %d 次后，"
-                            "限流会自动撤销。" % self.release_confirm)
-        else:
-            alert.add_section("已撤销动作", [
-                "限流链 %s 已清空并删除，INPUT 跳转已移除。" % self.chain,
-                "风控已恢复常规阈值。",
-            ])
-            alert.footer = "查看当前状态：`ipset list %s`" % self.threat_set
+        """把一次状态变化交给 threatd 的摘要，而不是自己发一封信。
 
+        这里原先构造一个 Alert 直接调 ``send_alert()``。loadshed 是独立进程，
+        那在当时是唯一能发的路径 —— 代价是这些告警**完全绕过**了合并、去重
+        窗口和共享的每日额度。在一台在线机器上实测：594 封已送达邮件里
+        **130 封（22%）** 就是这些开关，而且它们在阈值两侧反复横跳
+        （67 次开、63 次关），一封都没受过去重约束。
+
+        负载保护和姿态变化一样，是「守护按设计正常工作」，属于例行事件：
+        该进周期摘要，不该独自占用收件箱。真正需要立刻知道的是「本该限流却
+        没限成」那类，它走的是别的路径（见 run() 里的 protect-failed）。
+        """
+        title = _t("protect_on") if enabled else _t("protect_off")
         if self.dry_run:
             self.trace.append("ALERT: %s" % title)
             return
-        # Reuse the threat daemon's alert sink so both guards route through the
-        # same mail path.  Imported lazily to keep this module import-light.
+        record = {
+            "kind": "LOADSHED",
+            "state": "on" if enabled else "off",
+            "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ts": time.time(),
+            "load1": float(load1),
+            "conns": int(conns),
+            "protect_load": float(self.protect_load),
+            "protect_conn": int(self.protect_conn),
+            "release_load": float(self.release_load),
+            "release_conn": int(self.release_conn),
+        }
         try:
-            from .threat import send_alert
+            from . import routine
         except Exception as exc:                       # noqa: BLE001
-            self.log.warn("告警模块不可用，本次告警未发出：%s", exc)
+            self.log.warn("例行事件通道不可用，本次状态变化未上报：%s", exc)
             return
-        send_alert(alert, cfg=self.cfg, log=self.log)
+        if routine.spool(record):
+            self.log.info("%s（已并入周期摘要，不再单独发信）", title)
+        else:
+            self.log.warn("%s：写入例行事件通道失败，本次状态变化未上报", title)
 
     # -- lifecycle ---------------------------------------------------------
     def _on_signal(self, signum, _frame) -> None:

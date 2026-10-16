@@ -73,6 +73,13 @@ DEFAULTS: dict = {
         # 更坏：它让人以为配上了。展示的键必须就是读取的键。
         "digest_min_items": 5,
         "digest_max_wait": 1800,
+        # 全由「例行」类别组成的批次等这么久（秒）。
+        #
+        # 普通窗口在低事件率下会退化：到点就发一封只含一条的邮件，和逐条发
+        # 没有区别。实测 53 封「自动进入高压防护」就是这么来的。例行事件
+        # （成功的自动封禁、姿态变化、负载保护开关）只有成批看才有价值，
+        # 所以给它们一个长得多的上限 —— 设成 86400 就是日报。
+        "digest_routine_wait": 21600,
         # Inbound mailbox for the reply-command channel. Left empty, it is
         # inferred from the SMTP channel (the mailbox that sends the alerts
         # is almost always the one that receives the replies).
