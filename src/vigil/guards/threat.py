@@ -2016,6 +2016,40 @@ _KIND_ORDER = ("BREACH", "DETECT", "BAN_FAIL", "DIST", "NETBLOCK", "POSTURE",
 _ROUTINE_KINDS = frozenset({"BAN", "POSTURE", "LOADSHED", "INFO"})
 
 
+def outstanding_items() -> list:
+    """巡检报出的、当前仍未通过的安全项，用于在例行摘要里附「改进状态」。
+
+    直接读巡检写下的 ``state["status"]``（check_id -> 状态），而不是让邮件层
+    自己再算一遍：两份实现一定会漂移，而「摘要里说已解决、巡检里还红着」
+    比不附这一节更糟。
+    """
+    try:
+        with open(paths.STATE_STATE / "health.json", "r",
+                  encoding="utf-8") as fh:
+            status = (json.load(fh) or {}).get("status") or {}
+    except (OSError, ValueError):
+        return []
+    if not isinstance(status, dict):
+        return []
+    try:
+        from .checks import base as check_base
+        if not check_base.ids():
+            check_base.load_all()
+    except Exception:                                  # noqa: BLE001
+        check_base = None
+    out = []
+    for check_id, state in sorted(status.items()):
+        if state in ("OK", "", None):
+            continue
+        label = check_id
+        if check_base is not None:
+            cls = check_base.get(check_id)
+            if cls is not None:
+                label = cls.label or check_id
+        out.append((label, state))
+    return out
+
+
 def _ban_title(events) -> str:
     """「已自动封禁 N 个攻击源」，N 是独立来源数。
 
@@ -2153,10 +2187,17 @@ class EventReporter:
             #
             # 全由例行类别组成的批次等得更久：普通窗口在低事件率下会退化成
             # 「每 30 分钟一封、每封一条」，那和逐条发没有区别。
+            routine_only = all(e.get("kind") in _ROUTINE_KINDS for e in items)
             wait = self._batch_wait(items)
             oldest = min(float(e.get("ts") or now) for e in items)
-            if len(items) < self.d.settings.digest_min_items and \
-                    now - oldest < wait:
+            # 例行批次**不**因「攒够条数」而提前发：攒着，等窗口到点一次性发。
+            #
+            # 有这条才能把一天的例行邮件数钉在窗口数量上（6 小时窗口 → 最多
+            # 4 封）。没有它的话，事件一多就触发一次发送，窗口形同虚设 ——
+            # 而「一天不到 20 封」这种要求，靠的正是把上限算得出来。
+            enough = (not routine_only
+                      and len(items) >= self.d.settings.digest_min_items)
+            if not enough and now - oldest < wait:
                 with self._lock:
                     self._q.extendleft(reversed(items))
                 return False
@@ -2277,6 +2318,20 @@ class EventReporter:
                             % (len(groups["LOADSHED"]) - len(shown)))
             section.add("这些是守护自动限流以保住可用性，属例行处置；"
                         "它们不再逐条发信，只在这里汇总。")
+        if all(e.get("kind") in _ROUTINE_KINDS for e in items):
+            # 例行摘要顺带回答一个问题：「现在还有什么没解决」。
+            # 只有例行摘要附它 —— 附在每条告警后面会变成新的噪声。
+            section = alert.add_section("改进状态")
+            pending = outstanding_items()
+            if pending:
+                section.add("巡检仍有 %d 项未通过（按 `alerts.mode` 多数只记录"
+                            "不发信，详情见 `vigil health run`）：" % len(pending))
+                for label, state in pending[:10]:
+                    section.add("    [%s] %s" % (state, label))
+                if len(pending) > 10:
+                    section.add("    …… 另有 %d 项" % (len(pending) - 10))
+            else:
+                section.add("本轮巡检无未通过项。")
         if groups.get("BREACH"):
             section = alert.add_section("安全警告：疑似爆破成功")
             for event in groups["BREACH"]:

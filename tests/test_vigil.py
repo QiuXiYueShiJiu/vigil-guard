@@ -6547,8 +6547,16 @@ class TestMailIsBatchedNotStreamed(unittest.TestCase):
         self.assertEqual(0, len(self.sent))
         self.assertEqual(1, self.d.reporter.pending())
 
-    def test_enough_ordinary_events_make_one_email(self):
-        self._routine(self.d.settings.digest_min_items)
+    def test_enough_non_routine_events_make_one_email(self):
+        """攒够条数只发一封 —— 对**非例行**事件成立。
+
+        例行事件（成功的封禁、姿态变化、负载保护开关）不走这条：它们只在
+        窗口到点时发一次，否则「一天不超过 N 封」就没法预估。见
+        TestRoutineBatchesDoNotSendEarly。
+        """
+        for i in range(self.d.settings.digest_min_items):
+            self.d.reporter.queue({"kind": "SSH", "ip": "203.0.113.%d" % i,
+                                   "ts": time.time()})
         self.assertTrue(self.d.reporter.flush())
         self.assertEqual(1, len(self.sent), "攒够条数应只发一封")
 
@@ -13096,6 +13104,208 @@ class TestRoutineEventsReachTheDigest(unittest.TestCase):
         src = inspect.getsource(threat_mod.ThreatDaemon.ban)
         self.assertIn('"immediate": not ok', src,
                       "失败路径必须仍然是 immediate（交付失败要人介入）")
+
+
+class TestDailyQuotaIsAGlobalCeiling(unittest.TestCase):
+    """`mail.daily_quota` 的注释写着「across all providers」，实现却只管有配额的渠道。
+
+    全网只有 Resend 声明了 `quota_per_recipient`，于是 Resend 报「当日额度
+    已用尽」之后，兜底的 SMTP 照发不误 —— 实测日志里两条「剩余 0」紧跟着
+    一条「已送达 2/2」，一天的总量**没有任何上限**。展示出来的承诺必须真的
+    成立，否则「一天不超过 N 封」就只是一句注释。
+    """
+
+    class _Stub:
+        id = "stub"
+        is_mail = True
+        quota_per_recipient = 0
+
+        def validate(self):
+            return []
+
+        def send(self, msg, to):
+            return None
+
+    def setUp(self):
+        from vigil.mail import router as rmod, queue as mq
+        self.rmod, self.mq = rmod, mq
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "config.json",
+                                  secrets_path=root / "secrets.json")
+        self.cfg.set("mail.recipients", ["ops@example.invalid"])
+        self.cfg.set("mail.daily_quota", 20)
+        self.cfg.set("mail.dedupe_window", 0)
+        self.r = rmod.Router(self.cfg, log=_QuietLog())
+        self.r.chain = lambda: [self._Stub()]
+        self.delivered = []
+        self.r._deliver_one = lambda msg, to, chain, rep, total: (
+            self.delivered.append(msg), None)[1]
+        self.parked = []
+        self._real_overflow = self.mq.to_overflow
+        self._real_used = self.mq.quota_used
+        self._real_sends = self.mq.sends_since
+        self.mq.to_overflow = lambda msg, reason="": (
+            self.parked.append(msg), True)[1]
+        self.mq.sends_since = lambda seconds: 0
+
+    def tearDown(self):
+        self.mq.to_overflow = self._real_overflow
+        self.mq.quota_used = self._real_used
+        self.mq.sends_since = self._real_sends
+
+    def _used(self, n):
+        self.mq.quota_used = lambda: n
+
+    def _msg(self, severity="WARN", kind="alert", seq=1):
+        from vigil.mail.message import Message
+        return Message(subject="s%d" % seq, text="t", kind=kind, seq=seq,
+                       severity=severity)
+
+    def test_an_ordinary_alert_is_parked_once_the_day_is_full(self):
+        self._used(20)
+        self.r.deliver(self._msg())
+        self.assertEqual([], self.delivered, "满额后不该再发出普通告警")
+        self.assertEqual(1, len(self.parked), "被压住的应进补发摘要，而不是丢掉")
+
+    def test_a_crit_still_goes_out(self):
+        self._used(999)
+        self.r.deliver(self._msg(severity="CRIT"))
+        self.assertEqual(1, len(self.delivered), "CRIT 压不得：那是真事件")
+
+    def test_a_digest_still_goes_out(self):
+        """补发摘要就是「攒下来一起发」的出口；卡住它等于把告警彻底丢掉。"""
+        self._used(999)
+        self.r.deliver(self._msg(kind="digest"))
+        self.assertEqual(1, len(self.delivered))
+
+    def test_below_the_ceiling_nothing_is_parked(self):
+        self._used(3)
+        self.r.deliver(self._msg())
+        self.assertEqual(1, len(self.delivered))
+        self.assertEqual([], self.parked)
+
+    def test_zero_means_unlimited(self):
+        self.cfg.set("mail.daily_quota", 0)
+        self._used(99999)
+        self.r.deliver(self._msg())
+        self.assertEqual(1, len(self.delivered))
+
+
+class TestRoutineDigestCarriesImprovementStatus(unittest.TestCase):
+    """例行摘要要顺带回答一个问题：「现在还有什么没解决」。
+
+    来源直接读巡检写下的 `state["status"]`，而不是让邮件层自己再算一遍 ——
+    两份实现一定会漂移，而「摘要里说已解决、巡检里还红着」比不附更糟。
+    """
+
+    def setUp(self):
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+        self.health = root / "health.json"
+        self._real_state = self.t.paths.STATE_STATE
+        self.t.paths.STATE_STATE = root
+        self.addCleanup(lambda: setattr(self.t.paths, "STATE_STATE",
+                                        self._real_state))
+
+    def test_outstanding_items_lists_only_the_failing_checks(self):
+        self.health.write_text(json.dumps({"status": {
+            "php_config": "OK", "ssh_hardening": "WARN",
+            "local_service_auth": "WARN"}}), encoding="utf-8")
+        got = self.t.outstanding_items()
+        self.assertEqual({"SSH 加固", "本地服务未授权"},
+                         {label for label, _ in got},
+                         "只有非 OK 的项才算待改进，且用中文标签")
+        self.assertNotIn("PHP 安全配置", [label for label, _ in got])
+
+    def test_a_missing_health_state_is_not_an_error(self):
+        self.assertEqual([], self.t.outstanding_items())
+
+    def test_a_corrupt_health_state_is_not_an_error(self):
+        self.health.write_text("{not json", encoding="utf-8")
+        self.assertEqual([], self.t.outstanding_items())
+
+    def test_the_labels_come_from_the_check_registry(self):
+        self.health.write_text(
+            json.dumps({"status": {"ssh_hardening": "WARN"}}), encoding="utf-8")
+        got = self.t.outstanding_items()
+        self.assertEqual(1, len(got))
+        self.assertEqual("SSH 加固", got[0][0],
+                         "摘要里要用中文标签，而不是 check_id")
+
+    def test_a_routine_alert_carries_the_section(self):
+        self.health.write_text(
+            json.dumps({"status": {"ssh_hardening": "WARN"}}), encoding="utf-8")
+        daemon = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        sent = []
+        daemon.deliver = lambda a: (sent.append(a), True)[1]
+        daemon.reporter._last_send = 0
+        daemon.reporter.queue({
+            "kind": "LOADSHED", "state": "on", "at": "2026-01-01 00:00:00",
+            "load1": 9.9, "conns": 120, "protect_load": 8.0, "protect_conn": 100,
+            "release_load": 4.0, "release_conn": 50,
+            "ts": time.time() - daemon.settings.digest_routine_wait - 60})
+        self.assertTrue(daemon.reporter.flush())
+        titles = [s.title for s in sent[0].sections]
+        self.assertIn("改进状态", titles)
+        body = "\n".join(l for s in sent[0].sections
+                         if s.title == "改进状态" for l in s.lines)
+        self.assertIn("SSH 加固", body)
+
+
+class TestRoutineBatchesDoNotSendEarly(unittest.TestCase):
+    """例行批次不因「攒够条数」而提前发。
+
+    有这条才能把一天的例行邮件数钉在窗口数量上（6 小时窗口 → 最多 4 封）。
+    没有它的话，事件一多就触发一次发送，窗口形同虚设 —— 而「一天不到 20 封」
+    这种要求，靠的正是把上限算得出来。
+    """
+
+    def setUp(self):
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+        self.d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                     echo=False)
+        self.sent = []
+        self.d.deliver = lambda a: (self.sent.append(a.title), True)[1]
+        self.d.reporter._last_send = 0
+
+    def _routine(self, n, age=0.0):
+        for i in range(n):
+            self.d.reporter.queue({"kind": "BAN", "ip": "203.0.113.%d" % (i + 1),
+                                   "ts": time.time() - age})
+
+    def test_many_routine_events_do_not_force_an_early_send(self):
+        self._routine(self.d.settings.digest_min_items * 4)
+        self.assertFalse(self.d.reporter.flush(),
+                         "例行批次攒够条数也不该提前发，否则上限无法预估")
+        self.assertEqual(0, len(self.sent))
+
+    def test_a_routine_batch_goes_out_when_its_window_elapses(self):
+        self._routine(20, age=self.d.settings.digest_routine_wait + 60)
+        self.assertTrue(self.d.reporter.flush())
+        self.assertEqual(1, len(self.sent), "到点后应合并成一封，而不是二十封")
+
+    def test_a_non_routine_batch_still_sends_at_the_item_threshold(self):
+        for i in range(self.d.settings.digest_min_items):
+            self.d.reporter.queue({"kind": "SSH", "ip": "203.0.113.%d" % i,
+                                   "ts": time.time()})
+        self.assertTrue(self.d.reporter.flush(),
+                        "非例行批次仍按条数阈值发出，不该被例行的长等待拖累")
 
 
 if __name__ == "__main__":

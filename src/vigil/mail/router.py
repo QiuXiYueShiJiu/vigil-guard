@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 
 from ..core.errors import AuthError, ProviderError, RateLimitError
 from . import queue as q
-from .message import Message
+from .message import KIND_DIGEST, SEV_CRIT, Message
 from .providers import base as pbase
 
 
@@ -213,6 +213,29 @@ class Router:
         hook_chain = [p for p in chain if not p.is_mail]
 
         if mail_chain:
+            # `mail.daily_quota` 的注释一直写着「across all providers」，
+            # 但实现只约束了声明 `quota_per_recipient` 的渠道 —— 全网只有
+            # Resend 声明了它。于是 Resend 报「当日额度已用尽」之后，兜底的
+            # SMTP 照发不误，一天的总量**没有任何上限**：实测日志里
+            # 「剩余 0」两条紧跟着一条「已送达 2/2」。
+            #
+            # 展示出来的承诺必须真的成立，所以这里按全部渠道一起算。
+            #
+            # CRIT 与补发摘要是两个例外。CRIT 是真事件，压它会让人错过事故；
+            # 补发摘要本身就是「攒下来一起发」的那个出口 —— 卡住它等于把
+            # 已经压住的告警彻底丢掉，比不发还糟。
+            if quota_total > 0 and msg.severity != SEV_CRIT \
+                    and msg.kind != KIND_DIGEST:
+                used = q.quota_used()
+                if used >= quota_total:
+                    rep.skipped = ("当日发送上限已用尽（%d/%d），"
+                                   "本条并入补发摘要" % (used, quota_total))
+                    q.to_overflow(msg, rep.skipped)
+                    rep.overflowed.append(msg.seq)
+                    if self.log:
+                        self.log.info("上限封顶 -> #%06d %s（%s）"
+                                      % (msg.seq, msg.subject, rep.skipped))
+                    return rep
             for to in recipients:
                 self._deliver_one(msg, to, mail_chain, rep, quota_total)
         if hook_chain:
