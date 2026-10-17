@@ -404,6 +404,9 @@ def run_once(cfg=None, log=None, notify: bool = True, only=None,
     mode = str(cfg.get("alerts.mode", "attacks") or "attacks")
     acks = active_acks(state)
 
+    # 只有「该发信的那一刻」才值得把明细写进日志（见函数末尾的说明）。
+    # 诊断模式下（notify=False）照常展开，那里的读者正需要细节。
+    detail_wanted = not notify
     if notify and problems:
         loud = alertable(problems, mode)
         # 迟滞静默：不发信，但异常本身还在 `problems` 里。
@@ -425,6 +428,7 @@ def run_once(cfg=None, log=None, notify: bool = True, only=None,
             if due:
                 if why != "首次告警":
                     log.info("再次提醒（%s）" % why)
+                detail_wanted = True
                 _notify_problems(cfg, result, log, items=loud)
                 remember_alert(state, loud, now)
                 save_state(state)
@@ -459,10 +463,26 @@ def run_once(cfg=None, log=None, notify: bool = True, only=None,
                     if mode == "attacks" else list(recoveries))
             if loud:
                 _notify_recoveries(cfg, result, log, items=loud)
-    for p in problems:
-        flag = "" if p.get("notify", True) else "（抖动期静默）"
-        log.warn("  [%s] %s%s: %s" % (p["status"], p["label"], flag,
-                                      (p["detail"] or "").replace("\n", " ")[:200]))
+    # 未变化的异常不再每轮展开明细。
+    #
+    # 巡检每 2 分钟跑一次，而「异常 3 项」的完整文本每轮都会重复一遍 ——
+    # 实测 12 小时内同一项写了 338 行，把 health.log 冲到 1.4 MB，真正的新
+    # 问题反而淹在里面（这正是本次排查时先被误导去翻「可疑进程」的原因）。
+    #
+    # 明细只在「异常集合发生变化」或「到了重复提醒间隔」时展开；其余轮次只留
+    # 上面那行「巡检完成：N 项，异常 M 项」。信息不丢：要看细节随时
+    # `vigil health run`，它的明细走控制台而不是这里。
+    show_detail = detail_wanted
+    if problems and show_detail:
+        for p in problems:
+            flag = "" if p.get("notify", True) else "（抖动期静默）"
+            log.warn("  [%s] %s%s: %s"
+                     % (p["status"], p["label"], flag,
+                        (p["detail"] or "").replace("\n", " ")[:200]))
+    elif problems:
+        log.info("异常 %d 项未变化（%s），本轮不重复展开明细"
+                 % (len(problems),
+                    "、".join(p["label"] for p in problems[:5])))
     return result
 
 
