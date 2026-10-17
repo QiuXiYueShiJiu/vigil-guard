@@ -2717,11 +2717,34 @@ class ThreatDaemon:
             seconds = max(seconds, self.settings.recidivist_ban_seconds)
         return int(seconds)
 
-    def ban(self, ip: str, reason: str, detector: str, severity: int = 1) -> bool:
+    def ban(self, ip: str, reason: str, detector: str, severity: int = 1,
+            force: bool = False) -> bool:
         """Ban *ip*, escalating by offence count.  Returns whether it worked."""
         if not self._valid_ip(ip):
             self.audit("[跳过] %s" % _t("ban_bad_ip", ip))
             return False
+        # 幂等：已经在封禁中、且还没到期，就别再走一遍。
+        #
+        # 实测（2026-10-17 日志）：同一秒内同一个 IP 被「封禁」了四次，四行
+        # 全写着「第1次」，而 2 个来源产生了 58 次升级事件 —— 因为检测器一次
+        # 处理了一批日志，每一行都调一次 ban()。ipset 的重复 add 是空操作，
+        # 但阶梯计数、事件队列和告警计数都会被喂成「发生了很多次攻击」。
+        # 这正是本项目反复踩到的那个病根：**一次事件被算成多次**。
+        #
+        # `force=True` 留给人工封禁：运维明确要求时，重复执行不该变成静默的
+        # 空操作 —— 那种「命令成功但什么都没发生」最难查。
+        if not force:
+            entry = (self.state.bans or {}).get(ip)
+            if isinstance(entry, dict):
+                try:
+                    until = float(entry.get("until") or 0)
+                except (TypeError, ValueError):
+                    until = 0.0
+                if until > time.time():
+                    if self.cooldowns.allow("already_banned:%s" % ip):
+                        self.audit("[已在封禁中] %s 剩余 %ds，本次不重复处理"
+                                   % (ip, int(until - time.time())))
+                    return True
         if self.whitelist.allowed(ip):
             self.audit("[放行] %s" % _t("ban_skip_whitelist", ip, reason))
             self.bump_stat("whitelist_hits")
@@ -4252,7 +4275,9 @@ def manual_ban(cfg, ip: str, seconds: int = 0, reason: str = "",
         # Report the failure honestly rather than claiming a ban happened.
         return False, "ipset 写入失败：%s" % (
             err or "封禁集合可能不存在，或缺少 ipset 命令")
-    ok = daemon.ban(ip, reason or "管理员手动封禁", detector="manual")
+    # 人工封禁绕过幂等跳过：运维明确要求时，重复执行必须真的执行。
+    ok = daemon.ban(ip, reason or "管理员手动封禁", detector="manual",
+                    force=True)
     if ok:
         info = daemon.state.bans.get(ip) or {}
         left = int(max(0, float(info.get("until", 0)) - time.time()))

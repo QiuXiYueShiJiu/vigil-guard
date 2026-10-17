@@ -2,7 +2,7 @@
 
 __all__ = ["__version__", "NAME", "SUMMARY", "HOMEPAGE"]
 
-__version__ = "3.3.4"
+__version__ = "3.3.5"
 NAME = "vigil"
 SUMMARY = "Server security, integrity and alerting guard"
 HOMEPAGE = "https://github.com/vigil-guard/vigil"

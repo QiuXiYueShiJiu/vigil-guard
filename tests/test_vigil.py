@@ -13308,5 +13308,63 @@ class TestRoutineBatchesDoNotSendEarly(unittest.TestCase):
                         "非例行批次仍按条数阈值发出，不该被例行的长等待拖累")
 
 
+class TestRepeatedBansAreIdempotent(unittest.TestCase):
+    """同一个 IP 在封禁期内不该被反复「再封一次」。
+
+    实测日志（2026-10-17 06:07:55）：同一秒里同一个 IP 被记了四行「封禁」，
+    全部写着「第1次」；另一处 2 个来源产生了 58 次升级事件。原因是检测器
+    一次处理一批日志，每一行都调一次 `ban()`。ipset 的重复 add 是空操作，
+    但阶梯计数、事件队列与告警计数会被喂成「发生了很多次攻击」——
+    这正是本项目反复踩到的那个病根：一次事件被算成多次。
+    """
+
+    def setUp(self):
+        from vigil.guards import threat as threat_mod
+        self.t = threat_mod
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+        self.cfg.set("threat.whitelist", ["127.0.0.1/8", "::1"])
+
+    def _daemon(self):
+        d = self.t.ThreatDaemon(self.cfg, log=_QuietLog(), dry_run=True,
+                                echo=False)
+        d.reporter._q.clear()
+        return d
+
+    def _bans(self, d):
+        return [e for e in d.reporter._q if e.get("kind") == "BAN"]
+
+    def test_a_second_ban_while_active_produces_no_extra_event(self):
+        d = self._daemon()
+        for _ in range(4):
+            d.ban("203.0.113.77", "扫描", detector="exploit_high", severity=2)
+        self.assertEqual(1, len(self._bans(d)),
+                         "封禁期内重复调用不该再产生事件")
+
+    def test_the_skip_still_reports_success(self):
+        d = self._daemon()
+        d.ban("203.0.113.78", "扫描", detector="exploit_high", severity=2)
+        self.assertTrue(
+            d.ban("203.0.113.78", "扫描", detector="exploit_high", severity=2),
+            "「已在封禁中」意味着它确实被封着，不该回报失败")
+
+    def test_force_bypasses_the_skip(self):
+        d = self._daemon()
+        d.ban("203.0.113.79", "扫描", detector="exploit_high", severity=2)
+        d.ban("203.0.113.79", "手动", detector="manual", force=True)
+        self.assertEqual(2, len(self._bans(d)),
+                         "force 必须绕过幂等跳过（人工封禁不能变成静默空操作）")
+
+    def test_an_expired_ban_can_be_issued_again(self):
+        d = self._daemon()
+        d.ban("203.0.113.80", "扫描", detector="exploit_high", severity=2)
+        d.state.bans["203.0.113.80"]["until"] = time.time() - 1
+        d.ban("203.0.113.80", "扫描", detector="exploit_high", severity=2)
+        self.assertEqual(2, len(self._bans(d)), "已到期的封禁应当可以再次封")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
