@@ -339,6 +339,8 @@ class LoadShedder:
         self.hits = {"protect": 0, "release": 0}
         self._adopted = False
         self._last_alert = 0.0
+        # 「负载高」日志的限频时间戳（见 run()）。状态变化另有自己的路径。
+        self._last_load_warn = 0.0
         self._iptables = shell.which("iptables", "/usr/sbin/iptables", "/sbin/iptables")
         self._ip6tables = shell.which("ip6tables", "/usr/sbin/ip6tables",
                                       "/sbin/ip6tables")
@@ -715,7 +717,14 @@ class LoadShedder:
                     elif action == "maintenance":
                         self.log.info(_t("skip_maintenance"))
                     elif load1 > self.warn_load and self.level == LEVEL_NORMAL:
-                        self.log.warn(_t("warn_load", load1, conns))
+                        # 每 10 秒一行「负载高」会把日志冲成噪音，而这种状态
+                        # 常常持续好几分钟：实测 2 小时里 12 行，全是同一个
+                        # 数字附近。按 alert_cooldown（默认 600 秒）限频。
+                        # 真正进入/解除保护模式那两条不受影响 —— 那是状态变化，
+                        # 不是持续状态的复读。
+                        if time.time() - self._last_load_warn >= self.alert_cooldown:
+                            self._last_load_warn = time.time()
+                            self.log.warn(_t("warn_load", load1, conns))
                 except Exception as exc:               # noqa: BLE001
                     self.log.warn(_t("cycle_error", exc))
                 self.stop.wait(self.check_interval)
