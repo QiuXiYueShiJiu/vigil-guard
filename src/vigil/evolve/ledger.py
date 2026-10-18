@@ -109,33 +109,56 @@ def _mac_key(cfg=None) -> bytes:
     starts chaining with its next write, with no migration step that could
     itself be interrupted.
     """
+    keys = _candidate_keys(cfg)
+    if keys:
+        return keys[0]
+    # Neither home has a key yet. Mint one and write it to *both*, so a
+    # verifier can never come back with a different value than the writer
+    # used -- that mismatch is the whole of the failure this replaces: a host
+    # whose config gained a key after the ledger had already been chained
+    # with the state file reported every chained record as altered.
+    fresh = secrets.token_hex(32)
+    wrote = _write_secret_file(LEDGER.parent / "ledger-key", fresh)
+    if cfg is not None:
+        try:
+            cfg.set(MAC_KEY_PATH, fresh)
+            cfg.save()
+            wrote = True
+        except (OSError, ValueError):
+            pass
+    return fresh.encode("utf-8") if wrote else b""
+
+
+def _candidate_keys(cfg=None) -> list:
+    """Every key this ledger may have been chained with, most likely first.
+
+    The key has two homes (see :func:`_mac_key`), and a host can end up with a
+    different value in each: the daemon wrote a record from a code path with
+    no ``Config`` in hand, or an upgrade rotated one home and not the other.
+    That split is an operational fact, not tampering, so verification offers
+    both instead of declaring every record in the file altered -- which is
+    exactly what happened here: the ledger was chained with
+    ``state/ledger-key``, the config later gained a second key, and the
+    tamper check reported the *reset* line as rewritten forever after.
+
+    The state file comes first: it sits beside the ledger and is what a writer
+    without a ``Config`` uses, so it is the one the file has actually been
+    chained with on any host that runs anything headless.
+    """
+    out = []
+    state = _read_state_key()
+    if state:
+        out.append(state)
     if cfg is not None:
         try:
             stored = str(cfg.get(MAC_KEY_PATH, "") or "")
         except Exception:                                   # noqa: BLE001
             stored = ""
         if len(stored) >= 32:
-            return stored.encode("utf-8")
-    # Nothing in the config (or no config in hand). Read the state file
-    # *before* generating, so the writer and the verifier agree: getting this
-    # order wrong made every `record()` mint a fresh key, and every
-    # `verify()` compare against a different one -- the chain looked broken on
-    # every single run, which is how a tamper check like this gets switched
-    # off.
-    existing = _read_state_key()
-    if existing:
-        return existing
-    fresh = secrets.token_hex(32)
-    if _write_secret_file(LEDGER.parent / "ledger-key", fresh):
-        return fresh.encode("utf-8")
-    if cfg is None:
-        return b""
-    try:
-        cfg.set(MAC_KEY_PATH, fresh)
-        cfg.save()
-        return fresh.encode("utf-8")
-    except Exception:                                       # noqa: BLE001
-        return b""
+            raw = stored.encode("utf-8")
+            if raw not in out:
+                out.append(raw)
+    return out
 
 
 def _read_state_key() -> bytes:
@@ -299,6 +322,28 @@ def read(limit: int = 200) -> list:
 def verify(limit: int = 200, cfg=None) -> dict:
     """Walk the chain and report where (if anywhere) it breaks.
 
+    Tries every key this ledger could have been chained with (see
+    :func:`_candidate_keys`). A chain that holds under the second key is
+    reported as ``ok`` with ``key_split`` set: the ledger is intact, and the
+    operational problem is the two divergent key homes -- which the caller can
+    repair. Reporting that as tampering fires a CRIT on every run and teaches
+    the operator that this check lies, which is the one outcome a tamper check
+    cannot afford.
+    """
+    keys = _candidate_keys(cfg)
+    out = _verify_one(limit, cfg, keys)
+    if out["ok"] and len(keys) > 1:
+        out["key_split"] = True
+        out["key_note"] = (
+            "台账的密钥曾在串联中途更换（config 与 state 各存有一把），"
+            "每条记录的 MAC 都由本机的其中一把密钥签署、链接完整；"
+            "建议统一两处密钥，以免人工核对时误以为链条断了")
+    return out
+
+
+def _verify_one(limit: int, cfg, keys) -> dict:
+    """Walk the chain and report where (if anywhere) it breaks.
+
     Returns ``{ok, entries, checked, legacy, break_at, break_kind,
     break_reason, key_available}``.
 
@@ -316,9 +361,7 @@ def verify(limit: int = 200, cfg=None) -> dict:
     """
     out = {"ok": True, "entries": [], "checked": 0, "legacy": 0,
            "break_at": 0, "break_kind": "", "break_reason": "",
-           "key_available": False}
-    key = _mac_key(cfg)
-    out["key_available"] = bool(key)
+           "key_available": bool(keys)}
     try:
         lines = LEDGER.read_text(encoding="utf-8",
                                  errors="replace").splitlines()[-limit:]
@@ -383,7 +426,7 @@ def verify(limit: int = 200, cfg=None) -> dict:
             continue
 
         seen_any = True
-        if not key:
+        if not keys:
             out["ok"] = False
             out["break_at"] = index
             out["break_kind"] = "no-key"
@@ -399,7 +442,8 @@ def verify(limit: int = 200, cfg=None) -> dict:
                 "该行之前有记录被删除、插入或重排"
                 % (index, entry.get("kind"), entry.get("ts")))
             return out
-        if not hmac.compare_digest(compute_mac(entry, prev, key), mac):
+        if not any(hmac.compare_digest(compute_mac(entry, prev, k), mac)
+                   for k in keys):
             out["ok"] = False
             out["break_at"] = index
             out["break_kind"] = "mac"

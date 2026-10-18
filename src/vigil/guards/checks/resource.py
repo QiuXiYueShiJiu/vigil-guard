@@ -446,11 +446,24 @@ class DiskIoWait(Check):
         if dt <= 0:
             return CheckResult(OK, "I/O 采样间隔为 0，本轮跳过")
         pct = di * 100.0 / dt
-        if pct >= crit:
-            return CheckResult(CRIT, "磁盘 I/O 等待过高：**%.1f%%**（阈值 %.0f%%）—— "
-                                     "磁盘已成为瓶颈，读写操作排队会导致整机卡顿；"
-                                     "也可能是磁盘硬件故障的前兆。"
+        # 升级为 CRIT 需要连续两次采样都超过严重阈值。单个 2 分钟窗口越线
+        # 往往是一次突发（编译、备份、浏览器解包），本机实测这种形态一天内
+        # 出现 56 次 CRIT，而磁盘只是忙；每出现一次都会改变告警指纹——把
+        # 明细整段重新展开，在会发信的配置下还会重发邮件。阈值关心的是持续
+        # 压力，所以 CRIT 留给「连续两轮」的那个形态，单轮只按警告处理。
+        try:
+            last_pct = float(ctx.snapshot("io_prev_pct", pct))
+        except (TypeError, ValueError):
+            last_pct = 0.0
+        if pct >= crit and last_pct >= crit:
+            return CheckResult(CRIT, "磁盘 I/O 等待过高：**%.1f%%**（阈值 %.0f%%，"
+                                     "已连续两轮越线）—— 磁盘已成为瓶颈，读写操作"
+                                     "排队会导致整机卡顿；也可能是磁盘硬件故障的前兆。"
                                % (pct, crit))
+        if pct >= crit:
+            return CheckResult(WARN, "磁盘 I/O 等待 %.1f%%（严重阈值 %.0f%%）—— "
+                                     "单次采样越线，多为突发负载；连续两轮越线才升级"
+                                     "为严重。" % (pct, crit))
         if pct >= warn:
             return CheckResult(WARN, "磁盘 I/O 等待偏高：%.1f%%（阈值 %.0f%%）"
                                % (pct, warn))

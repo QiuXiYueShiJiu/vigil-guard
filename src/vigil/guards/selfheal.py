@@ -408,7 +408,27 @@ def _regen_gate_nginx(path: str, specs=None, cache=None) -> dict:
                 "detail": "nginx 拒绝重新生成的片段，已还原：%s" % str(out)[-200:]}
 
     _nginx_reload()
-    detail = "已重新生成并写入 %s（%d 字节）" % (path, len(wanted))
+    # Record the write in the ledger. `self_integrity` excuses a changed file
+    # exactly when the ledger carries a record of *that path* producing
+    # *that content*; without this line a repair is indistinguishable from an
+    # intrusion, and the CRIT returns on every pass -- forever, because the
+    # repair is itself what changes the file. That loop is what a tamper check
+    # must never do: it teaches the operator to ignore it.
+    ledger_note = ""
+    try:
+        from ..evolve import ledger as _ledger
+        from .checks.selfcheck import digest_file
+        _ledger.record("selfheal", path=str(path),
+                       after=digest_file(str(path)),
+                       reason="自愈：重建网关 nginx 片段")
+    except Exception as exc:                                # noqa: BLE001
+        # Not swallowed: the repair itself succeeded, but without the record
+        # the next self-integrity pass will call this file tampered with. Say
+        # so in the report rather than leave the operator to discover it as a
+        # CRIT a minute later.
+        ledger_note = "；但台账记录失败（%s: %s），下一轮自检仍会把它当成修改"
+        ledger_note = ledger_note % (type(exc).__name__, exc)
+    detail = "已重新生成并写入 %s（%d 字节）%s" % (path, len(wanted), ledger_note)
     weakened = _weakened(old, wanted)
     if weakened:
         detail += "；" + weakened

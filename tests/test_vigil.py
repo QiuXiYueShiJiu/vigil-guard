@@ -9584,6 +9584,26 @@ class TestEvolveLedgerChain(unittest.TestCase):
         self.assertTrue(verdict["ok"], verdict.get("break_reason"))
         self.assertEqual(3, verdict["checked"])
 
+    def test_a_key_that_changed_mid_chain_is_a_split_not_tampering(self):
+        # The history this comes from: line 1 was chained with the key beside
+        # the ledger, then an upgrade started chaining with the one in the
+        # config. Every link is intact and every MAC is signed by a key this
+        # host owns, so the honest verdict is "the chain holds, unify your key
+        # files" -- not "history was rewritten", which fires a CRIT on every
+        # run forever and teaches the operator that this check lies.
+        first_key, second_key = b"a" * 64, b"b" * 64
+        (self.root / "ledger-key").write_text(second_key.decode() + "\n")
+        self.cfg.set("evolve.ledger_mac_key", first_key.decode())
+        e1 = {"ts": 1.0, "kind": "ledger-reset", "prev": ""}
+        e1["mac"] = self.ledger.compute_mac(e1, "", first_key)
+        e2 = {"ts": 2.0, "kind": "deployed", "prev": e1["mac"]}
+        e2["mac"] = self.ledger.compute_mac(e2, e1["mac"], second_key)
+        self._write(json.dumps(e1), json.dumps(e2))
+        verdict = self.ledger.verify(cfg=self.cfg)
+        self.assertTrue(verdict["ok"], verdict.get("break_reason"))
+        self.assertTrue(verdict.get("key_split"),
+                        "密钥分裂必须报告出来，不能静默通过")
+
     def test_a_tampered_line_breaks_the_chain_at_that_line(self):
         self.ledger.record("applied", cfg=self.cfg, path="/a", after="x")
         self.ledger.record("applied", cfg=self.cfg, path="/b")
@@ -13365,6 +13385,48 @@ class TestRepeatedBansAreIdempotent(unittest.TestCase):
         d.ban("203.0.113.80", "扫描", detector="exploit_high", severity=2)
         self.assertEqual(2, len(self._bans(d)), "已到期的封禁应当可以再次封")
 
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+
+
+class TestDiskIoWaitEscalation(unittest.TestCase):
+    """单次突发不该被当成磁盘故障报严重，持续压力才升级。
+
+    实测：本机一天里 56 次 CRIT 来自同一个 2 分钟窗口越线，磁盘只是被自己的
+    构建/浏览器拖忙。每一次都改变告警指纹，把整段明细重新展开一次。
+    """
+
+    def setUp(self):
+        from vigil.guards.checks import base as cbase, resource
+        self.base, self.resource = cbase, resource
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.cfg = vconfig.Config(path=root / "c.json",
+                                  secrets_path=root / "s.json")
+        self._real = resource._proc_stat
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.resource._proc_stat = self._real
+
+    def _sample(self, state, iowait, total):
+        # vals[4] 是 iowait，vals 之和是总 CPU 时间。
+        self.resource._proc_stat = lambda: [total - iowait, 0, 0, 0,
+                                            iowait, 0, 0, 0]
+        ctx = self.base.CheckContext(cfg=self.cfg, state=state, env={},
+                                     log=None, now=time.time())
+        return self.resource.DiskIoWait().safe_run(ctx)
+
+    def test_one_spike_is_warn_and_the_second_escalates_to_crit(self):
+        state = {}
+        self._sample(state, 10, 110)              # 建立基线
+        first = self._sample(state, 60, 210)      # 单个窗口 50%
+        self.assertEqual("WARN", first.status, first.detail)
+        self.assertIn("连续两轮", first.detail)
+        second = self._sample(state, 110, 310)    # 又一个窗口 50%
+        self.assertEqual("CRIT", second.status, second.detail)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -53,7 +53,11 @@ _BASELINE_V = 2
 
 #: Ledger kinds that mean "this program changed one of its own files on
 #: purpose", and the field carrying the hash of the file afterwards.
-_EDIT_KINDS = ("code-edited", "applied")
+#: Ledger record kinds that legitimately produce a file's current content.
+#: ``selfheal`` belongs here for the same reason ``applied`` does: the repair
+#: *is* the change, and a repair nobody recorded reads exactly like an
+#: intrusion on the next pass.
+_EDIT_KINDS = ("code-edited", "applied", "selfheal")
 
 #: Peer hashes that are not hashes and must never be compared as one.
 _NOT_A_HASH = ("", "missing", "too-big", "unreadable", "not-recorded")
