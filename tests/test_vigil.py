@@ -13440,10 +13440,14 @@ class TestGeoRegionNaming(unittest.TestCase):
             "1.2.3.4（\u4e2d\u83ef\u6c11\u570b 彰化 · X · AS1）"))
         self.assertFalse(util._geo_needs_refresh(
             "1.2.3.4（中国台湾省 彰化 · X · AS1）"))
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        # 缓存存的是「写好的结果」，命名规则改了必须让旧条目失效，否则旧写法
+        # 会一直显示到 30 天 TTL 到期。版本号比字符串嗅探可靠：不会把
+        # 「中国 山东 济南市」这种正常的多级地名误判成旧格式。
+        self.assertTrue(util._cache_current({"s": "x", "t": 1,
+                                             "v": util._GEO_CACHE_V}))
+        self.assertFalse(util._cache_current({"s": "x", "t": 1}))
+        self.assertFalse(util._cache_current({"s": "x", "t": 1,
+                                              "v": util._GEO_CACHE_V - 1}))
 
 
 class TestDiskIoWaitEscalation(unittest.TestCase):

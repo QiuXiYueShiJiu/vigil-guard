@@ -823,7 +823,8 @@ def ip_profile(cfg, ip: str) -> dict:
     cache = read_json(paths.GEOIP_CACHE, {}) or {}
     entry = cache.get(ip) if isinstance(cache.get(ip), dict) else None
     now = time.time()
-    if entry and (now - entry.get("t", 0)) < 30 * 86400 and entry.get("p"):
+    if entry and _cache_current(entry) and (now - entry.get("t", 0)) < 30 * 86400 \
+            and entry.get("p"):
         return dict(entry["p"], ip=ip)
 
     # -- geo + flags ----------------------------------------------------
@@ -889,7 +890,7 @@ def ip_profile(cfg, ip: str) -> dict:
 
     # -- persist --------------------------------------------------------
     payload = {k: v for k, v in out.items() if k != "ip"}
-    cache[ip] = dict(entry or {}, t=now, p=payload)
+    cache[ip] = dict(entry or {}, t=now, p=payload, v=_GEO_CACHE_V)
     if len(cache) > 5000:
         for k in sorted(cache, key=lambda k: (cache[k] or {}).get("t", 0))[:2000]:
             cache.pop(k, None)
@@ -1006,6 +1007,21 @@ def region_label(code, country, region, city) -> str:
     return label
 
 
+#: 缓存条目的格式版本。地名怎么写是代码里的规则，而缓存存的是**写好的结果**：
+#: 规则一改，旧条目还会按旧写法显示到 TTL 到期（30 天）。加个版本号，读到旧
+#: 版本就当作未命中重查一次 —— 这比在每条结果里做字符串嗅探可靠，也不会把
+#: 「中国 山东 济南市」这种正常的多级地名误判成旧格式。
+_GEO_CACHE_V = 2
+
+
+def _cache_current(entry) -> bool:
+    """Whether a cache entry was produced by the current naming rules."""
+    try:
+        return int(entry.get("v") or 0) == _GEO_CACHE_V
+    except (TypeError, ValueError):
+        return False
+
+
 def _geo_needs_refresh(text) -> bool:
     """True for cache entries written before the names were normalised.
 
@@ -1044,7 +1060,8 @@ def geo(cfg, ip: str, timeout: float = 4.0) -> str:
 
     cache = read_json(paths.GEOIP_CACHE, {}) or {}
     entry = cache.get(ip)
-    if isinstance(entry, dict) and (time.time() - entry.get("t", 0)) < 30 * 86400:
+    if isinstance(entry, dict) and _cache_current(entry) \
+            and (time.time() - entry.get("t", 0)) < 30 * 86400:
         text = entry.get("s") or ip
         if not _geo_needs_refresh(text):
             _GEO_MEM[ip] = text
@@ -1069,7 +1086,7 @@ def geo(cfg, ip: str, timeout: float = 4.0) -> str:
         except (ValueError, KeyError):
             pass
     if text != ip:
-        cache[ip] = {"s": text, "t": time.time()}
+        cache[ip] = {"s": text, "t": time.time(), "v": _GEO_CACHE_V}
         # Keep the cache bounded; alert storms can involve thousands of IPs.
         if len(cache) > 5000:
             for k in sorted(cache, key=lambda k: cache[k].get("t", 0))[:2000]:
