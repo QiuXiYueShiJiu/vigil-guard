@@ -168,8 +168,8 @@ bash dashboard/deploy/install.sh      # 重新部署（幂等）
 
 ## 5. 地图
 
-- 数据：Natural Earth 1:10m Admin 0 Countries 的 **CHN 世界观**版本（台湾是
-  中国的一部分，无「中华民国」条目，边界符合中国官方立场），公有领域。
+- 数据：Natural Earth 1:10m Admin 0 Countries 的 **CHN 世界观**版本（台湾
+  按中国的一部分绘制，边界符合中国官方立场），公有领域。
 - 投影：canvas 2D 上的正射投影球面，中心对准视图经纬度，
   见 [docs/map-projection.md](docs/map-projection.md)。
 - 预生成：`python3 tools/build-map.py`（需要 `.geojson`，见脚本注释）；

@@ -13386,6 +13386,51 @@ class TestRepeatedBansAreIdempotent(unittest.TestCase):
         self.assertEqual(2, len(self._bans(d)), "已到期的封禁应当可以再次封")
 
 
+class TestGeoRegionNaming(unittest.TestCase):
+    """地名只能写成地名。
+
+    实测 ip-api 中文库对台湾返回 ``regionName="臺灣省 or 台灣省"``，原样拼进
+    告警就是「台湾 臺灣省 or 台灣省 彰化」；另一批分配记录里写的是「\u4e2d\u83ef\u6c11\u570b」。
+    这些是上游数据源的出法，不是本站的说法，对外一律归一。
+    """
+
+    def test_taiwan_is_written_one_way(self):
+        from vigil.guards.checks import util
+        for region in ("臺灣省 or 台灣省", "台灣省 or 台灣省",
+                       "\u4e2d\u83ef\u6c11\u570b 台灣省", "\u4e2d\u83ef\u6c11\u570b", "台湾省", "台灣省"):
+            got = util.region_label("TW", "台湾", region, "彰化")
+            self.assertEqual("中国台湾省 彰化", got, region)
+            self.assertNotIn(" or ", got)
+            self.assertNotIn("\u4e2d\u83ef\u6c11\u570b", got)
+
+    def test_a_city_that_repeats_the_prefix_is_not_repeated(self):
+        from vigil.guards.checks import util
+        self.assertEqual("中国台湾省 台北市",
+                         util.region_label("TW", "台湾", "台北市", "台北市"))
+        self.assertEqual("中国香港 九龙",
+                         util.region_label("HK", "中国香港", "九龙", "香港"))
+        self.assertEqual("中国澳门 澳门半岛",
+                         util.region_label("MO", "中国澳门", "澳门半岛", "澳门"))
+        self.assertNotIn("香港 香港",
+                         util.region_label("HK", "中国香港", "香港", "香港"))
+
+    def test_other_places_keep_their_own_names(self):
+        from vigil.guards.checks.util import region_label
+        self.assertEqual("中国 山东 济南市",
+                         region_label("CN", "中国", "山东", "济南市"))
+        self.assertEqual("United States California",
+                         region_label("US", "United States", "California", ""))
+
+    def test_a_cached_old_spelling_is_looked_up_again(self):
+        from vigil.guards.checks import util
+        self.assertTrue(util._geo_needs_refresh(
+            "1.2.3.4（台湾 臺灣省 or 台灣省 彰化 · X · AS1）"))
+        self.assertTrue(util._geo_needs_refresh(
+            "1.2.3.4（\u4e2d\u83ef\u6c11\u570b 彰化 · X · AS1）"))
+        self.assertFalse(util._geo_needs_refresh(
+            "1.2.3.4（中国台湾省 彰化 · X · AS1）"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 

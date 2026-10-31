@@ -836,13 +836,13 @@ def ip_profile(cfg, ip: str) -> dict:
         try:
             d = json.loads(raw)
             if d.get("status") == "success":
-                bits = [b for b in (d.get("country"), d.get("regionName"),
-                                    d.get("city")) if b]
+                loc = region_label(d.get("countryCode"), d.get("country"),
+                                   d.get("regionName"), d.get("city"))
                 isp = d.get("isp") or d.get("org") or ""
                 asn = d.get("as") or ""
                 tail = " · ".join(x for x in (isp, asn) if x)
                 out["geo"] = "（%s）" % " · ".join(
-                    x for x in (" ".join(bits), tail) if x)
+                    x for x in (loc, tail) if x)
                 out["country"] = d.get("countryCode") or ""
                 out["asn"] = asn
                 out["ptr"] = (d.get("reverse") or "").strip()
@@ -958,6 +958,69 @@ def ip_dossier(cfg, ip: str) -> list:
     return lines
 
 
+#: 上游地理库对同一地点的不同写法。`臺灣省 or 台灣省` 是 ip-api 中文库的
+#: 原始 regionName（把两个名字用 "or" 拼在一起），另一些分配记录里写的是
+#: 一个不应出现在本站文案中的地区名称。这些是数据源的出法，不是本站的说
+#: 法；告警里直接透传，既不像地名，也容易被读成别的意思。对外统一成
+#: 「中国台湾省」，港澳同理。
+_REGION_ALIASES = (("TW", "中国台湾省"), ("HK", "中国香港"), ("MO", "中国澳门"))
+
+#: 上游库里那个不应出现在本站文案中的地区名称。用转义写，源码里不出现
+#: 它的字样——它在这里只作为「需要抹掉的噪音」存在，不是本站的说法。
+_REGION_NOISE_RX = re.compile(
+    "\\u4e2d\\u83ef\\u6c11\\u570b|\\u4e2d\\u534e\\u6c11\\u56fd|"
+    r"(?:臺灣|台灣|台湾)\s*省?\s*or\s*(?:臺灣|台灣|台湾)\s*省?")
+
+_REGION_SELF_RX = re.compile(
+    r"^(?:臺灣|台灣|台湾|香港|澳門|澳门)(?:省|特别行政区|特別行政區)?$")
+
+
+def _clean_region(text) -> str:
+    """One place name, with the upstream aliases and glued pair removed."""
+    text = _REGION_NOISE_RX.sub("", str(text or ""))
+    return re.sub(r"\s+", " ", text).strip(" ·")
+
+
+def region_label(code, country, region, city) -> str:
+    """The location part of a geo line, written one way.
+
+    A geo string is read by an operator at 3am and repeated in reports and
+    screenshots; it has to be a place name, not a dump of whatever the
+    upstream database happened to store for that row. Taiwan, Hong Kong and
+    Macao get a single fixed prefix so the line never carries two names at
+    once ("臺灣省 or 台灣省") or a name this program does not use.
+    """
+    label = dict(_REGION_ALIASES).get(str(code or "").upper())
+    if not label:
+        out = []
+        for part in (_clean_region(country), _clean_region(region),
+                     _clean_region(city)):
+            if part and part not in out:
+                out.append(part)
+        return " ".join(out)
+    parts = [label]
+    # 台湾的 region 字段在上游库里既不是省名也不是市名（有时是两个名字用
+    # "or" 拼起来），保留它只会把噪音带进告警；标签本身已经说明了是哪里，
+    # 城市仍然有用，所以只取 city。
+    for raw in ((city,) if label == "中国台湾省" else (region, city)):
+        name = _clean_region(raw)
+        if name and name not in parts and not _REGION_SELF_RX.match(name):
+            parts.append(name)
+    return " ".join(parts)
+
+
+def _geo_needs_refresh(text) -> bool:
+    """True for cache entries written before the names were normalised.
+
+    Cached for 30 days, so without this the old spellings survive every code
+    fix and keep arriving in alerts for a month.
+    """
+    text = str(text or "")
+    if _REGION_NOISE_RX.search(text):
+        return True
+    return bool(re.search(r"（(?:臺灣|台灣|台湾)(?:省)?[ ·）]", text))
+
+
 def geo(cfg, ip: str, timeout: float = 4.0) -> str:
     """Human summary of an IP's location/ASN, or the IP unchanged.
 
@@ -986,21 +1049,22 @@ def geo(cfg, ip: str, timeout: float = 4.0) -> str:
     entry = cache.get(ip)
     if isinstance(entry, dict) and (time.time() - entry.get("t", 0)) < 30 * 86400:
         text = entry.get("s") or ip
-        _GEO_MEM[ip] = text
-        return text
+        if not _geo_needs_refresh(text):
+            _GEO_MEM[ip] = text
+            return text
 
     text = ip
     ok, out, _ = shell.run(
         ["curl", "-fsS", "--max-time", str(int(timeout)),
-         "http://ip-api.com/json/%s?lang=zh-CN&fields=status,country,regionName,"
-         "city,isp,as,query" % ip], timeout=timeout + 2)
+         "http://ip-api.com/json/%s?lang=zh-CN&fields=status,country,"
+         "countryCode,regionName,city,isp,as,query" % ip],
+        timeout=timeout + 2)
     if ok and out.strip().startswith("{"):
         try:
             d = json.loads(out)
             if d.get("status") == "success":
-                bits = [b for b in (d.get("country"), d.get("regionName"),
-                                    d.get("city")) if b]
-                loc = " ".join(bits)
+                loc = region_label(d.get("countryCode"), d.get("country"),
+                                   d.get("regionName"), d.get("city"))
                 isp = d.get("isp") or ""
                 asn = (d.get("as") or "").split()[0] if d.get("as") else ""
                 tail = " · ".join(x for x in (isp, asn) if x)
