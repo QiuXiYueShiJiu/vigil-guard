@@ -998,15 +998,12 @@ def region_label(code, country, region, city) -> str:
             if part and part not in out:
                 out.append(part)
         return " ".join(out)
-    parts = [label]
-    # 台湾的 region 字段在上游库里既不是省名也不是市名（有时是两个名字用
-    # "or" 拼起来），保留它只会把噪音带进告警；标签本身已经说明了是哪里，
-    # 城市仍然有用，所以只取 city。
-    for raw in ((city,) if label == "中国台湾省" else (region, city)):
-        name = _clean_region(raw)
-        if name and name not in parts and not _REGION_SELF_RX.match(name):
-            parts.append(name)
-    return " ".join(parts)
+    # 这三个地区只输出标签本身，不拼上游的省/市字段：那些字段在中文库里
+    # 一律是繁体（「中環」「中西區」「臺北」），而且写法不稳定（台湾的
+    # region 甚至把两个名字用 "or" 连起来）。城市名带来的排查价值，抵不过
+    # 「同一份告警里混着繁简两种字」和「把数据源的写法当成本站的说法」这两
+    # 个代价；要精确位置时按 IP 现查即可。
+    return label
 
 
 def _geo_needs_refresh(text) -> bool:

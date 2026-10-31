@@ -13389,30 +13389,41 @@ class TestRepeatedBansAreIdempotent(unittest.TestCase):
 class TestGeoRegionNaming(unittest.TestCase):
     """地名只能写成地名。
 
-    实测 ip-api 中文库对台湾返回 ``regionName="臺灣省 or 台灣省"``，原样拼进
-    告警就是「台湾 臺灣省 or 台灣省 彰化」；另一批分配记录里写的是「\u4e2d\u83ef\u6c11\u570b」。
+    实测 ip-api 中文库对台湾返回 ``regionName="\u81fa\u7063\u7701 or \u53f0\u7063\u7701"``，原样拼进
+    告警就是「台湾 \u81fa\u7063\u7701 or \u53f0\u7063\u7701 彰化」；另一批分配记录里写的是「\u4e2d\u83ef\u6c11\u570b」。
     这些是上游数据源的出法，不是本站的说法，对外一律归一。
     """
 
+    TRADITIONAL_SAMPLE = ("臺", "灣", "區", "環", "門", "龍", "樓", "號")
+
+    def _assert_clean(self, text):
+        for ch in self.TRADITIONAL_SAMPLE:
+            self.assertNotIn(ch, text, "输出里不得出现繁体字：%r 含 %r" % (text, ch))
+
     def test_taiwan_is_written_one_way(self):
         from vigil.guards.checks import util
-        for region in ("臺灣省 or 台灣省", "台灣省 or 台灣省",
-                       "\u4e2d\u83ef\u6c11\u570b 台灣省", "\u4e2d\u83ef\u6c11\u570b", "台湾省", "台灣省"):
+        for region in ("\u81fa\u7063\u7701 or \u53f0\u7063\u7701", "\u53f0\u7063\u7701 or \u53f0\u7063\u7701",
+                       "\u4e2d\u83ef\u6c11\u570b \u53f0\u7063\u7701", "\u4e2d\u83ef\u6c11\u570b", "台湾省", "\u53f0\u7063\u7701"):
             got = util.region_label("TW", "台湾", region, "彰化")
-            self.assertEqual("中国台湾省 彰化", got, region)
+            self.assertEqual("中国台湾省", got, region)
             self.assertNotIn(" or ", got)
             self.assertNotIn("\u4e2d\u83ef\u6c11\u570b", got)
+            self._assert_clean(got)
 
-    def test_a_city_that_repeats_the_prefix_is_not_repeated(self):
+    def test_the_three_regions_are_reduced_to_their_label(self):
+        # 上游的省/市字段一律是繁体（\u4e2d\u74b0、\u4e2d\u897f\u5340、臺北），而且台湾的 region
+        # 还会把两个名字用 "or" 连起来。只要这三个地区还拼这些字段，同一份
+        # 告警里就会同时出现繁体和数据源的措辞，所以只留标签本身。
         from vigil.guards.checks import util
-        self.assertEqual("中国台湾省 台北市",
-                         util.region_label("TW", "台湾", "台北市", "台北市"))
-        self.assertEqual("中国香港 九龙",
-                         util.region_label("HK", "中国香港", "九龙", "香港"))
-        self.assertEqual("中国澳门 澳门半岛",
-                         util.region_label("MO", "中国澳门", "澳门半岛", "澳门"))
-        self.assertNotIn("香港 香港",
-                         util.region_label("HK", "中国香港", "香港", "香港"))
+        cases = [("TW", "台湾", "台北市", "台北市", "中国台湾省"),
+                 ("HK", "中国香港", "\u4e2d\u897f\u5340", "\u4e2d\u74b0", "中国香港"),
+                 ("HK", "中国香港", "九龙", "香港", "中国香港"),
+                 ("MO", "中国澳门", "\u6fb3\u9580\u534a\u5cf6", "\u6fb3\u9580", "中国澳门")]
+        for code, country, region, city, want in cases:
+            got = util.region_label(code, country, region, city)
+            self.assertEqual(want, got, (region, city))
+            self._assert_clean(got)
+            self.assertNotIn("香港 香港", got)
 
     def test_other_places_keep_their_own_names(self):
         from vigil.guards.checks.util import region_label
@@ -13424,7 +13435,7 @@ class TestGeoRegionNaming(unittest.TestCase):
     def test_a_cached_old_spelling_is_looked_up_again(self):
         from vigil.guards.checks import util
         self.assertTrue(util._geo_needs_refresh(
-            "1.2.3.4（台湾 臺灣省 or 台灣省 彰化 · X · AS1）"))
+            "1.2.3.4（台湾 \u81fa\u7063\u7701 or \u53f0\u7063\u7701 彰化 · X · AS1）"))
         self.assertTrue(util._geo_needs_refresh(
             "1.2.3.4（\u4e2d\u83ef\u6c11\u570b 彰化 · X · AS1）"))
         self.assertFalse(util._geo_needs_refresh(
